@@ -1,0 +1,273 @@
+import math
+import torch
+import torch.distributed as dist
+import random
+import numpy as np
+from PIL import Image
+
+from .base import BaseModel
+from ..smp import *
+from ..dataset import DATASET_TYPE
+
+# from .vllm_jointmodel import VLLMJointModel
+from .qwen2_vl.prompt import Qwen2VLPromptMixin
+from transformers import AutoModelForCausalLM
+
+from vllm import SamplingParams
+
+import torch
+from PIL import Image
+from pathlib import Path
+from typing import List, Dict, Any
+import os
+
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer, AutoProcessor, AutoConfig, Qwen2_5_VLForConditionalGeneration
+from vllm.model_executor.models import ModelRegistry
+
+from .duplex_thinker import DuplexThinkerForCausalLM
+
+ModelRegistry.register_model("Qwen3ForCausalLM", DuplexThinkerForCausalLM)
+
+VISUAL_BANDWIDTH=int(os.getenv("VISUAL_BANDWIDTH", 64))
+
+def get_visual_message_tokens(num_tokens: int) -> List[str]:
+    return [f'<im_msg-{i}>' for i in range(num_tokens)]
+
+@torch.inference_mode()
+def extract_batch_image_features(batch: List[Dict[str, Any]], perceiver_model, perceiver_processor, alignment_layer, device) -> List[torch.Tensor]:
+    images = [Image.open(item["image_path"]).convert("RGB") for item in batch]
+    p_prompt_template = 'Encode the image into {num_feat} tokens, including information related to the question. Here is the question: {question}'
+    visual_message_str = "".join(get_visual_message_tokens(VISUAL_BANDWIDTH))
+
+    p_texts = []
+    for item in batch:
+        p_prompt = p_prompt_template.format(num_feat=VISUAL_BANDWIDTH, question=item["question"])
+        p_message = [{'role': 'user', 'content': [{'type': 'image'}, {'type': 'text', 'text': p_prompt}]},
+                     {'role': 'assistant', 'content': [{'type': 'text', 'text': visual_message_str}]}]
+        p_texts.append(perceiver_processor.apply_chat_template(p_message, tokenize=False, add_generation_prompt=False))
+
+    inputs = perceiver_processor(text=p_texts, images=images, return_tensors="pt", padding=True).to(device)
+    outputs = perceiver_model(**inputs, output_hidden_states=True)
+    last_hidden_states = outputs.hidden_states[-1]
+    p_msg_token_ids = perceiver_processor.tokenizer.convert_tokens_to_ids(get_visual_message_tokens(VISUAL_BANDWIDTH))
+    p_msg_start_id, p_msg_end_id = p_msg_token_ids[0], p_msg_token_ids[-1]
+
+    batch_features = []
+    for i in range(len(batch)):
+        input_ids_sample = inputs.input_ids[i]
+        start_indices = (input_ids_sample == p_msg_start_id).nonzero(as_tuple=True)[0]
+        end_indices = (input_ids_sample == p_msg_end_id).nonzero(as_tuple=True)[0]
+        if len(start_indices) == 0 or len(end_indices) == 0:
+            raise ValueError(f"Visual message tokens not found in sample {i}")
+        features = last_hidden_states[i, start_indices[0]:end_indices[0] + 1, :]
+        aligned_features = alignment_layer(features)
+        batch_features.append(aligned_features)
+    return batch_features
+
+def batch_inference(batch_data: List[Dict[str, Any]], llm: LLM, thinker_tokenizer, perceiver_model, perceiver_processor, alignment_layer, device):
+
+    extracted_features = extract_batch_image_features(batch_data, perceiver_model, perceiver_processor, alignment_layer, device)
+
+    prompts_for_vllm = []
+    visual_message_str = "".join(get_visual_message_tokens(VISUAL_BANDWIDTH))
+    t_prompt_template = '{question} Image: ' + visual_message_str
+    for item in batch_data:
+        t_prompt = t_prompt_template.format(question=item["question"])
+        message = [{"role": "user", "content": t_prompt}]
+        final_prompt = thinker_tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+        ####### difference between _prefix
+        # final_prompt = final_prompt + "<think>\n\n</think>\n\n"
+        final_prompt = final_prompt + "<think>"
+        #######
+        prompts_for_vllm.append(final_prompt)
+
+    print(f"shape of extracted_features: {[feat.shape for feat in extracted_features]}")
+
+    requests = []
+    for i in range(len(prompts_for_vllm)):
+        extracted_features[i] = extracted_features[i].unsqueeze(1).to("cpu").to(torch.float32)
+        print(f"Feature shape for sample {i}: {extracted_features[i].shape}")
+        request = {
+            "prompt": prompts_for_vllm[i],
+            "multi_modal_data": {
+                "image": extracted_features[i]
+            }
+        }
+        requests.append(request)
+
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=4096)
+    # sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=30)
+
+    outputs = llm.generate(requests, sampling_params)
+
+    res = []
+    for i, output in enumerate(outputs):
+        if output.outputs:
+            res.append(output.outputs[0].text.strip())
+        else:
+            res.append("No output generated.")
+
+    print(f"Generated {len(res)} responses.")
+    return res
+
+class DuplexThinkerS2vLLMPrefixP3(Qwen2VLPromptMixin, BaseModel):
+
+    INSTALL_REQ = False
+    INTERLEAVE = False
+
+    def __init__(self, model_path="", use_custom_prompt=True, **kwargs):
+        super().__init__(use_custom_prompt=use_custom_prompt)
+        random.seed(0)
+        np.random.seed(0)
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+
+        with open("log.txt", "a") as f:
+            f.write(f"Initializing DuplexThinkerS2vLLM with model_path: {model_path}\n")
+
+        self.model_path = model_path
+
+        self.perceiver_device = "cuda:0"
+
+        # SEPARATED_MODELS_DIR = Path("./separated_models")
+        SEPARATED_MODELS_DIR = Path(model_path)
+        PERCEIVER_PATH = SEPARATED_MODELS_DIR / "perceiver"
+        THINKER_PATH = SEPARATED_MODELS_DIR / "thinker"
+        ALIGNMENT_LAYER_PATH = SEPARATED_MODELS_DIR / "linear_align_dim.pth"
+        VISUAL_BANDWIDTH = 64
+
+        tensor_parallel_size = torch.cuda.device_count()
+        if tensor_parallel_size == 0:
+            raise ValueError("DualThinker with VLLM requires at least one CUDA GPU.")
+
+        self.perceiver_processor = AutoProcessor.from_pretrained(PERCEIVER_PATH)
+        self.perceiver_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            PERCEIVER_PATH,
+            torch_dtype=torch.bfloat16,
+        ).to(self.perceiver_device).eval()
+        print("Perceiver model and processor loaded.")
+
+        self.thinker_config = AutoConfig.from_pretrained(THINKER_PATH, trust_remote_code=True)
+        # self.alignment_layer = torch.nn.Linear(
+        #     self.perceiver_model.config.hidden_size,
+        #     self.thinker_config.hidden_size,
+        #     dtype=torch.bfloat16
+        # ).to(self.perceiver_device).eval()
+        # self.alignment_layer = torch.nn.Linear(
+        #     self.perceiver_model.config.hidden_size,
+        #     self.thinker_config.hidden_size,
+        #     dtype=torch.bfloat16
+        # ).to(self.perceiver_device).eval()
+        self.alignment_layer = torch.nn.Sequential(
+            torch.nn.Linear(self.perceiver_model.config.hidden_size, self.perceiver_model.config.hidden_size, dtype=torch.bfloat16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.perceiver_model.config.hidden_size, self.thinker_config.hidden_size, dtype=torch.bfloat16),
+        ).to(self.perceiver_device).eval()
+        self.alignment_layer.load_state_dict(torch.load(ALIGNMENT_LAYER_PATH))
+
+        print(f"weight of alignment layer: {self.alignment_layer[0].weight}, bias: {self.alignment_layer[0].bias}")
+        print(f"wieght of alignment layer: {self.alignment_layer[2].weight}, bias: {self.alignment_layer[2].bias}")
+
+        self.thinker_tokenizer = AutoTokenizer.from_pretrained(THINKER_PATH, padding_side="left")
+
+        # get gpu count
+        gpu_count = torch.cuda.device_count()
+
+        self.llm = LLM(
+            model=str(THINKER_PATH),
+            trust_remote_code=True,
+            tensor_parallel_size=gpu_count,
+            gpu_memory_utilization=0.6,
+            # enforce_eager=True,
+            limit_mm_per_prompt={"image": VISUAL_BANDWIDTH},
+        )
+
+        # print(f'Loading vllm model from {self.model_path}')
+
+        # self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+
+        # self.model = self.model.eval().cuda()
+
+        # self.kwargs = kwargs
+
+        # self.p_sampling_params = dict(do_sample=True, temperature=0.01, top_p=0.001, top_k=1, max_new_tokens=2048, repetition_penalty=1.0)
+        # self.t_sampling_params = dict(do_sample=True, temperature=0.6, top_p=0.95, top_k=20, max_new_tokens=32768)
+
+
+    def generate_inner(self, message, dataset=None):
+        print(f"Generating response for message: {message}", flush=True)
+
+        prompt, image_path = self.message_to_promptimg(message, dataset=dataset)
+
+        # image = Image.open(image_path).convert('RGB')
+
+        # image = self._resize_image_if_needed(image)
+
+        # msgs = [{'role': 'user', 'content': prompt}]
+
+        # print(f"Prepared message for generation: {msgs}", flush=True)
+
+        # res = self.model.chat(
+        #     [image_path],
+        #     [msgs],
+        #     perceiver_generation_params=self.p_sampling_params,
+        #     thinker_generation_params=self.t_sampling_params,
+        # )
+
+        batch = [
+            {"image_path": image_path, "question": prompt}
+        ]
+
+        return batch_inference(
+            batch,
+            self.llm,
+            self.thinker_tokenizer,
+            self.perceiver_model,
+            self.perceiver_processor,
+            self.alignment_layer,
+            self.perceiver_device
+        )
+
+    def generate_batch_inner(self, messages, dataset=None):
+        print(f"Generating batch with {len(messages)} messages.", flush=True)
+
+        prompts, image_paths = self.messages_to_promptimg(messages, dataset=dataset)
+
+        # images = [Image.open(image_path).convert('RGB') for image_path in image_paths]
+        # images = [self._resize_image_if_needed(image) for image in images]
+
+        batch = []
+        for prompt, image_path in zip(prompts, image_paths):
+            batch.append({"image_path": image_path, "question": prompt})
+        print(f"Prepared {len(batch)} messages for batch generation.", flush=True)
+        return batch_inference(
+            batch,
+            self.llm,
+            self.thinker_tokenizer,
+            self.perceiver_model,
+            self.perceiver_processor,
+            self.alignment_layer,
+            self.perceiver_device
+        )
+
+        # msgs = [{'role': 'user', 'content': prompt} for prompt in prompts]
+
+        # print(f"Prepared {len(msgs)} messages for batch generation.", flush=True)
+
+        # res = self.model.chat(
+        #     image_paths,
+        #     msgs,
+        #     perceiver_generation_params=self.p_sampling_params,
+        #     thinker_generation_params=self.t_sampling_params,
+        # )
+
+        # return res
+
+
+if __name__ == "__main__":
+    # Example usage
+    model = DuplexThinkerS2vLLM(model_path="/path/to/home/workspace/duplex_think2/separated_models")
+    message = {"question": "What is the content of this image?", "image_path": "/path/to/home/workspace/duplex_think2/dummy_image.jpg"}
+    response = model.generate_inner(message)
+    print(response)

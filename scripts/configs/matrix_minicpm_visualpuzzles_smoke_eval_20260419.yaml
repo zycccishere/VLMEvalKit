@@ -1,0 +1,43 @@
+name: minicpm_visualpuzzles_smoke_eval_20260419
+repo_root: "{repo_root}"
+results_root: runs/smoke_minicpm_visualpuzzles_20260419
+node_gpu_ids: "0,1,2,3"
+datasets:
+  - VisualPuzzles
+dataset_index_allowlists:
+  VisualPuzzles: "{repo_root}/scripts/configs/index_allowlists/gemma4_reasoning_smoke_visualpuzzles_20260418.txt"
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text
+models:
+  - minicpm_v_45
+  - minicpm_o_45
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 1
+  safe_truncate_chars: 6000
+  stage_debug: 1
+  stage_debug_samples: 2
+  prompt_audit: 1
+  prompt_audit_print: 1
+answer_format:
+  enable: 1
+  require_boxed: 0
+  response_col: prediction
+  fallback_col: detailed_prediction
+  max_fails: 50
+evaluation:
+  launch_mode: fg
+  nproc: 8
+  judge: gpt-4o-mini
+  openai_api_key: ""
+  openai_api_base: https://api.openai.com/v1
+worker_monitor:
+  enable: true
+  interval_seconds: 600
+resume_infer_default: false

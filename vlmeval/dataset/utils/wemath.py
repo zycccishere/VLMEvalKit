@@ -1,12 +1,13 @@
 # pylint: skip-file
 
-import pandas as pd
-import json
-import numpy as np
-import os
 import argparse
+import json
+import os
 
-from ...smp import load
+import numpy as np
+import pandas as pd
+
+from vlmeval.smp.file import load
 
 # four_dimensional_metrics.py
 
@@ -122,7 +123,6 @@ def evaluate_calculate_metrics(merged_2steps, merged_3steps):
         ((merged_3steps['joker_1'] == True) & (merged_3steps['joker_2'] == True) & (merged_3steps['joker_3'] == True))
         & (merged_3steps['joker_multi'] == True)
     ]
-    # metrics.to_csv("/Users/mac/Desktop/测试结果/error_anal/csv/gpt4o-0626.csv", index = False)
     return metrics
 
 

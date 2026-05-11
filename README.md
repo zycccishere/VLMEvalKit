@@ -1,3 +1,72 @@
+## Image Replay Evaluation Fork
+
+This branch is a cleaned, publishable VLMEvalKit fork for the image-replay experiments. It is based on `open-compass/VLMEvalKit` commit `00804217f868058f871f5ff252a7b9623c3475d9` and keeps the active replay evaluation surface used for Qwen2.5-VL, MiniCPM-4.5, and Gemma3-family experiments.
+
+Runtime artifacts are intentionally not included: no `runs/`, `checkpoints/`, model weights, `LMUData/`, private API keys, or machine-local caches are tracked. Historical launchers are kept under `scripts_legacy/` for provenance; the maintained entrypoint is `scripts/run_benchmark.sh`.
+
+### Quick Start
+
+Copy `.env.example` to `.env` or export the variables in your shell:
+
+```bash
+export MODEL_ROOT=/models
+export CONDA_ROOT=$HOME/miniconda3
+export LMUData=$PWD/LMUData
+export OPENAI_API_KEY_JUDGE=
+export OPENAI_API_BASE_JUDGE=https://api.openai.com/v1
+export OPENAI_COMPATIBLE_API_KEY=
+export OPENAI_COMPATIBLE_API_BASE=
+```
+
+Run a dry plan before launching work:
+
+```bash
+bash scripts/run_benchmark.sh \
+  --matrix-config scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml \
+  --model-config scripts/configs/models.yaml \
+  --scheduler gpu_pool \
+  --plan-only
+```
+
+### Active Entrypoints
+
+- `bash scripts/run_benchmark.sh ...`: canonical matrix runner. It reads `scripts/configs/models.yaml` plus a matrix YAML, supports `--resume-infer`, and has `--scheduler gpu_pool` for mixed tensor-parallel packing.
+- `bash scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh <node_rank> [gpu_ids]`: two-node Qwen2.5-VL plus MiniCPM-4.5 run over the four newer reasoning/perception benchmarks.
+- `bash scripts/run_gemma3_family_all11_replay6_2nodes_20260422.sh <node_rank> [gpu_ids]`: two-node Gemma3-family run over the 11-benchmark replay matrix.
+- `bash scripts/ssh_launch_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh [host0 host1]`: tmux launcher for the Qwen2.5/MiniCPM two-node entrypoint. Set `REMOTE_REPO` to the remote clone path.
+- `bash scripts/ssh_launch_gemma3_family_all11_replay6_2nodes_20260422.sh [host0 host1]`: tmux launcher for the Gemma3 two-node entrypoint. Set `REMOTE_REPO` to the remote clone path.
+- `bash scripts/run_legacy_dynamath_infer_only_all_replay.sh`: preserved legacy Dynamath infer-only entrypoint used by older table rows.
+
+The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. It can keep an 8-GPU node filled with combinations such as one `tp=4` task plus two `tp=2` tasks when the matrix contains both 72B and 32B jobs.
+
+### Main Matrices
+
+- `scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml`: Qwen2.5-VL 3B/7B/32B/72B plus MiniCPM-V/O-4.5 on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, and `MMStar`.
+- `scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml`: Gemma3 family on `DynaMath`, `MathVision`, `LogicVista`, `VisualPuzzles`, `AI2D_TEST`, `OCRBench`, `SEEDBench2_Plus`, and the four newer benchmarks.
+- `scripts/configs/matrix_qwen25vl_all4_reasoning_perception4_new_entry_20260421.yaml`: earlier Qwen2.5-only four-new-benchmark matrix.
+- `scripts/configs/matrix_qwen25vl7b_minicpm45_table_20260406.yaml`: preserved legacy table matrix for Qwen2.5-7B and MiniCPM-4.5.
+- `scripts/configs/matrix_legacy_dynamath_infer_only_all_replay.yaml`: preserved legacy Dynamath infer-only matrix.
+- `scripts/configs/matrix_minicpm45_wemath_cot_rerun_20260429.yaml`: MiniCPM-4.5 WeMath CoT rerun matrix.
+
+### Code Map
+
+- Replay policy and transform routing: `vlmeval/vlm/replay_policy.py`, `vlmeval/vlm/replay_image_transform.py`.
+- Qwen2/Qwen2.5 replay wrapper: `vlmeval/vlm/qwen2_vl/model.py` and `vlmeval/vlm/qwen2_vl/replay_prompt_template.py`.
+- MiniCPM-4.5 replay wrapper: `vlmeval/vlm/minicpm_v_4_5_replay.py`.
+- Gemma3/Gemma4 replay wrappers: `vlmeval/vlm/gemma3_replay.py`, `vlmeval/vlm/gemma4_replay.py`.
+- Minimal model registries: `vlmeval/config_qwen_minimal.py`, `vlmeval/config_minicpm45_minimal.py`, `vlmeval/config_gemma3_minimal.py`, `vlmeval/config_gemma4_minimal.py`.
+- Dataset/eval adaptations: `vlmeval/dataset/dynamath.py`, `vlmeval/dataset/image_mcq.py`, `vlmeval/dataset/image_vqa.py`, and `vlmeval/dataset/utils/{logicvista,mathv,visualpuzzles,wemath}.py`.
+- Matrix orchestration and result collection: `scripts/run_benchmark.py`, `scripts/collect_matrix_results.py`, and `scripts/configs/`.
+
+### Reproducibility Notes
+
+- Active image-replay model and data locations are controlled by environment variables, not hardcoded private paths. Set `MODEL_ROOT`, `CONDA_ROOT`, `LMUData`, `LLAVA_ROOT`, and `QWEN35_PYDEPS` as needed.
+- LLM-judge based datasets use `OPENAI_API_KEY_JUDGE`/`OPENAI_API_BASE_JUDGE` first, then `OPENAI_API_KEY`/`OPENAI_API_BASE`; generic non-OpenAI-compatible endpoints can be supplied with `OPENAI_COMPATIBLE_API_KEY`/`OPENAI_COMPATIBLE_API_BASE`.
+- Non-default API wrappers such as `JTVLChatAPI` have no bundled private endpoint. Configure their endpoint and token explicitly with the documented environment variables in the wrapper before use.
+- `scripts_legacy/` is intentionally retained for old final-table provenance. Treat these scripts as historical launch references rather than the preferred active interface.
+
+---
+
 ![LOGO](https://opencompass.openxlab.space/utils/MMLB.jpg)
 
 <b>A Toolkit for Evaluating Large Vision-Language Models. </b>

@@ -1,0 +1,36 @@
+{
+  "matrix_config": "scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml",
+  "model_config": "scripts/configs/models.yaml",
+  "out_dir": "scripts/configs/task_manifests/qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422",
+  "nodes": 2,
+  "gpus_per_node": 8,
+  "task_count": 144,
+  "nodes_summary": [
+    {
+      "node": 0,
+      "tasks": 72,
+      "load": 51.6,
+      "models": {
+        "minicpm_o_45": 12,
+        "minicpm_v_45": 12,
+        "qwen25vl_32b": 12,
+        "qwen25vl_3b": 12,
+        "qwen25vl_72b": 12,
+        "qwen25vl_7b": 12
+      }
+    },
+    {
+      "node": 1,
+      "tasks": 72,
+      "load": 51.6,
+      "models": {
+        "minicpm_o_45": 12,
+        "minicpm_v_45": 12,
+        "qwen25vl_32b": 12,
+        "qwen25vl_3b": 12,
+        "qwen25vl_72b": 12,
+        "qwen25vl_7b": 12
+      }
+    }
+  ]
+}

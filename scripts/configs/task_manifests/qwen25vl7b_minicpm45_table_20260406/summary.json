@@ -1,0 +1,35 @@
+{
+  "repo_root": "/path/to/vlmevalkit",
+  "results_root": "/path/to/vlmevalkit/runs/by_setting_qwen25vl7b_minicpm45_table_20260406",
+  "matrix_config": "/path/to/vlmevalkit/scripts/configs/matrix_qwen25vl7b_minicpm45_table_20260406.yaml",
+  "task_count": 360,
+  "nodes": [
+    {
+      "node": 0,
+      "model_key": "qwen25vl_7b",
+      "model_display": "Qwen2.5-VL-7B",
+      "task_count": 120,
+      "estimated_load": 463216.0,
+      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl7b_minicpm45_table_20260406/node0_tasks.csv",
+      "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl7b_minicpm45_table_20260406/run_node0.sh"
+    },
+    {
+      "node": 1,
+      "model_key": "minicpm_v_45",
+      "model_display": "MiniCPM-V-4_5",
+      "task_count": 120,
+      "estimated_load": 463216.0,
+      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl7b_minicpm45_table_20260406/node1_tasks.csv",
+      "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl7b_minicpm45_table_20260406/run_node1.sh"
+    },
+    {
+      "node": 2,
+      "model_key": "minicpm_o_45",
+      "model_display": "MiniCPM-o-4_5",
+      "task_count": 120,
+      "estimated_load": 463216.0,
+      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl7b_minicpm45_table_20260406/node2_tasks.csv",
+      "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl7b_minicpm45_table_20260406/run_node2.sh"
+    }
+  ]
+}

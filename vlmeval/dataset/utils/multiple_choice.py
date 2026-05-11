@@ -1,8 +1,10 @@
 import pandas as pd
-from ...utils import can_infer, track_progress_rich, can_infer_lego
+from ...utils import can_infer, track_progress_rich
 from ...smp import *
 import numpy as np
 import re
+import os
+from .prompt_tail import tail_tokens_for_judge
 
 MMB_abbrs = {
     'coarse_perception': 'CP',
@@ -151,67 +153,6 @@ def report_acc_MMT(df):
     return pd.DataFrame(res)
 
 
-def report_acc_MMSci(df):
-
-    df_filtered = df[df['setting'].isin(['Fig2Cap', 'SubFig2Cap', 'SubCap2Fig'])]
-
-    subject_acc = df_filtered.groupby(['subject', 'setting'])['hit'].mean().unstack(fill_value=0)
-    subject_acc['Avg'] = subject_acc.mean(axis=1)
-    subject_acc.reset_index(inplace=True)
-
-    category_acc = df_filtered.groupby(['category', 'setting'])['hit'].mean().unstack(fill_value=0)
-    category_acc['Avg'] = category_acc.mean(axis=1)
-    category_acc.reset_index(inplace=True)
-    category_acc['category'] = 'CATEGORY_' + category_acc['category']
-    category_acc.rename(columns={'category': 'subject'}, inplace=True)
-
-    overall_acc = df_filtered.groupby(['setting'])['hit'].mean().to_frame().T
-    overall_acc['Avg'] = overall_acc.mean(axis=1)
-    overall_acc['subject'] = 'Overall'
-
-    full_acc_df = pd.concat([subject_acc, category_acc, overall_acc], ignore_index=True)
-    column_order = ['subject', 'Fig2Cap', 'SubFig2Cap', 'SubCap2Fig', 'Avg']
-    full_acc_df = full_acc_df[column_order]
-    return full_acc_df
-
-
-def report_topviewrs_acc(df):
-    # assert group in [None, 'category', 'l2-category']
-    res = defaultdict(list)
-    print(df.columns)
-
-    if 'split' in df:
-        splits = list(set(df['split']))
-        res['split'] = splits
-    else:
-        df['split'] = ['none'] * len(df)
-        res['split'] = ['none']
-
-    for group in [None, 'l2-category', 'category']:
-        if group is None:
-
-            res['Overall'] = [np.mean(df[df['split'] == sp]['hit']) for sp in res['split']]
-
-            if 'partial_match' in df:
-                res['Overall_PM'] = [np.mean(df[df['split'] == sp]['partial_match']) for sp in res['split']]
-        elif group not in df:
-            continue
-        else:
-            abilities = list(set(df[group]))
-            abilities.sort()
-            for ab in abilities:
-                ab_name = MMB_abbrs[ab] if ab in MMB_abbrs else ab
-                sub_df = df[df[group] == ab]
-                res[ab_name] = [np.mean(sub_df[sub_df['split'] == sp]['hit']) for sp in res['split']]
-                if 'partial_match' in df:
-                    res[f'{ab_name}_PM'] = [
-                        np.mean(sub_df[sub_df['split'] == sp]['partial_match'])
-                        for sp in res['split']
-                    ]
-
-    return pd.DataFrame(res)
-
-
 def build_prompt(question, options, prediction):
     tmpl = (
         'You are an AI assistant who will help me to match '
@@ -239,12 +180,15 @@ def build_prompt_wemath(question, options, prediction):
         'You are provided with a question, several options, and an answer, '
         'and you need to find which option is most similar to the answer. '
         'If the meaning of all options are significantly different from the answer, output Z. '
-        'Your should output a single uppercase character in A, B, C, D, E, F, G (if they are valid options), and Z. \n'
+        'Your should output a single uppercase character in A, B, C, D, E, F, G '
+        '(if they are valid options), and Z. \n'
         'Example 1: \n'
-        'Question: <start>\nWhat is the main object in image?\nOptions: A. teddy bear B. rabbit C. cat D. dog\n<end>\n'
+        'Question: <start>\nWhat is the main object in image?\n'
+        'Options: A. teddy bear B. rabbit C. cat D. dog\n<end>\n'
         'Answer: <start>\na cute teddy bear\n<end>\nYour output: A\n'
         'Example 2: \n'
-        'Question: <start>\nWhat is the main object in image?\nOptions: A. teddy bear B. rabbit C. cat D. dog\n<end>\n'
+        'Question: <start>\nWhat is the main object in image?\n'
+        'Options: A. teddy bear B. rabbit C. cat D. dog\n<end>\n'
         'Answer: <start>\nSpider\n<end>\nYour output: Z\n'
         'Example 3: \n'
         'Question: <start>\n{}\nOptions: {}\n<end>\nAnswer: <start>\n{}\n<end>\nYour output: '
@@ -309,31 +253,6 @@ def build_prompt_cn(question, options, prediction):
     return tmpl.format(question, options, prediction)
 
 
-def build_prompt_LEGO(question, options, prediction,question_type):
-    if question_type == 'sort':
-        tmpl = (
-            'You are an AI assistant who will help me to arrange options in the correct order. '
-            'You are provided with a question, four options, and an answer. '
-            'You need to determine the correct ordering of options based on the answer. '
-            'Output should be a permutation of ABCD (like DCBA or BADC).\n'
-            'Example 1:\n'
-            'Question: Arrange these historical events chronologically\n'
-            'Options: A. Renaissance B. Middle Ages C. Industrial Revolution D. Digital Age\n'
-            'Answer: From Middle Ages to Renaissance, then Industrial Revolution, finally Digital Age\n'
-            'Output: BACD\n\n'
-            'Example 2:\n'
-            'Question: Sort colors by wavelength (longest to shortest)\n'
-            'Options: A. Red B. Green C. Blue D. Violet\n'
-            'Answer: Red has longest wavelength, followed by green then blue, shortest is violet\n'
-            'Output: ABCD\n\n'
-            'Example 3:\n'
-            'Question: {}\nOptions: {}\nAnswer: {}\nOutput:'
-        )
-        return tmpl.format(question, options, prediction)
-    else:
-        return build_prompt(question, options, prediction)
-
-
 def build_choices(item):
     ret = {}
     for ch in string.ascii_uppercase:
@@ -343,6 +262,11 @@ def build_choices(item):
 
 
 def prefetch_answer(item):
+    force_llm_judge = str(os.environ.get('FORCE_GPT_JUDGE_ALL', '0')).strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }
+    if force_llm_judge:
+        return False
     choices = build_choices(item)
     return can_infer(item['prediction'], choices)
 
@@ -352,24 +276,23 @@ def extract_answer_from_item(model, item, dataset_name=None):
     # It will return: (pred, raw, llm_time)
     choices = build_choices(item)
     option_str = build_option_str(choices)
+    prediction_tail = tail_tokens_for_judge(item['prediction'], max_tokens=96)
 
     if dataset_name == 'BLINK':
-        prompt = build_prompt_blink(item['question'], option_str, item['prediction'])
-    elif dataset_name == 'WeMath':
-        prompt = build_prompt_wemath(item['question'], option_str, item['prediction'])
+        prompt = build_prompt_blink(item['question'], option_str, prediction_tail)
+    elif dataset_name in {'WeMath', 'WeMath_COT'}:
+        prompt = build_prompt_wemath(item['question'], option_str, prediction_tail)
     elif cn_string(item['question']):
-        prompt = build_prompt_cn(item['question'], option_str, item['prediction'])
-    elif dataset_name is not None and 'LEGO' in dataset_name:
-        prompt = build_prompt_LEGO(item['question'], option_str, item['prediction'],item['question_type'])
+        prompt = build_prompt_cn(item['question'], option_str, prediction_tail)
     else:
-        prompt = build_prompt(item['question'], option_str, item['prediction'])
+        prompt = build_prompt(item['question'], option_str, prediction_tail)
     retry = 3
 
-    if dataset_name is not None and 'LEGO' in dataset_name:
-        ret = can_infer_lego(item['prediction'], item['question_type'], choices)
-    else:
-        ret = can_infer(item['prediction'], choices)
-    if ret:
+    force_llm_judge = str(os.environ.get('FORCE_GPT_JUDGE_ALL', '0')).strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }
+    ret = can_infer(item['prediction'], choices)
+    if (not force_llm_judge) and ret:
         return dict(opt=ret, log=item['prediction'])
     if model is None:
         return dict(opt='Z', log='Failed in Prefetch, no GPT-based answer matching under `exact_matching` policy.')
@@ -379,22 +302,15 @@ def extract_answer_from_item(model, item, dataset_name=None):
         if 'Failed to obtain answer via API' in ans:
             logger.warning('GPT API failed to answer. ')
         else:
-            if dataset_name is not None and 'LEGO' in dataset_name:
-                ret = can_infer_lego(ans, item['question_type'], choices)
-            else:
-                ret = can_infer(ans, choices)
+            ret = can_infer(ans, choices)
             if ret:
                 return dict(opt=ret, log=ans)
             else:
-                logger.warning(
-                    f'Failed to in infer: prediction is {ans}, choice labels are {set(choices)}'
-                    f', Answer is {item["answer"]}' if "answer" in item else ""
-                )
+                logger.warning(f'Output includes 0 / > 1 letter among candidates {set(choices)} and Z: {ans}')
         retry -= 1
 
         if retry == 0:
-            options = list(choices) + ['Z'] if 'Z' not in choices else []
-            return dict(opt=rd.choice(options), log='Failed to predict, thus randomly generate one. ')
+            return dict(opt='Z', log='Failed to predict after judge retries; returning Z. ')
 
 
 # For Circular Evaluation
@@ -431,10 +347,6 @@ def eval_vanilla(model, item, dataset_name=None):
 
 # For Circular Evaluation
 def eval_circular_group(model, sub_data, dataset_name=None):
-    prefetched = prefetch_circular_group(sub_data, verbose=True)
-    if isinstance(prefetched, dict) and 'hit' in prefetched:
-        return prefetched
-
     res, GT, PRED = prefetch_circular_group(sub_data, verbose=True)
     if res is not None:
         return res
@@ -490,7 +402,9 @@ def mcq_vanilla_eval(model, data, meta, nproc, result_file, dataset_name=None):
         res = track_progress_rich(eval_vanilla, tups, nproc=nproc, chunksize=nproc, save=result_file, keys=keys)
         result = load(result_file)
         for k, v in zip(keys, res):
-            if k not in result:
+            if k in result:
+                assert result[k]['hit'] == v['hit'] and result[k]['log'] == v['log']
+            else:
                 result[k] = v
     data['hit'] = [result[i]['hit'] for i in data['index']]
     data['log'] = [result[i]['log'] for i in data['index']]
@@ -509,23 +423,18 @@ def mcq_circular_eval(model, data, meta, nproc, result_file, dataset_name=None):
 
     for idx in list(meta['index']) + list(data['index']):
         assert istype(idx, int)
-    if 'g_index' not in data:
-        data['g_index'] = [int(x % 1e6) for x in data['index']]
 
     # Only keep those lines in the meta data
     data = data[data['index'].isin(answer_map)]
     data['GT'] = [answer_map[idx] for idx in data['index']]
-
-    data['tmp_flag'] = [x == y for x, y in zip(data['index'], data['g_index'])]
-    data_main = data[data['tmp_flag']]
-    data_main.pop('tmp_flag')
+    data_main = data[data['index'] < int(1e6)]
 
     data_groups = []
     for i in range(len(data_main)):
         # Dealing with the normal part
         idx = data_main.iloc[i]['index']
         if idx not in result:
-            sub_data = data[data['g_index'] == idx]
+            sub_data = data[data['index'] % int(1e6) == idx]
             data_groups.append(sub_data)
 
     if len(data_groups):
@@ -533,13 +442,13 @@ def mcq_circular_eval(model, data, meta, nproc, result_file, dataset_name=None):
         remain = []
         for dg, pf in zip(data_groups, prefetched):
             if pf is not None:
-                result[dg.iloc[0]['g_index']] = pf
+                result[dg.iloc[0]['index'] % 1e6] = pf
             else:
                 remain.append(dg)
         dump(result, result_file)
 
         tups = [dict(model=model, sub_data=x, dataset_name=dataset_name) for x in remain]
-        keys = [x.iloc[0]['g_index'] for x in remain]
+        keys = [x.iloc[0]['index'] % 1e6 for x in remain]
 
         if len(tups) == 0:
             pass
@@ -559,11 +468,12 @@ def mcq_circular_eval(model, data, meta, nproc, result_file, dataset_name=None):
                 keys=keys)
             result = load(result_file)
             for k, v in zip(keys, res):
-                if k not in result:
+                if k in result:
+                    assert result[k]['hit'] == v['hit'] and result[k]['log'] == v['log']
+                else:
                     result[k] = v
 
-    tmp_ext = get_pred_file_format()
-    tmp_pth = f'/tmp/{timestr()}.{tmp_ext}'
+    tmp_pth = f'/tmp/{timestr()}.xlsx'
     dump(data_main, tmp_pth)
     data_main = load(tmp_pth)
     indices = data_main['index']
@@ -601,18 +511,6 @@ def extract_characters_regex(s, choices=['(A)', '(B)', '(C)', '(D)', '(E)']):
                 return choice[1]
         return ''
     return matches[0]
-
-
-def report_acc_MMVP(df):
-    assert len(df) % 2 == 0
-    for i in range(len(df) // 2):
-        assert df['question'][2 * i] == df['question'][2 * i + 1]
-    res = {}
-    res['Average'] = np.mean(df['hit'])
-    hits = list(df['hit'])
-    both_correct = [hits[2 * i] and hits[2 * i + 1] for i in range(len(df) // 2)]
-    res['Overall'] = np.mean(both_correct)
-    return d2df(res)
 
 
 def get_dimension_rating(data_path):

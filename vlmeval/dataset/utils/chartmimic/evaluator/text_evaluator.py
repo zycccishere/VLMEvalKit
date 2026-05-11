@@ -195,12 +195,12 @@ for ax in all_axes:
 
 
 if __name__ == "__main__":
-    # sys.path.insert(0, '/home/yc21/project/Princess-s-CHI')
+    example_root = os.environ.get("CHARTMIMIC_EXAMPLE_ROOT", "/path/to/Princess-s-CHI")
 
     evaluator = TextEvaluator(use_axs=False)
     # evaluator = TextEvaluator()
 
-    generation_code_file = "/home/yc21/project/Princess-s-CHI/dataset/line/line_7.py"
-    golden_code_file = "/home/yc21/project/Princess-s-CHI/results/chart2code_gpt_DirectAgent_results/direct/line_7.py"
+    generation_code_file = f"{example_root}/dataset/line/line_7.py"
+    golden_code_file = f"{example_root}/results/chart2code_gpt_DirectAgent_results/direct/line_7.py"
 
     evaluator(generation_code_file, golden_code_file)

@@ -1,0 +1,33 @@
+{
+  "name": "llava13b_aligned_shared_image_text_image_20260330",
+  "family": "llava13b_aligned_shared",
+  "mode": "image_text_image",
+  "policy": "identity",
+  "rule": "manual_caps_from_existing_eval_outputs",
+  "datasets": {
+    "AI2D_TEST": {
+      "max_new_tokens": 32,
+      "reference_column": "ori_prediction",
+      "p95_words": 1.0,
+      "evidence_path": "/path/to/LLaVA/runs/llava-training-replay/pt_image_text_image__sft_image_text_image__eval_image_text_image/vlmeval/default/image_text_image/llava_v1.5_13b_replay/llava_v1.5_13b_replay_AI2D_TEST_gpt-4o-mini_result.xlsx"
+    },
+    "LogicVista": {
+      "max_new_tokens": 96,
+      "reference_column": "prediction",
+      "p95_words": 70.4,
+      "evidence_path": "/path/to/LLaVA/runs/llava-training-replay/pt_image_text_image__sft_image_text_image__eval_image_text_image/vlmeval/default/image_text_image/llava_v1.5_13b_replay/llava_v1.5_13b_replay_LogicVista_gpt4o-mini.xlsx"
+    },
+    "MathVision": {
+      "max_new_tokens": 48,
+      "reference_column": "prediction",
+      "p95_words": 6.0,
+      "evidence_path": "/path/to/LLaVA/runs/llava-training-replay/pt_image_text_image__sft_image_text_image__eval_image_text_image/vlmeval/default/image_text_image/llava_v1.5_13b_replay/llava_v1.5_13b_replay_MathVision_gpt-4o-mini.xlsx"
+    },
+    "DynaMath": {
+      "max_new_tokens": 32,
+      "reference_column": "prediction",
+      "p95_words": 5.0,
+      "evidence_path": "/path/to/LLaVA/runs/llava-training-replay/pt_image_text_image__sft_image_text_image__eval_image_text_image/vlmeval/default/image_text_image/llava_v1.5_13b_replay/llava_v1.5_13b_replay_DynaMath_gpt-4o-mini.xlsx"
+    }
+  }
+}

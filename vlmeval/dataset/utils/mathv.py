@@ -1,18 +1,19 @@
 from ...smp import *
 from ...utils import can_infer
+from .prompt_tail import tail_tokens_for_judge
 import timeout_decorator
 try:
     from latex2sympy2 import latex2sympy
 except Exception as e:
     logging.critical(f'{type(e)}: {e}')
     logging.critical('Please install latex2sympy2 by running "pip install latex2sympy2"')
-    raise e
+from math_verify import parse, verify, LatexExtractionConfig
 
 
 FAIL_MSG = 'Failed to obtain answer via API.'
 
 
-@timeout_decorator.timeout(30)
+@timeout_decorator.timeout(30, use_signals=False)
 def is_equal(asw: str, gt_asw: str) -> bool:
     if not isinstance(asw, str) != str or not isinstance(gt_asw, str):
         print('Warning: input is not string')
@@ -37,6 +38,10 @@ def is_equal(asw: str, gt_asw: str) -> bool:
             return True
     except:
         pass
+    try:
+        return verify(asw, gt_asw)
+    except Exception:
+        return False
     return False
 
 
@@ -87,13 +92,13 @@ Please read the following example.
 Then extract the answer from the model response and type it at the end of the prompt.\n
 """
     question = line['question']
-    prediction = str(line['prediction'])
+    prediction = tail_tokens_for_judge(line['prediction'], max_tokens=512)
     prompt = task_description
     examples = get_gpt4_ICE()
     for example in examples:
         prompt += example + '\n'
     prompt += question + '\n'
-    prompt += 'Model respone: ' + prediction
+    prompt += 'Model response tail (last 512 tokens): ' + prediction
     prompt += 'Extracted answer:'
     return prompt
 
@@ -155,6 +160,7 @@ def MATH_V_acc(result_file):
     fetch = defaultdict(lambda: 0)
     hit = defaultdict(lambda: 0)
     lt = len(data)
+    hit_score = []
     from tqdm import tqdm
     for i in tqdm(range(lt)):
         item = data.iloc[i]
@@ -166,7 +172,10 @@ def MATH_V_acc(result_file):
             fetch[cate] += 1
         if post_check(item, prefetch=False):
             hit['Overall'] += 1
+            hit_score.append(1)
             hit[cate] += 1
+        else:
+            hit_score.append(0)
 
     res = defaultdict(list)
     for k in tot.keys():
@@ -177,4 +186,4 @@ def MATH_V_acc(result_file):
         res['prefetch_rate'].append(fetch[k] / tot[k] * 100)
         res['acc'].append(hit[k] / tot[k] * 100)
     res = pd.DataFrame(res).sort_values('Subject', ignore_index=True)
-    return res
+    return res, hit_score

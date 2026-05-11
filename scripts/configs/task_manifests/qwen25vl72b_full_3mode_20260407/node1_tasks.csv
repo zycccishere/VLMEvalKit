@@ -1,0 +1,9 @@
+model_key,policy,mode,transform,dataset,kind,status,weight
+qwen25vl_72b,default,image_image_text,baseline,LogicVista,baseline,missing,894.00
+qwen25vl_72b,default,image_image_text,baseline,MathVista_MINI,baseline,missing,2000.00
+qwen25vl_72b,default,image_image_text,baseline,VisuLogic,baseline,missing,2000.00
+qwen25vl_72b,default,image_text_image,baseline,DynaMath,baseline,missing,10020.00
+qwen25vl_72b,default,image_text_image,baseline,MathVision,baseline,missing,6080.00
+qwen25vl_72b,default,image_text_image,baseline,SEEDBench2_Plus,baseline,missing,4554.00
+qwen25vl_72b,default,image_text_image,baseline,VisuLogic,baseline,missing,2000.00
+qwen25vl_72b,default,image_text_image,baseline,VisualPuzzles,baseline,missing,2336.00

@@ -1,5 +1,6 @@
 from ...smp import *
 from ...utils import can_infer
+from .prompt_tail import tail_tokens_for_judge
 
 
 FAIL_MSG = 'Failed to obtain answer via API.'
@@ -56,13 +57,13 @@ Please read the following example.
 Then extract the answer from the model response and type it at the end of the prompt.\n
 """
     question = line['question']
-    prediction = str(line['prediction'])
+    prediction = tail_tokens_for_judge(line['prediction'], max_tokens=512)
     prompt = task_description
     examples = get_gpt4_ICE()
     for example in examples:
         prompt += example + '\n'
     prompt += question + '\n'
-    prompt += 'Model respone: ' + prediction
+    prompt += 'Model response tail (last 512 tokens): ' + prediction
     prompt += 'Extracted answer:'
     return prompt
 

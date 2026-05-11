@@ -67,7 +67,7 @@ class KimiVLAPIWrapper(BaseAPI):
             self.logger.error('Unknown API Base. ')
             raise NotImplementedError
 
-        self.logger.info(f'Using API Base: {self.api_base}; API Key: {self.key}')
+        self.logger.info(f'Using API Base: {self.api_base}; API Key: <redacted>')
 
     # inputs can be a lvl-2 nested list: [content1, content2, content3, ...]
     # content can be a string or a list of image & text

@@ -1,5 +1,6 @@
 import torch
 import sys
+import os
 import os.path as osp
 import warnings
 from transformers import StoppingCriteriaList
@@ -13,12 +14,13 @@ class MiniGPT4(BaseModel):
 
     def __init__(self,
                  mode='v2',
-                 root='/mnt/petrelfs/share_data/duanhaodong/MiniGPT-4/',
+                 root=None,
                  temperature=1,
                  max_out_len=512):
 
+        root = root or os.environ.get('MINIGPT4_ROOT')
         if root is None:
-            warnings.warn(
+            raise RuntimeError(
                 'Please set root to the directory of MiniGPT-4, which is cloned from here: '
                 'https://github.com/Vision-CAIR/MiniGPT-4. '
             )

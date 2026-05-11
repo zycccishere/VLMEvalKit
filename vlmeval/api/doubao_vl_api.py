@@ -67,7 +67,7 @@ class DoubaoVLWrapper(BaseAPI):
             timeout=self.timeout
         )
 
-        self.logger.info(f'Using API Base: {self.api_base}; End Point: {self.endpoint}; API Key: {self.key}')
+        self.logger.info(f'Using API Base: {self.api_base}; End Point: {self.endpoint}; API Key: <redacted>')
 
     def dump_image(self, line, dataset):
         """Dump the image(s) of the input line to the corresponding dataset folder.

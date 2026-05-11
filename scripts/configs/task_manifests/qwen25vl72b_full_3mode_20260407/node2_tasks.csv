@@ -1,0 +1,11 @@
+model_key,policy,mode,transform,dataset,kind,status,weight
+qwen25vl_72b,default,image_image_text,baseline,AI2D_TEST,baseline,missing,6176.00
+qwen25vl_72b,default,image_image_text,baseline,OCRBench,baseline,missing,2000.00
+qwen25vl_72b,default,image_text,baseline,AI2D_TEST,baseline,missing,3088.00
+qwen25vl_72b,default,image_text,baseline,DynaMath,baseline,missing,5010.00
+qwen25vl_72b,default,image_text,baseline,LogicVista,baseline,missing,447.00
+qwen25vl_72b,default,image_text,baseline,MathVision,baseline,missing,3040.00
+qwen25vl_72b,default,image_text,baseline,MathVista_MINI,baseline,missing,1000.00
+qwen25vl_72b,default,image_text,baseline,VisuLogic,baseline,missing,1000.00
+qwen25vl_72b,default,image_text_image,baseline,AI2D_TEST,baseline,missing,6176.00
+qwen25vl_72b,default,image_text_image,baseline,OCRBench,baseline,missing,2000.00

@@ -33,7 +33,7 @@ class TaiyiWrapper(BaseAPI):
         super().__init__(retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
         assert url is not None, ('Please set the url ')
         self.url = url
-        self.logger.info(f'Using url: {self.url}; API Key: {self.key}')
+        self.logger.info(f'Using url: {self.url}; API Key: <redacted>')
 
     def use_custom_prompt(self, dataset):
         if DATASET_TYPE(dataset) == 'Y/N' or DATASET_TYPE(dataset) == 'MCQ' or DATASET_TYPE(dataset) == 'VQA':

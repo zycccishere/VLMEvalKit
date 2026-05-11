@@ -1,7 +1,11 @@
 from ..smp import *
 import os
 import sys
+import time
+import fcntl
 from .base import BaseAPI
+from .ori_gpt_client import OpenAIChatClient
+import code, traceback, signal
 
 APIBASES = {
     'OFFICIAL': 'https://api.openai.com/v1/chat/completions',
@@ -22,12 +26,65 @@ def GPT_context_window(model):
         'gpt-3.5-turbo-0125': 16385,
         'gpt-3.5-turbo-1106': 16385,
         'gpt-3.5-turbo-instruct': 4096,
+        'gpt-4o': 16384,
+        'gpt-5': 128000
     }
     if model in length_map:
         return length_map[model]
     else:
         return 128000
 
+
+def resolve_openai_key_from_env() -> str:
+    return (
+        os.environ.get('OPENAI_API_KEY', '').strip()
+        or os.environ.get('OPENAI_API_KEY_JUDGE', '').strip()
+        or os.environ.get('OPENAI_COMPATIBLE_API_KEY', '').strip()
+    )
+
+
+def normalize_openai_compatible_api_base(api_base: str) -> str:
+    base = (api_base or '').strip().rstrip('/')
+    if not base:
+        return base
+    low = base.lower()
+    if low.endswith('/llm'):
+        base = base + '/v1/chat/completions'
+    elif low.endswith('/v1'):
+        base = base + '/chat/completions'
+    elif low.endswith('/v1/chat'):
+        base = base + '/completions'
+    return base
+
+
+def throttle_openai_compatible_request():
+    """Optional cross-process request throttle for low-RPM OpenAI-compatible keys."""
+    min_interval = float(os.environ.get('VLMEVAL_API_MIN_INTERVAL_SECONDS', '0') or 0)
+    if min_interval <= 0:
+        return
+    lock_path = os.environ.get(
+        'VLMEVAL_API_RATE_LIMIT_LOCK',
+        os.path.expanduser('~/.cache/vlmeval_api_rate_limit.lock'),
+    )
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, 'a+', encoding='utf-8') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        raw = f.read().strip()
+        try:
+            last_time = float(raw)
+        except ValueError:
+            last_time = 0.0
+        now = time.time()
+        wait_s = min_interval - (now - last_time)
+        if wait_s > 0:
+            time.sleep(wait_s)
+            now = time.time()
+        f.seek(0)
+        f.truncate()
+        f.write(f'{now:.6f}')
+        f.flush()
+        fcntl.flock(f, fcntl.LOCK_UN)
 
 class OpenAIWrapper(BaseAPI):
 
@@ -36,14 +93,15 @@ class OpenAIWrapper(BaseAPI):
     def __init__(self,
                  model: str = 'gpt-3.5-turbo-0613',
                  retry: int = 5,
+                 wait: int = 5,
                  key: str = None,
-                 verbose: bool = False,
+                 verbose: bool = True,
                  system_prompt: str = None,
                  temperature: float = 0,
-                 timeout: int = 300,
+                 timeout: int = 60,
                  api_base: str = None,
                  max_tokens: int = 2048,
-                 img_size: int = -1,
+                 img_size: int = 512,
                  img_detail: str = 'low',
                  use_azure: bool = False,
                  **kwargs):
@@ -55,7 +113,7 @@ class OpenAIWrapper(BaseAPI):
         self.temperature = temperature
         self.use_azure = use_azure
 
-        if 'step' in model:
+        if 'step-1v' in model:
             env_key = os.environ.get('STEPAI_API_KEY', '')
             if key is None:
                 key = env_key
@@ -63,58 +121,34 @@ class OpenAIWrapper(BaseAPI):
             env_key = os.environ.get('YI_API_KEY', '')
             if key is None:
                 key = env_key
-        elif 'internvl2-pro' in model:
-            env_key = os.environ.get('InternVL2_PRO_KEY', '')
-            if key is None:
-                key = env_key
-        elif 'abab' in model:
-            env_key = os.environ.get('MiniMax_API_KEY', '')
-            if key is None:
-                key = env_key
-        elif 'moonshot' in model:
-            env_key = os.environ.get('MOONSHOT_API_KEY', '')
-            if key is None:
-                key = env_key
-        elif 'grok' in model:
-            env_key = os.environ.get('XAI_API_KEY', '')
-            if key is None:
-                key = env_key
-        elif 'gemini' in model and 'preview' in model:
-            # Will only handle preview models
-            env_key = os.environ.get('GOOGLE_API_KEY', '')
-            if key is None:
-                key = env_key
-            api_base = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        elif 'ernie' in model:
-            env_key = os.environ.get('BAIDU_API_KEY', '')
-            if key is None:
-                key = env_key
-            api_base = 'https://qianfan.baidubce.com/v2/chat/completions'
-            self.baidu_appid = os.environ.get('BAIDU_APP_ID', None)
         else:
             if use_azure:
                 env_key = os.environ.get('AZURE_OPENAI_API_KEY', None)
-                assert env_key is not None, 'Please set the environment variable AZURE_OPENAI_API_KEY. '
+                # assert env_key is not None, 'Please set the environment variable AZURE_OPENAI_API_KEY. '
 
                 if key is None:
                     key = env_key
-                assert isinstance(key, str), (
-                    'Please set the environment variable AZURE_OPENAI_API_KEY to your openai key. '
-                )
+                # assert isinstance(key, str), (
+                #     'Please set the environment variable AZURE_OPENAI_API_KEY to your openai key. '
+                # )
             else:
-                env_key = os.environ.get('OPENAI_API_KEY', '')
+                env_key = resolve_openai_key_from_env()
                 if key is None:
                     key = env_key
+                # assert isinstance(key, str) and key.startswith('sk-'), (
+                #     f'Illegal openai_key {key}. '
+                #     'Please set the environment variable OPENAI_API_KEY to your openai key. '
+                # )
 
         self.key = key
-        assert img_size > 0 or img_size == -1
+        # assert img_size > 0 or img_size == -1
         self.img_size = img_size
-        assert img_detail in ['high', 'low']
+        # assert img_detail in ['high', 'low']
         self.img_detail = img_detail
         self.timeout = timeout
-        self.is_max_completion_tokens = ('o1' in model) or ('o3' in model) or ('o4' in model) or ('gpt-5' in model)
-        self.is_o_model = ('o1' in model) or ('o3' in model) or ('o4' in model)
-        super().__init__(retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
+
+        super().__init__(wait=wait, retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
+        return
 
         if use_azure:
             api_base_template = (
@@ -148,12 +182,10 @@ class OpenAIWrapper(BaseAPI):
                 self.api_base = api_base
             else:
                 self.logger.error('Unknown API Base. ')
-                raise NotImplementedError
-            if os.environ.get('BOYUE', None):
-                self.api_base = os.environ.get('BOYUE_API_BASE')
-                self.key = os.environ.get('BOYUE_API_KEY')
+                sys.exit(-1)
 
-        self.logger.info(f'Using API Base: {self.api_base}; API Key: {self.key}')
+        self.logger.info(f'Using API Base: {self.api_base}; API Key: <redacted>')
+        print(f'Init finished', flush=True)
 
     # inputs can be a lvl-2 nested list: [content1, content2, content3, ...]
     # content can be a string or a list of image & text
@@ -193,49 +225,60 @@ class OpenAIWrapper(BaseAPI):
 
     def generate_inner(self, inputs, **kwargs) -> str:
         input_msgs = self.prepare_inputs(inputs)
+
+        # print(f'Input messages: {input_msgs}', flush=True)
+
         temperature = kwargs.pop('temperature', self.temperature)
         max_tokens = kwargs.pop('max_tokens', self.max_tokens)
+
+        context_window = GPT_context_window(self.model)
+        max_tokens = min(max_tokens, context_window - self.get_token_len(inputs))
+        if 0 < max_tokens <= 100:
+            self.logger.warning(
+                'Less than 100 tokens left, '
+                'may exceed the context window with some additional meta symbols. '
+            )
+        if max_tokens <= 0:
+            return 0, self.fail_msg + 'Input string longer than context window. ', 'Length Exceeded. '
 
         # Will send request if use Azure, dk how to use openai client for it
         if self.use_azure:
             headers = {'Content-Type': 'application/json', 'api-key': self.key}
-        elif 'internvl2-pro' in self.model:
-            headers = {'Content-Type': 'application/json', 'Authorization': self.key}
         else:
             headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {self.key}'}
-        if hasattr(self, 'baidu_appid'):
-            headers['appid'] = self.baidu_appid
-
         payload = dict(
             model=self.model,
             messages=input_msgs,
+            max_tokens=max_tokens,
             n=1,
             temperature=temperature,
             **kwargs)
 
-        if self.is_max_completion_tokens:
-            payload['max_completion_tokens'] = max_tokens
-            payload.pop('temperature')
-        else:
-            payload['max_tokens'] = max_tokens
+        # # START ORIGIN ##
+        # response = requests.post(
+        #     self.api_base,
+        #     headers=headers, data=json.dumps(payload), timeout=self.timeout * 1.1)
 
-        if 'gemini' in self.model:
-            payload.pop('max_tokens')
-            payload.pop('n')
-            payload['reasoning_effort'] = 'high'
+        # END ORIGIN ##
 
-        proxies = {}
-        if os.getenv('http_proxy'):
-            proxies['http'] = os.getenv('http_proxy')
-        if os.getenv('https_proxy'):
-            proxies['https'] = os.getenv('https_proxy')
-        proxies = proxies or None
-
+        # Use native chat-completions payload to keep multimodal message support.
+        api_base = getattr(self, 'api_base', None)
+        if not api_base:
+            # Compatibility fallback for branches where __init__ does not set self.api_base.
+            env_base = (
+                os.environ.get('OPENAI_API_BASE', '').strip()
+                or os.environ.get('OPENAI_API_BASE_JUDGE', '').strip()
+                or os.environ.get('OPENAI_COMPATIBLE_API_BASE', '').strip()
+            )
+            api_base = env_base if env_base else APIBASES['OFFICIAL']
+            self.api_base = api_base
+        if isinstance(api_base, str):
+            api_base = normalize_openai_compatible_api_base(api_base)
+        throttle_openai_compatible_request()
         response = requests.post(
-            self.api_base,
+            api_base,
             headers=headers,
             data=json.dumps(payload),
-            proxies=proxies,
             timeout=self.timeout * 1.1,
         )
         ret_code = response.status_code
@@ -244,11 +287,8 @@ class OpenAIWrapper(BaseAPI):
         try:
             resp_struct = json.loads(response.text)
             answer = resp_struct['choices'][0]['message']['content'].strip()
-        except Exception as err:
-            if self.verbose:
-                self.logger.error(f'{type(err)}: {err}')
-                self.logger.error(response.text if hasattr(response, 'text') else response)
-
+        except Exception:
+            pass
         return ret_code, answer, response
 
     def get_image_token_len(self, img_path, detail='low'):
@@ -272,26 +312,40 @@ class OpenAIWrapper(BaseAPI):
         return total
 
     def get_token_len(self, inputs) -> int:
-        import tiktoken
+        """
+        Estimate token length for inputs.
+        Falls back to character-based estimation if tiktoken fails (e.g., no network).
+        """
         try:
-            enc = tiktoken.encoding_for_model(self.model)
-        except Exception as err:
-            if 'gpt' in self.model.lower():
-                if self.verbose:
-                    self.logger.warning(f'{type(err)}: {err}')
+            import tiktoken
+            try:
+                enc = tiktoken.encoding_for_model(self.model)
+            except:
                 enc = tiktoken.encoding_for_model('gpt-4')
-            else:
-                return 0
-        assert isinstance(inputs, list)
-        tot = 0
-        for item in inputs:
-            if 'role' in item:
-                tot += self.get_token_len(item['content'])
-            elif item['type'] == 'text':
-                tot += len(enc.encode(item['value']))
-            elif item['type'] == 'image':
-                tot += self.get_image_token_len(item['value'], detail=self.img_detail)
-        return tot
+
+            assert isinstance(inputs, list)
+            tot = 0
+            for item in inputs:
+                if 'role' in item:
+                    tot += self.get_token_len(item['content'])
+                elif item['type'] == 'text':
+                    tot += len(enc.encode(item['value']))
+                elif item['type'] == 'image':
+                    tot += self.get_image_token_len(item['value'], detail=self.img_detail)
+            return tot
+        except Exception as e:
+            # Fallback: estimate ~4 characters per token (rough approximation)
+            self.logger.warning(f"tiktoken failed ({type(e).__name__}), using character-based estimation")
+            assert isinstance(inputs, list)
+            tot = 0
+            for item in inputs:
+                if 'role' in item:
+                    tot += self.get_token_len(item['content'])
+                elif item['type'] == 'text':
+                    tot += len(item['value']) // 4 + 1
+                elif item['type'] == 'image':
+                    tot += self.get_image_token_len(item['value'], detail=self.img_detail)
+            return tot
 
 
 class GPT4V(OpenAIWrapper):

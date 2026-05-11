@@ -1,0 +1,55 @@
+name: gemma4_replay_smoke_20260418
+repo_root: "{repo_root}"
+results_root: runs/smoke_gemma4_replay_20260418
+node_gpu_ids: "0,1,2,3"
+datasets:
+  - AI2D_TEST
+  - DynaMath
+dataset_index_allowlists:
+  AI2D_TEST: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_ai2d_test_20260403.txt"
+  DynaMath: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_dynamath_20260401.txt"
+policies:
+  direct:
+    replay_prompt_template_name: directly_answer
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text
+  - image_text_image
+models:
+  - gemma4_e2b
+  - gemma4_e4b
+  - gemma4_26b_a4b
+  - gemma4_31b
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 1
+  safe_truncate_chars: 6000
+  stage_debug: 1
+  stage_debug_samples: 2
+  prompt_audit: 1
+  prompt_audit_print: 1
+trace:
+  level: full
+  samples: 2
+  dump_max_chars: 24000
+  prompt_audit_print: 1
+answer_format:
+  enable: 1
+  require_boxed: 0
+  response_col: prediction
+  fallback_col: detailed_prediction
+  max_fails: 50
+evaluation:
+  launch_mode: skip
+  nproc: 8
+  judge: gpt-4o-mini
+  openai_api_key: ""
+  openai_api_base: https://api.openai.com/v1
+worker_monitor:
+  enable: true
+  interval_seconds: 600
+resume_infer_default: false

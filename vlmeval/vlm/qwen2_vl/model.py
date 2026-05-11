@@ -1,18 +1,36 @@
 from __future__ import annotations
+
 import os
 import sys
 import warnings
 import math
 import logging
 import json
+import time
+from typing import Any
 
 import torch
 from transformers import StoppingCriteria
-from huggingface_hub import snapshot_download
 
 from ..base import BaseModel
 from .prompt import Qwen2VLPromptMixin
-from ...smp import get_gpu_memory, listinstr, get_cache_path
+from ..replay_policy import (
+    apply_replay,
+    canonicalize_replay_mode,
+    is_noop_replay_mode,
+    maybe_debug_print_replay,
+    read_replay_config_from_env,
+)
+from ..replay_image_transform import (
+    apply_image_transform_to_content,
+    canonicalize_image_transform,
+)
+from .replay_prompt_template import (
+    apply_prompt_template_to_content,
+    read_prompt_template_config_from_env,
+    strip_prompt_template_from_content_for_direct_answer,
+)
+from ...smp import get_gpu_memory, listinstr
 from ...dataset import DATASET_MODALITY
 
 VLLM_MAX_IMAGE_INPUT_NUM = 24
@@ -188,7 +206,6 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         top_k=1,
         temperature=0.01,
         repetition_penalty=1.0,
-        do_sample: bool = True,
         use_custom_prompt: bool = True,
         system_prompt: str | None = None,
         post_process: bool = False,  # if True, will try to only extract stuff in the last \boxed{}.
@@ -209,8 +226,8 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             top_k=top_k,
             temperature=temperature,
             repetition_penalty=repetition_penalty,
-            do_sample=do_sample,
         )
+        # assert False
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
@@ -222,65 +239,80 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                   the fps/nframe setting in video dataset is omitted")
         self.use_audio_in_video = use_audio_in_video
         self.FRAME_FACTOR = 2
-
         assert model_path is not None
-
-        if not os.path.exists(model_path):
-            cache_path = get_cache_path(model_path, repo_type='models')
-            if cache_path is None:
-                snapshot_download(repo_id=model_path)
-                cache_path = get_cache_path(model_path, repo_type='models')
-            model_path = cache_path
-
         self.model_path = model_path
-
         MODEL_CLS = None
 
-        cfg_json_path = os.path.join(self.model_path, 'config.json')
-        assert cfg_json_path is not None, 'Qwen series models require a config.json file to specify the architecture.'
-
-        with open(cfg_json_path, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
-            architectures = str(cfg.get("architectures", None)).lower()
-
-        if listinstr(['omni'], architectures):
+        if listinstr(['omni'], model_path.lower()):
             try:
                 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
             except Exception as err:
                 logging.critical("pip install git+https://github.com/huggingface/transformers@3a1ead0aabed473eafe527915eea8c197d424356")  # noqa: E501
                 raise err
             MODEL_CLS = Qwen2_5OmniForConditionalGeneration
-            self.processor = Qwen2_5OmniProcessor.from_pretrained(self.model_path)
-
-        elif listinstr(['qwen2_5'], architectures):
+            self.processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
+        elif listinstr(['perceiver'], model_path.lower()):
             from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
             MODEL_CLS = Qwen2_5_VLForConditionalGeneration
-            self.processor = AutoProcessor.from_pretrained(self.model_path)
-
+            self.processor = AutoProcessor.from_pretrained(model_path)
+        elif listinstr(['2.5', '2_5', 'qwen25', 'mimo'], model_path.lower()):
+            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+            MODEL_CLS = Qwen2_5_VLForConditionalGeneration
+            self.processor = AutoProcessor.from_pretrained(model_path)
         else:
             from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
             MODEL_CLS = Qwen2VLForConditionalGeneration
-            self.processor = Qwen2VLProcessor.from_pretrained(self.model_path)
+            self.processor = Qwen2VLProcessor.from_pretrained(model_path)
 
         gpu_mems = get_gpu_memory()
         max_gpu_mem = max(gpu_mems) if gpu_mems != [] else -1
         assert max_gpu_mem > 0
-        self.use_vllm = kwargs.get('use_vllm', False)
+        self.use_vllm = kwargs.get('use_vllm', True)
         self.use_lmdeploy = kwargs.get('use_lmdeploy', False)
-        self.limit_mm_per_prompt = VLLM_MAX_IMAGE_INPUT_NUM
+        env_limit_mm = os.environ.get("REPLAY_LIMIT_MM_PER_PROMPT", "").strip()
+        if env_limit_mm.isdigit():
+            self.limit_mm_per_prompt = max(1, int(env_limit_mm))
+        else:
+            self.limit_mm_per_prompt = VLLM_MAX_IMAGE_INPUT_NUM
         assert self.use_vllm + self.use_lmdeploy <= 1, "You can only set one flag between `use_vllm` and `use_lmdeploy` to True"  # noqa: E501
 
         if self.use_vllm:
             from vllm import LLM
             gpu_count = torch.cuda.device_count()
-            if gpu_count >= 8:
-                tp_size = 8
-            elif gpu_count >= 4:
-                tp_size = 4
-            elif gpu_count >= 2:
-                tp_size = 2
-            else:
-                tp_size = 1
+            env_max_model_len = os.environ.get("VLLM_MAX_MODEL_LEN", "").strip()
+            env_max_num_seqs = os.environ.get("VLLM_MAX_NUM_SEQS", "").strip()
+            # Allow explicit override by kwargs/env; otherwise auto-pick a valid TP size.
+            tp_size = kwargs.get('tensor_parallel_size', None)
+            if tp_size is None:
+                env_tp_size = os.environ.get('VLLM_TP_SIZE', '').strip()
+                tp_size = int(env_tp_size) if env_tp_size.isdigit() else None
+
+            if tp_size is None:
+                num_attention_heads = None
+                try:
+                    from transformers import AutoConfig
+                    cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+                    num_attention_heads = getattr(cfg, 'num_attention_heads', None)
+                    if num_attention_heads is None and hasattr(cfg, 'text_config'):
+                        num_attention_heads = getattr(cfg.text_config, 'num_attention_heads', None)
+                except Exception as err:
+                    logging.warning(f'Failed to read num_attention_heads from config, fallback TP heuristic. {err}')
+
+                if num_attention_heads is not None:
+                    valid_tp = [tp for tp in range(min(gpu_count, int(num_attention_heads)), 0, -1)
+                                if int(num_attention_heads) % tp == 0]
+                    tp_size = valid_tp[0] if valid_tp else 1
+                else:
+                    if gpu_count >= 8:
+                        tp_size = 8
+                    elif gpu_count >= 4:
+                        tp_size = 4
+                    elif gpu_count >= 2:
+                        tp_size = 2
+                    else:
+                        tp_size = 1
+
+            tp_size = max(1, min(int(tp_size), max(1, gpu_count)))
             logging.info(
                 f'Using vLLM for {self.model_path} inference with {tp_size} GPUs (available: {gpu_count})'
             )
@@ -289,13 +321,27 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                     'VLLM_WORKER_MULTIPROC_METHOD is not set to spawn.'
                     'Use \'export VLLM_WORKER_MULTIPROC_METHOD=spawn\' to avoid potential multi-process issues'
                 )
+            # Keep max_model_len configurable because some vLLM/Triton builds can fail
+            # rotary/profile runs on very long context (e.g. 32768) for Qwen2-VL.
+            max_model_len = kwargs.get("max_model_len", None)
+            if max_model_len is None:
+                max_model_len = int(env_max_model_len) if env_max_model_len.isdigit() else 8192
+            max_num_seqs = int(env_max_num_seqs) if env_max_num_seqs.isdigit() else 5
+            env_enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "").strip().lower()
+            enforce_eager = env_enforce_eager in {"1", "true", "yes", "on"}
+            gpu_utils = kwargs.get("gpu_utils", None)
+            if gpu_utils is None:
+                env_gpu_utils = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "").strip()
+                gpu_utils = float(env_gpu_utils) if env_gpu_utils else 0.9
             self.llm = LLM(
                 model=self.model_path,
-                max_num_seqs=5,
-                max_model_len=32768,
+                max_num_seqs=max_num_seqs,
+                max_model_len=max_model_len,
                 limit_mm_per_prompt={"image": self.limit_mm_per_prompt},
                 tensor_parallel_size=tp_size,
-                gpu_memory_utilization=kwargs.get("gpu_utils", 0.9),
+                gpu_memory_utilization=gpu_utils,
+                trust_remote_code=True,
+                enforce_eager=enforce_eager,
             )
 
         elif self.use_lmdeploy:
@@ -309,11 +355,295 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             self.device = 'cuda'
         else:
             self.model = MODEL_CLS.from_pretrained(
-                model_path, torch_dtype='auto', device_map="auto", attn_implementation='flash_attention_2'
+                model_path, torch_dtype='auto', device_map="auto", trust_remote_code=True
             )
             self.model.eval()
 
         torch.cuda.empty_cache()
+
+        legacy_stage_debug = os.environ.get("REPLAY_STAGE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+        trace_level = os.environ.get("REPLAY_TRACE_LEVEL", "").strip().lower()
+        if trace_level not in {"off", "summary", "full"}:
+            if legacy_stage_debug or os.environ.get("REPLAY_DUMP_DIR", "").strip() or os.environ.get("REPLAY_PROMPT_AUDIT", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                trace_level = "summary"
+            else:
+                trace_level = "off"
+        self._replay_trace_level = trace_level
+        self._stage_debug_enabled = trace_level in {"summary", "full"}
+        self._stage_debug_max_samples = int(
+            os.environ.get(
+                "REPLAY_TRACE_SAMPLES",
+                os.environ.get("REPLAY_STAGE_DEBUG_SAMPLES", "3"),
+            )
+        )
+        self._stage_debug_seen_samples = 0
+        self._stage_debug_active = False
+
+        self._replay_dump_dir = os.environ.get("REPLAY_TRACE_DIR", os.environ.get("REPLAY_DUMP_DIR", "")).strip()
+        self._replay_dump_file = None
+        self._replay_dump_max_chars = int(
+            os.environ.get("REPLAY_TRACE_MAX_CHARS", os.environ.get("REPLAY_DUMP_MAX_CHARS", "0"))
+        )
+        self._prompt_audit_enabled = (
+            os.environ.get("REPLAY_PROMPT_AUDIT", "0").strip().lower() in {"1", "true", "yes", "on"}
+            or trace_level in {"summary", "full"}
+        )
+        self._prompt_audit_print = os.environ.get("REPLAY_PROMPT_AUDIT_PRINT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self._last_trace_state: dict[str, Any] = {}
+        if self._replay_dump_dir:
+            os.makedirs(self._replay_dump_dir, exist_ok=True)
+            self._replay_dump_file = os.path.join(self._replay_dump_dir, f"{self.__class__.__name__}.jsonl")
+            print(f"[replay-dump] enabled. Writing to {self._replay_dump_file}", flush=True)
+
+    def _trace_allows(self, detail: str = "summary") -> bool:
+        if not self._stage_debug_active:
+            return False
+        if self._replay_trace_level == "off":
+            return False
+        if self._replay_trace_level == "full":
+            return True
+        return detail != "full"
+
+    def _begin_stage_debug_sample(self):
+        if self._stage_debug_enabled and self._stage_debug_seen_samples < self._stage_debug_max_samples:
+            self._stage_debug_seen_samples += 1
+            self._stage_debug_active = True
+        else:
+            self._stage_debug_active = False
+        if not self._stage_debug_active:
+            self._last_trace_state = {}
+
+    def _stage_debug(self, stage: str, payload: dict, detail: str = "summary"):
+        if not self._trace_allows(detail):
+            return
+        info = {"stage": stage, "model": self.__class__.__name__}
+        info.update(payload)
+        try:
+            print("[REPLAY_TRACE] " + json.dumps(info, ensure_ascii=False), flush=True)
+        except Exception:
+            print(f"[REPLAY_TRACE] stage={stage} model={self.__class__.__name__}", flush=True)
+
+    def _clip_text(self, text: str) -> str:
+        if not isinstance(text, str):
+            text = str(text)
+        max_chars = self._replay_dump_max_chars
+        if max_chars > 0 and len(text) > max_chars:
+            return text[:max_chars] + f"\n...[TRUNCATED {len(text) - max_chars} chars]"
+        return text
+
+    @staticmethod
+    def _has_boxed_instruction(text: str) -> bool:
+        if not isinstance(text, str):
+            return False
+        lowered = text.lower()
+        return ("\\boxed{" in text) or ("boxed{<answer>}" in lowered)
+
+    @staticmethod
+    def _has_one_line_instruction(text: str) -> bool:
+        if not isinstance(text, str):
+            return False
+        return "return exactly one line in this format" in text.lower()
+
+    def _collect_text_blocks(self, content: list[dict]) -> list[dict]:
+        blocks = []
+        for idx, item in enumerate(content):
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            text = item.get("text", "")
+            blocks.append(
+                {
+                    "index": idx,
+                    "chars": len(text),
+                    "has_boxed_instruction": self._has_boxed_instruction(text),
+                    "has_one_line_instruction": self._has_one_line_instruction(text),
+                    "text": self._clip_text(text),
+                }
+            )
+        return blocks
+
+    def _summarize_prompt_flags(self, text: str) -> dict:
+        return {
+            "prompt_chars": len(text) if isinstance(text, str) else len(str(text)),
+            "prompt_has_boxed_instruction": self._has_boxed_instruction(text),
+            "prompt_has_one_line_instruction": self._has_one_line_instruction(text),
+        }
+
+    def _safe_image_ref(self, image_ref):
+        if isinstance(image_ref, str):
+            if image_ref.startswith("data:"):
+                return f"{image_ref[:64]}...[len={len(image_ref)}]"
+            return image_ref
+        return str(image_ref)
+
+    def _summarize_mm(self, mm_items):
+        if mm_items is None:
+            return []
+        summary = []
+        for idx, item in enumerate(mm_items):
+            if isinstance(item, torch.Tensor):
+                summary.append(
+                    {
+                        "index": idx,
+                        "type": "tensor",
+                        "shape": list(item.shape),
+                        "dtype": str(item.dtype),
+                        "device": str(item.device),
+                    }
+                )
+            else:
+                summary.append(
+                    {
+                        "index": idx,
+                        "type": type(item).__name__,
+                        "repr": self._clip_text(repr(item)),
+                    }
+                )
+        return summary
+
+    def _write_replay_dump(self, record: dict, detail: str = "summary"):
+        if not self._replay_dump_file or not self._trace_allows(detail):
+            return
+        payload = {
+            "ts": time.time(),
+            "model_class": self.__class__.__name__,
+            "trace_level": self._replay_trace_level,
+        }
+        payload.update(record)
+        try:
+            with open(self._replay_dump_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[replay-dump] write failed: {e}", flush=True)
+
+    def _extract_replay_meta(self, inputs: list[dict[str, Any]]) -> dict[str, Any]:
+        for item in inputs:
+            if isinstance(item, dict) and isinstance(item.get("replay_meta"), dict):
+                return dict(item["replay_meta"])
+        return {}
+
+    def _find_image_token_spans(self, input_ids: list[int]) -> list[dict[str, int]]:
+        image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        spans = []
+        start = None
+        for idx, token_id in enumerate(input_ids):
+            if token_id == image_token_id and start is None:
+                start = idx
+            elif token_id != image_token_id and start is not None:
+                spans.append({"image_position": len(spans) + 1, "start": start, "end": idx - 1})
+                start = None
+        if start is not None:
+            spans.append({"image_position": len(spans) + 1, "start": start, "end": len(input_ids) - 1})
+        return spans
+
+    def _summarize_token_ids(self, token_ids: list[int], detail: str = "summary") -> Any:
+        if detail == "full" or len(token_ids) <= 256:
+            return token_ids
+        return {
+            "length": len(token_ids),
+            "head": token_ids[:128],
+            "tail": token_ids[-128:],
+        }
+
+    def _record_processor_trace(
+        self,
+        *,
+        text,
+        images,
+        videos,
+        dataset: str | None,
+        replayed_content: list[dict[str, Any]],
+    ) -> None:
+        if not self._trace_allows("summary"):
+            return
+        try:
+            processor_inputs = self.processor(
+                text=text,
+                images=images,
+                videos=videos,
+                padding=True,
+                return_tensors="pt",
+            )
+        except Exception as err:
+            self._write_replay_dump(
+                {
+                    "phase": "processor_trace_failed",
+                    "dataset": str(dataset) if dataset is not None else None,
+                    "error_type": type(err).__name__,
+                    "error": self._clip_text(str(err)),
+                },
+                detail="summary",
+            )
+            return
+
+        input_ids = processor_inputs.get("input_ids")
+        attention_mask = processor_inputs.get("attention_mask")
+        if input_ids is None or attention_mask is None:
+            return
+        prompt_ids = input_ids[0].tolist()
+        prompt_mask = attention_mask[0].tolist()
+        image_spans = self._find_image_token_spans(prompt_ids)
+        target_span = image_spans[1] if len(image_spans) >= 2 else None
+        self._last_trace_state = {
+            "dataset": str(dataset) if dataset is not None else None,
+            "prompt_token_count": len(prompt_ids),
+            "prompt_token_ids": prompt_ids,
+            "image_token_spans": image_spans,
+            "target_image_span": target_span,
+            "replayed_content": replayed_content,
+        }
+        token_payload = {
+            "dataset": str(dataset) if dataset is not None else None,
+            "prompt_token_count": len(prompt_ids),
+            "attention_mask_count": int(sum(prompt_mask)),
+            "prompt_token_ids": self._summarize_token_ids(prompt_ids, detail="full"),
+            "attention_mask": self._summarize_token_ids(prompt_mask, detail="full"),
+            "image_token_spans": image_spans,
+            "target_image_span": target_span,
+        }
+        self._stage_debug("processor_inputs", token_payload, detail="full")
+        self._write_replay_dump(
+            {
+                "phase": "processor_inputs",
+                **token_payload,
+                "processor_tensor_summary": {
+                    key: {
+                        "shape": list(value.shape),
+                        "dtype": str(value.dtype),
+                    }
+                    for key, value in processor_inputs.items()
+                    if hasattr(value, "shape") and hasattr(value, "dtype")
+                },
+            },
+            detail="full",
+        )
+
+    def _record_generation_loss_mask(self, generated_text: str, dataset: str | None) -> None:
+        if not self._trace_allows("full") or not self._last_trace_state:
+            return
+        prompt_ids = list(self._last_trace_state.get("prompt_token_ids", []))
+        if not prompt_ids:
+            return
+        output_ids = self.processor.tokenizer(
+            generated_text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        prompt_len = len(prompt_ids)
+        supervised_count = len(output_ids)
+        labels = ([-100] * prompt_len) + list(output_ids)
+        loss_mask = ([0] * prompt_len) + ([1] * supervised_count)
+        payload = {
+            "phase": "loss_mask",
+            "dataset": str(dataset) if dataset is not None else None,
+            "prompt_token_count": prompt_len,
+            "generated_token_count": supervised_count,
+            "loss_mask": self._summarize_token_ids(loss_mask, detail="full"),
+            "labels": self._summarize_token_ids(labels, detail="full"),
+            "supervised_token_span": None if supervised_count == 0 else {"start": prompt_len, "end": prompt_len + supervised_count - 1},
+            "generated_token_ids": self._summarize_token_ids(list(output_ids), detail="full"),
+        }
+        self._stage_debug("loss_mask", payload, detail="full")
+        self._write_replay_dump(payload, detail="full")
 
     def _prepare_content(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
         """
@@ -538,7 +868,16 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         response = response.text
         return response
 
-    def generate_inner_vllm(self, message, dataset=None):
+    def _build_vllm_sampling_params(self):
+        from vllm import SamplingParams
+
+        return SamplingParams(
+            temperature=0.0,
+            max_tokens=self.max_new_tokens,
+            stop_token_ids=None,
+        )
+
+    def _build_vllm_request(self, message, dataset=None):
         from vllm import SamplingParams
 
         if listinstr(['omni'], self.model_path.lower()):
@@ -555,9 +894,17 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 raise err
 
         messages = []
+        videos_nd = None
         if self.system_prompt is not None:
             messages.append({'role': 'system', 'content': self.system_prompt})
         messages.append({'role': 'user', 'content': self._prepare_content_vllm(message, dataset=dataset)})
+        self._stage_debug(
+            "after_prepare_content_vllm",
+            {
+                "dataset": str(dataset) if dataset is not None else None,
+                "message_preview": str(messages)[:1200],
+            },
+        )
         if self.verbose:
             print(f'\033[31m{messages}\033[0m')
 
@@ -566,7 +913,59 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             audios, images, videos = process_mm_info(messages, use_audio_in_video=self.use_audio_in_video)
         else:
             images, videos = process_vision_info(messages)
-        print('finishing process vision info in vllm.')
+
+        replayed_content = messages[-1].get("content", []) if messages else []
+        replayed_image_refs = [
+            self._safe_image_ref(item.get("image"))
+            for item in replayed_content
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        image_pad_count = text.count("<|image_pad|>") if isinstance(text, str) else 0
+        self._record_processor_trace(
+            text=text,
+            images=images,
+            videos=videos,
+            dataset=dataset,
+            replayed_content=replayed_content,
+        )
+        self._write_replay_dump(
+            {
+                "phase": "prepared",
+                "dataset": str(dataset) if dataset is not None else None,
+                "replay_cfg": getattr(self, "replay_cfg", None),
+                "prompt": self._clip_text(text),
+                **self._summarize_prompt_flags(text),
+                "prompt_image_pad_count": image_pad_count,
+                "message_input": message,
+                "message_replayed": replayed_content,
+                "replayed_image_refs": replayed_image_refs,
+                "replayed_image_count": len(replayed_image_refs),
+                "vision_extract_image_count": len(images) if images is not None else 0,
+                "vision_extract_video_count": len(videos) if videos is not None else 0,
+                "vision_extract_image_summary": self._summarize_mm(images),
+                "vision_extract_video_summary": self._summarize_mm(videos),
+                "image_token_spans": self._last_trace_state.get("image_token_spans", []),
+                "target_image_span": self._last_trace_state.get("target_image_span"),
+            }
+        )
+
+        if replayed_image_refs and images is not None and len(images) < len(replayed_image_refs):
+            logging.warning(
+                "[replay-dump] Extracted image count (%d) is less than replayed image count (%d). "
+                "This may indicate clipping by limit_mm_per_prompt or prompt formatting issue.",
+                len(images),
+                len(replayed_image_refs),
+            )
+        self._stage_debug(
+            "after_chat_template_and_vision_info",
+            {
+                "dataset": str(dataset) if dataset is not None else None,
+                **self._summarize_prompt_flags(text),
+                "num_images": len(images) if images is not None else 0,
+                "num_videos": len(videos) if videos is not None else 0,
+                "prompt_preview": str(text)[:1200],
+            },
+        )
 
         if DATASET_MODALITY(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
             assert len(videos) == 1
@@ -584,33 +983,31 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 video_inputs['mm_processor_kwargs']['use_audio_in_video'] = True
             if videos_nd[0].shape[0] > VLLM_MAX_IMAGE_INPUT_NUM:
                 print('video input sequence may be too long for vllm, Maybe cannot generate response for VLLM')
-        sampling_params = SamplingParams(
-            temperature=0.0, max_tokens=self.max_new_tokens, stop_token_ids=None
-        )
         if images:
-            outputs = self.llm.generate(
-                {
-                    "prompt": text,
-                    "multi_modal_data": {"image": images},
-                },
-                sampling_params=sampling_params,
-            )
+            req = {
+                "prompt": text,
+                "multi_modal_data": {"image": images},
+            }
         elif videos_nd:
-            outputs = self.llm.generate(
-                video_inputs,
-                sampling_params=sampling_params,
-            )
+            req = video_inputs
         else:
-            outputs = self.llm.generate(
-                {
-                    "prompt": text,
-                },
-                sampling_params=sampling_params,
-            )
+            req = {
+                "prompt": text,
+            }
+        return req
 
-        for o in outputs:
-            generated_text = o.outputs[0].text
+    def _finalize_vllm_generated_text(self, generated_text, dataset=None):
 
+        self._write_replay_dump(
+            {
+                "phase": "generated",
+                "dataset": str(dataset) if dataset is not None else None,
+                "replay_cfg": getattr(self, "replay_cfg", None),
+                "output_text": self._clip_text(generated_text),
+                "output_text_len": len(generated_text) if isinstance(generated_text, str) else None,
+            }
+        )
+        self._record_generation_loss_mask(generated_text, dataset=dataset)
         if self.post_process:
             resp = generated_text.split('\\boxed{')[-1]
             lt = len(resp)
@@ -633,13 +1030,342 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             print(f'\033[32m{generated_text}\033[0m')
         return generated_text
 
+    def generate_inner_vllm(self, message, dataset=None):
+        sampling_params = self._build_vllm_sampling_params()
+        req = self._build_vllm_request(message, dataset=dataset)
+        outputs = self.llm.generate(req, sampling_params=sampling_params)
+        generated_text = ''
+        for o in outputs:
+            generated_text = o.outputs[0].text
+        return self._finalize_vllm_generated_text(generated_text, dataset=dataset)
+
     def generate_inner(self, message, dataset=None):
+        self._begin_stage_debug_sample()
         if self.use_vllm:
             return self.generate_inner_vllm(message, dataset=dataset)
         elif self.use_lmdeploy:
             return self.generate_inner_lmdeploy(message, dataset=dataset)
         else:
             return self.generate_inner_transformers(message, dataset=dataset)
+
+    def generate_batch_inner(self, messages, dataset=None):
+        if self.use_vllm:
+            self._begin_stage_debug_sample()
+            if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], list):
+                if DATASET_MODALITY(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
+                    return [self.generate_inner_vllm(msg, dataset=dataset) for msg in messages]
+                sampling_params = self._build_vllm_sampling_params()
+                reqs = [self._build_vllm_request(msg, dataset=dataset) for msg in messages]
+                outputs = self.llm.generate(reqs, sampling_params=sampling_params)
+                results = []
+                for output in outputs:
+                    generated_text = ''
+                    if getattr(output, 'outputs', None):
+                        generated_text = output.outputs[0].text
+                    results.append(self._finalize_vllm_generated_text(generated_text, dataset=dataset))
+                return results
+            return [self.generate_inner_vllm(messages, dataset=dataset)]
+
+
+class Qwen2VLChatReplay(Qwen2VLChat):
+    """Replay-enabled Qwen2VLChat with minimal intrusion."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.replay_cfg = read_replay_config_from_env()
+        self.prompt_template_cfg = read_prompt_template_config_from_env()
+        self.template_on_last_replay_text = os.environ.get("REPLAY_TEMPLATE_ON_LAST_REPLAY_TEXT", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        print(f"[Qwen2VLChatReplay] replay_cfg={self.replay_cfg}", flush=True)
+        print(f"[Qwen2VLChatReplay] prompt_template_cfg={self.prompt_template_cfg}", flush=True)
+        print(
+            f"[Qwen2VLChatReplay] template_on_last_replay_text={self.template_on_last_replay_text}",
+            flush=True,
+        )
+        self.safe_fallback_enabled = os.environ.get("REPLAY_SAFE_FALLBACK", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.safe_fallback_truncate_chars = max(
+            512, int(os.environ.get("REPLAY_SAFE_TRUNCATE_CHARS", "6000"))
+        )
+        print(
+            f"[Qwen2VLChatReplay] safe_fallback_enabled={self.safe_fallback_enabled} "
+            f"safe_fallback_truncate_chars={self.safe_fallback_truncate_chars}",
+            flush=True,
+        )
+        self.image_transform_name = canonicalize_image_transform(os.environ.get("REPLAY_IMAGE_TRANSFORM", "baseline"))
+        self.image_transform_cache_dir = os.environ.get("REPLAY_IMAGE_TRANSFORM_CACHE_DIR", "").strip()
+        self.image_transform_target_position = max(
+            1,
+            int(os.environ.get("REPLAY_IMAGE_TRANSFORM_TARGET_POSITION", "2")),
+        )
+        print(
+            f"[Qwen2VLChatReplay] image_transform={self.image_transform_name} "
+            f"target_position={self.image_transform_target_position} "
+            f"cache_dir={self.image_transform_cache_dir or '<disabled>'}",
+            flush=True,
+        )
+
+    def _apply_prompt_template_to_content(
+        self,
+        content: list[dict[str, str]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        templated = apply_prompt_template_to_content(
+            content,
+            self.prompt_template_cfg,
+            dataset=dataset,
+        )
+        before_blocks = self._collect_text_blocks(content)
+        after_blocks = self._collect_text_blocks(templated)
+        audit_info = {
+            "template_name": self.prompt_template_cfg.get("name"),
+            "template_source": self.prompt_template_cfg.get("source"),
+            "before_text_blocks": before_blocks,
+            "after_text_blocks": after_blocks,
+            "before_any_boxed_instruction": any(x.get("has_boxed_instruction") for x in before_blocks),
+            "after_any_boxed_instruction": any(x.get("has_boxed_instruction") for x in after_blocks),
+            "before_any_one_line_instruction": any(x.get("has_one_line_instruction") for x in before_blocks),
+            "after_any_one_line_instruction": any(x.get("has_one_line_instruction") for x in after_blocks),
+        }
+        self._stage_debug(
+            "prompt_template_before_after",
+            {
+                **audit_info,
+                "before_preview": str(content)[:1200],
+                "after_preview": str(templated)[:1200],
+            },
+        )
+        if self._prompt_audit_enabled:
+            self._write_replay_dump(
+                {
+                    "phase": "prompt_template_before_after",
+                    **audit_info,
+                }
+            )
+            if self._prompt_audit_print:
+                print(
+                    "[PROMPT_AUDIT] "
+                    + json.dumps(
+                        {
+                            "template": self.prompt_template_cfg.get("name"),
+                            "before_boxed": audit_info["before_any_boxed_instruction"],
+                            "after_boxed": audit_info["after_any_boxed_instruction"],
+                            "before_one_line": audit_info["before_any_one_line_instruction"],
+                            "after_one_line": audit_info["after_any_one_line_instruction"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+        return templated
+
+    def _apply_replay_to_content(self, content: list[dict[str, str]]) -> list[dict[str, str]]:
+        replayed = apply_replay(
+            content,
+            mode=self.replay_cfg["mode"],
+            repeat_times=self.replay_cfg["repeat_times"],
+            image_copy_mode=self.replay_cfg["image_copy_mode"],
+        )
+        self._stage_debug(
+            "replay_before_after",
+            {
+                "replay_mode": self.replay_cfg["mode"],
+                "before_preview": str(content)[:1200],
+                "after_preview": str(replayed)[:1200],
+            },
+        )
+        maybe_debug_print_replay(
+            enabled=self.replay_cfg["debug"],
+            mode=self.replay_cfg["mode"],
+            before=content,
+            after=replayed,
+            tag=self.__class__.__name__,
+        )
+        return replayed
+
+    def _apply_template_replay_pipeline(
+        self,
+        content: list[dict[str, str]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        # Default behavior: template first, then replay (legacy behavior).
+        # Optional behavior: if replay is enabled and this flag is on,
+        # replay first and template only the last text of replayed content.
+        use_last_replay_text = getattr(self, "template_on_last_replay_text", False)
+        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+        if use_last_replay_text and not is_noop_replay_mode(replay_mode):
+            replay_source = content
+            if self.prompt_template_cfg.get("name") == "directly_answer":
+                replay_source = strip_prompt_template_from_content_for_direct_answer(
+                    content,
+                    dataset=dataset,
+                    text_key="text",
+                )
+            replayed = self._apply_replay_to_content(replay_source)
+            return self._apply_prompt_template_to_content(replayed, dataset=dataset)
+
+        templated = self._apply_prompt_template_to_content(content, dataset=dataset)
+        return self._apply_replay_to_content(templated)
+
+    def _apply_image_transform_pipeline(
+        self,
+        content: list[dict[str, str]],
+        *,
+        inputs: list[dict[str, Any]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        if self.image_transform_name == "baseline":
+            return content
+        replay_meta = self._extract_replay_meta(inputs)
+        transformed, transform_record = apply_image_transform_to_content(
+            content,
+            transform_name=self.image_transform_name,
+            sample_meta=replay_meta,
+            cache_dir=self.image_transform_cache_dir or os.path.join(os.getcwd(), ".replay_transform_cache"),
+            dataset_name=str(dataset) if dataset is not None else "unknown_dataset",
+            image_position=self.image_transform_target_position,
+        )
+        self._stage_debug(
+            "image_transform",
+            {
+                "dataset": str(dataset) if dataset is not None else None,
+                "image_transform": self.image_transform_name,
+                "record": transform_record,
+            },
+            detail="summary",
+        )
+        self._write_replay_dump(
+            {
+                "phase": "image_transform",
+                "dataset": str(dataset) if dataset is not None else None,
+                "image_transform": self.image_transform_name,
+                "replay_meta": replay_meta,
+                "record": transform_record,
+            },
+            detail="summary",
+        )
+        return transformed
+
+    def _prepare_content(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
+        content = super()._prepare_content(inputs, dataset=dataset)
+        replayed = self._apply_template_replay_pipeline(content, dataset=dataset)
+        return self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
+
+    def _prepare_content_vllm(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
+        content = super()._prepare_content_vllm(inputs, dataset=dataset)
+        replayed = self._apply_template_replay_pipeline(content, dataset=dataset)
+        return self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
+
+    def _run_with_replay_cfg(
+        self,
+        message: list[dict[str, str]],
+        dataset: str | None,
+        *,
+        replay_mode: str,
+        repeat_times: int,
+        disable_image_transform: bool = False,
+    ) -> str:
+        old_cfg = dict(self.replay_cfg)
+        old_transform_name = self.image_transform_name
+        self.replay_cfg = dict(self.replay_cfg)
+        self.replay_cfg["mode"] = replay_mode
+        self.replay_cfg["repeat_times"] = repeat_times
+        if disable_image_transform:
+            self.image_transform_name = "baseline"
+        try:
+            return super().generate_inner_vllm(message, dataset=dataset)
+        finally:
+            self.replay_cfg = old_cfg
+            self.image_transform_name = old_transform_name
+
+    def _truncate_message_text(self, message: list[dict[str, str]]) -> list[dict[str, str]]:
+        max_chars = self.safe_fallback_truncate_chars
+        out = []
+        for item in message:
+            if isinstance(item, dict) and item.get("type") == "text":
+                new_item = dict(item)
+                txt = item.get("value", "")
+                if isinstance(txt, str) and len(txt) > max_chars:
+                    new_item["value"] = txt[:max_chars] + f"\n...[TRUNCATED {len(txt) - max_chars} chars]"
+                out.append(new_item)
+            else:
+                out.append(item)
+        return out
+
+    def generate_inner_vllm(self, message, dataset=None):
+        try:
+            return super().generate_inner_vllm(message, dataset=dataset)
+        except Exception as first_err:
+            if not self.safe_fallback_enabled:
+                raise
+
+            replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+            print(
+                f"[Qwen2VLChatReplay][safe-fallback] primary generation failed: {type(first_err).__name__}: {first_err}",
+                flush=True,
+            )
+
+            if not is_noop_replay_mode(replay_mode):
+                try:
+                    out = self._run_with_replay_cfg(
+                        message,
+                        dataset,
+                        replay_mode="image_text",
+                        repeat_times=1,
+                        disable_image_transform=True,
+                    )
+                    self._write_replay_dump(
+                        {
+                            "phase": "safe_fallback",
+                            "strategy": "disable_replay",
+                            "dataset": str(dataset) if dataset is not None else None,
+                            "original_replay_mode": replay_mode,
+                            "error_type": type(first_err).__name__,
+                            "error": self._clip_text(str(first_err)),
+                        }
+                    )
+                    return out
+                except Exception as e_disable_replay:
+                    print(
+                        f"[Qwen2VLChatReplay][safe-fallback] disable_replay failed: {type(e_disable_replay).__name__}: {e_disable_replay}",
+                        flush=True,
+                    )
+
+            try:
+                trimmed_message = self._truncate_message_text(message)
+                out = self._run_with_replay_cfg(
+                    trimmed_message,
+                    dataset,
+                    replay_mode="image_text",
+                    repeat_times=1,
+                    disable_image_transform=True,
+                )
+                self._write_replay_dump(
+                    {
+                        "phase": "safe_fallback",
+                        "strategy": "disable_replay_and_truncate_text",
+                        "dataset": str(dataset) if dataset is not None else None,
+                        "original_replay_mode": replay_mode,
+                        "truncate_chars": self.safe_fallback_truncate_chars,
+                        "error_type": type(first_err).__name__,
+                        "error": self._clip_text(str(first_err)),
+                    }
+                )
+                return out
+            except Exception as second_err:
+                print(
+                    f"[Qwen2VLChatReplay][safe-fallback] truncate retry failed: {type(second_err).__name__}: {second_err}",
+                    flush=True,
+                )
+                raise
 
 
 class Qwen2VLChatAguvis(Qwen2VLChat):

@@ -1,0 +1,607 @@
+env_profiles:
+  main_vlmeval:
+    python: "{conda_root}/envs/vlmevalkit/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    base_env:
+      LMUData: "{lmu_data}"
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+      VLMEVAL_API_MINIMAL_IMPORT: "1"
+      VLMEVAL_VLM_MINIMAL_IMPORT: "1"
+      VLMEVAL_LAZY_INIT: "1"
+  qwen35_vllm:
+    python: "{conda_root}/envs/vlmeval_qwen35_vllm/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    base_env:
+      LMUData: "{lmu_data}"
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: "1"
+      VLMEVAL_API_MINIMAL_IMPORT: "1"
+      VLMEVAL_VLM_MINIMAL_IMPORT: "1"
+      VLMEVAL_LAZY_INIT: "1"
+      QWEN35_USE_VLLM: "1"
+  minicpm45_vllm:
+    python: "{conda_root}/envs/vlmeval_qwen35_vllm/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    ensure_modules:
+      - librosa
+    base_env:
+      LMUData: "{lmu_data}"
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+      VLMEVAL_USE_MINICPM45_MINIMAL_CONFIG: "1"
+      VLMEVAL_API_MINIMAL_IMPORT: "1"
+      VLMEVAL_VLM_MINIMAL_IMPORT: "1"
+      VLMEVAL_LAZY_INIT: "1"
+      MINICPM45_USE_VLLM: "1"
+  gemma3_vllm:
+    python: "{conda_root}/envs/vlmeval_gemma4_vllm/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    base_env:
+      LMUData: "{lmu_data}"
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+      VLMEVAL_USE_GEMMA3_MINIMAL_CONFIG: "1"
+      VLMEVAL_API_MINIMAL_IMPORT: "1"
+      VLMEVAL_VLM_MINIMAL_IMPORT: "1"
+      VLMEVAL_LAZY_INIT: "1"
+      GEMMA3_USE_VLLM: "1"
+  gemma4_vllm:
+    python: "{conda_root}/envs/vlmeval_gemma4_vllm/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    base_env:
+      LMUData: "{lmu_data}"
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+      VLMEVAL_USE_GEMMA4_MINIMAL_CONFIG: "1"
+      VLMEVAL_API_MINIMAL_IMPORT: "1"
+      VLMEVAL_VLM_MINIMAL_IMPORT: "1"
+      VLMEVAL_LAZY_INIT: "1"
+      GEMMA4_USE_VLLM: "1"
+      GEMMA4_ENABLE_THINKING: "0"
+models:
+  qwen2vl_7b:
+    display_name: Qwen2-VL-7B
+    registry_name: Qwen2-VL-7B-Instruct-Replay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2-VL-7B-Instruct"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      estimated_dataset_cost: 1.0
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: "1"
+      MODEL_PATH: "{model_root}/Qwen2-VL-7B-Instruct"
+      MODEL_PATH_QWEN2: "{model_root}/Qwen2-VL-7B-Instruct"
+
+  qwen25vl_7b:
+    display_name: Qwen2.5-VL-7B
+    registry_name: Qwen2.5-VL-7B-Instruct-Replay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-7B-Instruct"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      estimated_dataset_cost: 1.1
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: "1"
+      MODEL_PATH: "{model_root}/Qwen2.5-VL-7B-Instruct"
+      MODEL_PATH_QWEN25: "{model_root}/Qwen2.5-VL-7B-Instruct"
+
+  qwen25vl_3b:
+    display_name: Qwen2.5-VL-3B
+    registry_name: Qwen2.5-VL-3B-Instruct-Replay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-3B-Instruct"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 0.9
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: "1"
+      MODEL_PATH: "{model_root}/Qwen2.5-VL-3B-Instruct"
+      MODEL_PATH_QWEN25_3B: "{model_root}/Qwen2.5-VL-3B-Instruct"
+
+  qwen25vl_32b:
+    display_name: Qwen2.5-VL-32B
+    registry_name: Qwen2VLChatReplay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-32B-Instruct"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 8
+      max_num_seqs: 8
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.0
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: "1"
+      MODEL_PATH_QWEN25_32B: "{model_root}/Qwen2.5-VL-32B-Instruct"
+
+  qwen25vl_72b:
+    display_name: Qwen2.5-VL-72B
+    registry_name: Qwen2VLChatReplay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-72B-Instruct"
+    runtime:
+      gpus_per_job: 4
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 4
+      max_model_len: 32768
+      estimated_dataset_cost: 6.0
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: "1"
+      MODEL_PATH_QWEN25_72B: "{model_root}/Qwen2.5-VL-72B-Instruct"
+
+  qwen35_4b:
+    display_name: Qwen3.5-4B
+    registry_name: Qwen3.5-4B-Replay
+    env_profile: qwen35_vllm
+    model_path: "{model_root}/Qwen3.5-4B"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 128
+      max_num_seqs: 128
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 0.9
+    task_env:
+      MODEL_PATH_QWEN35_4B: "{model_root}/Qwen3.5-4B"
+
+  qwen35_9b:
+    display_name: Qwen3.5-9B
+    registry_name: Qwen3.5-9B-Replay
+    env_profile: qwen35_vllm
+    model_path: "{model_root}/Qwen3.5-9B"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH_QWEN35_9B: "{model_root}/Qwen3.5-9B"
+
+  qwen35_27b:
+    display_name: Qwen3.5-27B
+    registry_name: Qwen3.5-27B-Replay
+    env_profile: qwen35_vllm
+    model_path: "{model_root}/Qwen3.5-27B"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 2.8
+    task_env:
+      MODEL_PATH_QWEN35_27B: "{model_root}/Qwen3.5-27B"
+
+  qwen35_35b_a3b:
+    display_name: Qwen3.5-35B-A3B
+    registry_name: Qwen3.5-35B-A3B-Replay
+    env_profile: qwen35_vllm
+    model_path: "{model_root}/Qwen3.5-35B-A3B"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.0
+    task_env:
+      MODEL_PATH_QWEN35_35B_A3B: "{model_root}/Qwen3.5-35B-A3B"
+
+  minicpm_v_45:
+    display_name: MiniCPM-V-4_5
+    registry_name: MiniCPM-V-4_5-Replay
+    env_profile: minicpm45_vllm
+    model_path: "{model_root}/MiniCPM-V-4_5"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPM45: "{model_root}/MiniCPM-V-4_5"
+      MINICPM45_MAX_NEW_TOKENS: "16384"
+
+  minicpm_o_45:
+    display_name: MiniCPM-o-4_5
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: minicpm45_vllm
+    model_path: "{model_root}/MiniCPM-o-4_5"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPMO45: "{model_root}/MiniCPM-o-4_5"
+      MINICPM45_MAX_NEW_TOKENS: "16384"
+
+  # Gemma 3 270M/1B are text-only. Image replay registers the 4B/12B/27B VLM checkpoints.
+  gemma3_4b:
+    display_name: Gemma3-4B-it
+    registry_name: Gemma3-4B-Replay
+    env_profile: gemma3_vllm
+    model_path: "{model_root}/gemma-3-4b-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 32
+      max_num_seqs: 32
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH_GEMMA3_4B: "{model_root}/gemma-3-4b-it"
+      GEMMA3_MAX_NEW_TOKENS: "4096"
+
+  gemma3_12b:
+    display_name: Gemma3-12B-it
+    registry_name: Gemma3-12B-Replay
+    env_profile: gemma3_vllm
+    model_path: "{model_root}/gemma-3-12b-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.8
+    task_env:
+      MODEL_PATH_GEMMA3_12B: "{model_root}/gemma-3-12b-it"
+      GEMMA3_MAX_NEW_TOKENS: "4096"
+
+  gemma3_27b:
+    display_name: Gemma3-27B-it
+    registry_name: Gemma3-27B-Replay
+    env_profile: gemma3_vllm
+    model_path: "{model_root}/gemma-3-27b-it"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 4
+      max_num_seqs: 4
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.2
+    task_env:
+      MODEL_PATH_GEMMA3_27B: "{model_root}/gemma-3-27b-it"
+      GEMMA3_MAX_NEW_TOKENS: "4096"
+
+  gemma4_e2b:
+    display_name: Gemma4-E2B-it
+    registry_name: Gemma4-E2B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E2B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 0.9
+    task_env:
+      MODEL_PATH_GEMMA4_E2B: "{model_root}/gemma-4-E2B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+
+  gemma4_e2b_think_on:
+    display_name: Gemma4-E2B-it-Thinking
+    registry_name: Gemma4-E2B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E2B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH_GEMMA4_E2B: "{model_root}/gemma-4-E2B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+      GEMMA4_ENABLE_THINKING: "1"
+      GEMMA4_VLLM_THINKING_TOKEN_BUDGET: "1024"
+
+  gemma4_e4b:
+    display_name: Gemma4-E4B-it
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 32
+      max_num_seqs: 32
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH_GEMMA4_E4B: "{model_root}/gemma-4-E4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+
+  gemma4_e4b_think_on:
+    display_name: Gemma4-E4B-it-Thinking
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 32
+      max_num_seqs: 32
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.1
+    task_env:
+      MODEL_PATH_GEMMA4_E4B: "{model_root}/gemma-4-E4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+      GEMMA4_ENABLE_THINKING: "1"
+      GEMMA4_VLLM_THINKING_TOKEN_BUDGET: "1024"
+
+  gemma4_26b_a4b:
+    display_name: Gemma4-26B-A4B-it
+    registry_name: Gemma4-26B-A4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-26B-A4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 8
+      max_num_seqs: 8
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 2.1
+    task_env:
+      MODEL_PATH_GEMMA4_26B_A4B: "{model_root}/gemma-4-26B-A4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+
+  gemma4_26b_a4b_think_on:
+    display_name: Gemma4-26B-A4B-it-Thinking
+    registry_name: Gemma4-26B-A4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-26B-A4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 8
+      max_num_seqs: 8
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 2.2
+    task_env:
+      MODEL_PATH_GEMMA4_26B_A4B: "{model_root}/gemma-4-26B-A4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+      GEMMA4_ENABLE_THINKING: "1"
+      GEMMA4_VLLM_THINKING_TOKEN_BUDGET: "1024"
+
+  gemma4_31b:
+    display_name: Gemma4-31B-it
+    registry_name: Gemma4-31B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-31B-it"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 4
+      max_num_seqs: 4
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.0
+    task_env:
+      MODEL_PATH_GEMMA4_31B: "{model_root}/gemma-4-31B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+
+  gemma4_31b_think_on:
+    display_name: Gemma4-31B-it-Thinking
+    registry_name: Gemma4-31B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-31B-it"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 4
+      max_num_seqs: 4
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.2
+    task_env:
+      MODEL_PATH_GEMMA4_31B: "{model_root}/gemma-4-31B-it"
+      GEMMA4_MAX_NEW_TOKENS: "4096"
+      GEMMA4_ENABLE_THINKING: "1"
+      GEMMA4_VLLM_THINKING_TOKEN_BUDGET: "1024"
+
+  gemma4_e2b_8192:
+    display_name: Gemma4-E2B-it-8192
+    registry_name: Gemma4-E2B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E2B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 0.9
+    task_env:
+      MODEL_PATH_GEMMA4_E2B: "{model_root}/gemma-4-E2B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+
+  gemma4_e2b_think_on_nb8192:
+    display_name: Gemma4-E2B-it-Thinking-NoBudget-8192
+    registry_name: Gemma4-E2B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E2B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.3
+    task_env:
+      MODEL_PATH_GEMMA4_E2B: "{model_root}/gemma-4-E2B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+      GEMMA4_ENABLE_THINKING: "1"
+
+  gemma4_e4b_8192:
+    display_name: Gemma4-E4B-it-8192
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 32
+      max_num_seqs: 32
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH_GEMMA4_E4B: "{model_root}/gemma-4-E4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+
+  gemma4_e4b_think_on_nb8192:
+    display_name: Gemma4-E4B-it-Thinking-NoBudget-8192
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-E4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 32
+      max_num_seqs: 32
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.5
+    task_env:
+      MODEL_PATH_GEMMA4_E4B: "{model_root}/gemma-4-E4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+      GEMMA4_ENABLE_THINKING: "1"
+
+  gemma4_26b_a4b_8192:
+    display_name: Gemma4-26B-A4B-it-8192
+    registry_name: Gemma4-26B-A4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-26B-A4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 8
+      max_num_seqs: 8
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 2.1
+    task_env:
+      MODEL_PATH_GEMMA4_26B_A4B: "{model_root}/gemma-4-26B-A4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+
+  gemma4_26b_a4b_think_on_nb8192:
+    display_name: Gemma4-26B-A4B-it-Thinking-NoBudget-8192
+    registry_name: Gemma4-26B-A4B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-26B-A4B-it"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 8
+      max_num_seqs: 8
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 3.0
+    task_env:
+      MODEL_PATH_GEMMA4_26B_A4B: "{model_root}/gemma-4-26B-A4B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+      GEMMA4_ENABLE_THINKING: "1"
+
+  gemma4_31b_8192:
+    display_name: Gemma4-31B-it-8192
+    registry_name: Gemma4-31B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-31B-it"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 4
+      max_num_seqs: 4
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.0
+    task_env:
+      MODEL_PATH_GEMMA4_31B: "{model_root}/gemma-4-31B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+
+  gemma4_31b_think_on_nb8192:
+    display_name: Gemma4-31B-it-Thinking-NoBudget-8192
+    registry_name: Gemma4-31B-it-Replay
+    env_profile: gemma4_vllm
+    model_path: "{model_root}/gemma-4-31B-it"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 4
+      max_num_seqs: 4
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 4.0
+    task_env:
+      MODEL_PATH_GEMMA4_31B: "{model_root}/gemma-4-31B-it"
+      GEMMA4_MAX_NEW_TOKENS: "8192"
+      GEMMA4_ENABLE_THINKING: "1"
+
+  llava15_7b_hf:
+    display_name: LLaVA-1.5-7B-HF-Replay
+    registry_name: llava_v1.5_7b_hf_replay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/llava-1.5-7b-hf"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 1
+      max_model_len: 4096
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH: "{model_root}/llava-1.5-7b-hf"
+
+  llava15_7b_vllm:
+    display_name: LLaVA-1.5-7B-vLLM-Replay
+    registry_name: llava_v1.5_7b_hf_replay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/llava-1.5-7b-hf"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 1
+      max_model_len: 4096
+      estimated_dataset_cost: 1.0
+    task_env:
+      MODEL_PATH: "{model_root}/llava-1.5-7b-hf"
+      LLAVA_USE_VLLM: "1"
+      LLAVA_VLLM_TP_SIZE: "1"
+      LLAVA_VLLM_MAX_MODEL_LEN: "4096"
+      LLAVA_VLLM_MAX_NUM_SEQS: "16"
+      LLAVA_VLLM_MAX_IMAGES_PER_PROMPT: "4"

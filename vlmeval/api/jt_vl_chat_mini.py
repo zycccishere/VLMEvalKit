@@ -9,9 +9,9 @@ from vlmeval.api.base import BaseAPI
 from vlmeval.dataset import DATASET_TYPE
 from vlmeval.dataset import img_root_map
 
-API_ENDPOINT = "https://hl.jiutian.10086.cn/kunlun/ingress/api/hl-4a9c15/7b11a3451e1a4612a6661c3e22235df6/ai-e7d64e71b61e421b8a41c0d43424d73a/service-cd5a067331e34cfea25f5a9d7960ffe8//v1/chat/completions"
-API_ENDPOINT_2B = 'https://hl.jiutian.10086.cn/kunlun/ingress/api/hl-4a9c15/7b11a3451e1a4612a6661c3e22235df6/ai-3101961c75eb47ad8cc8d8ebb62fb8b0/service-c0bf9bac00824ace8639c0e8e0a4a5da/v1/chat/completions'
-APP_CODE = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJzdWIiOiI1YjYyODY0ZjZmMWI0Yzg4YWE2ZDk1NzBhNDY1MWI3OSIsImlzcyI6ImFwaS1hdXRoLWtleSIsImV4cCI6NDg5ODU1NzAwN30.jLUbctPdJ74VC3Vwlr0nB4x9N2QxWtSGYE0vWsceZN-agDecVnH8pH8Q5SoCQ3-SBYx5jDx-UOg3kkoMqY9CdxiALauKU_UZ56CV2NKCcHUVeJIgNvfQJMb0z6yCCbSe80e1T8FxrxQXDvubyWtl4pTAhixYaEUqNG8rjUrDuA-vRgZ1e7HilBmU487OI76D9LUnU-zEdMWhzsCkh_Yy3M1Ur4PsKgMFi5QSmMuGSUGJjkpJHiGNx1QcevBLQSOCL2jvg15ifB2n2dD6zb8iPXFkfQTtmvbZofxWACSvkri-x9V3gFWg7DODwKUZsyyogPzRJVbmxDGruMsgiiCsPg"
+API_ENDPOINT = os.environ.get("JT_VL_CHAT_MINI_API_BASE", "")
+API_ENDPOINT_2B = os.environ.get("JT_VL_CHAT_2B_API_BASE", "")
+APP_CODE = os.environ.get("JT_VL_CHAT_APP_CODE", "")
 
 
 class JTVLChatWrapper(BaseAPI):
@@ -35,10 +35,10 @@ class JTVLChatWrapper(BaseAPI):
         self.temperature = temperature
         self.max_tokens = max_tokens
         if model == 'jt-vl-chat-mini':
-            self.api_base = API_ENDPOINT
+            self.api_base = api_base or API_ENDPOINT
         else:
-            self.api_base = API_ENDPOINT_2B
-        self.app_code = APP_CODE
+            self.api_base = api_base or API_ENDPOINT_2B
+        self.app_code = app_code or APP_CODE
 
         super().__init__(wait=wait, retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
 
@@ -213,6 +213,8 @@ class JTVLChatWrapper(BaseAPI):
                 stream=True)
 
         json_data = json.dumps(send_data)
+        if not self.api_base or not self.app_code:
+            raise RuntimeError("JT_VL_CHAT_*_API_BASE and JT_VL_CHAT_APP_CODE are required for JTVLChatAPI_Mini/2B.")
 
         header_dict = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.app_code}
 

@@ -1,0 +1,72 @@
+{
+  "matrix_config": "scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml",
+  "model_config": "scripts/configs/models.yaml",
+  "out_dir": "scripts/configs/task_manifests/gemma3_family_all11_replay6_2node_20260422",
+  "nodes": 2,
+  "gpus_per_node": 8,
+  "task_count": 198,
+  "nodes_summary": [
+    {
+      "node": 0,
+      "tasks": 99,
+      "load": 37.95,
+      "models": {
+        "gemma3_12b": 33,
+        "gemma3_27b": 33,
+        "gemma3_4b": 33
+      },
+      "datasets": {
+        "AI2D_TEST": 9,
+        "DynaMath": 9,
+        "LogicVista": 9,
+        "MMBench_DEV_EN_V11": 9,
+        "MMMU_DEV_VAL_SINGLE_IMAGE": 9,
+        "MMStar": 9,
+        "MathVision": 9,
+        "OCRBench": 9,
+        "SEEDBench2_Plus": 9,
+        "VisualPuzzles": 9,
+        "WeMath": 9
+      },
+      "modes": {
+        "image_image_text": 18,
+        "image_text": 18,
+        "image_text_image": 15,
+        "image_text_image_text": 15,
+        "image_text_text": 18,
+        "text_image": 15
+      }
+    },
+    {
+      "node": 1,
+      "tasks": 99,
+      "load": 37.95,
+      "models": {
+        "gemma3_12b": 33,
+        "gemma3_27b": 33,
+        "gemma3_4b": 33
+      },
+      "datasets": {
+        "AI2D_TEST": 9,
+        "DynaMath": 9,
+        "LogicVista": 9,
+        "MMBench_DEV_EN_V11": 9,
+        "MMMU_DEV_VAL_SINGLE_IMAGE": 9,
+        "MMStar": 9,
+        "MathVision": 9,
+        "OCRBench": 9,
+        "SEEDBench2_Plus": 9,
+        "VisualPuzzles": 9,
+        "WeMath": 9
+      },
+      "modes": {
+        "image_image_text": 15,
+        "image_text": 15,
+        "image_text_image": 18,
+        "image_text_image_text": 18,
+        "image_text_text": 15,
+        "text_image": 18
+      }
+    }
+  ]
+}

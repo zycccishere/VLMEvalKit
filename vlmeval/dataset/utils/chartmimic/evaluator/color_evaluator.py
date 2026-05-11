@@ -286,8 +286,6 @@ with open('{output_file}', 'w') as f:
 
 
 if __name__ == "__main__":
-    # sys.path.insert(0, '/home/yc21/project/Princess-s-CHI')
-
     evaluator = ColorEvaluator()
     # evaluator = TextEvaluator()
 

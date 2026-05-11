@@ -173,6 +173,8 @@ outputs/*
 demo.ipynb
 *json
 !vlmeval/dataset/utils/vgrpbench/configs/formating-prompt/**/*.json
+!scripts/configs/**/
+!scripts/configs/**/*.json
 .vscode
 *.swp
 GPT4o_MINI/
@@ -204,6 +206,27 @@ vlmeval/gemini_tmp.py
 run.sh
 run_g.sh
 tmp/
+tmp_*/
+*_tmp/
+*.tmp
+*.bak
+*.orig
+
+# Local experiment/runtime state
+runs/
+checkpoints/
+LMUData/
+.verify_lmu_data/
+.repair_lmu_data/
+annotations/
+logs/
+*.jsonl
+*.xlsx
+*.parquet
+*.npz
+
+# macOS resource forks can appear after rsync from local workspaces.
+._*
 InternVL*
 Qwen*
 CongRong*
@@ -218,5 +241,10 @@ SenseNova*
 temp
 result*
 debug
+
+# Historical launchers are intentionally versioned for provenance even when
+# their filenames match broad upstream ignore rules.
+!scripts_legacy/
+!scripts_legacy/**
 outputs
 scripts/data

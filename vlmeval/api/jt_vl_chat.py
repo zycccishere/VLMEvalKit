@@ -12,9 +12,8 @@ from vlmeval.api.base import BaseAPI
 from vlmeval.dataset import DATASET_TYPE, img_root_map
 from vlmeval.smp import *
 
-API_ENDPOINT = "https://hl.jiutian.10086.cn/kunlun/ingress/api/hl-4a9c15/7b11a3451e1a4612a6661c3e22235df6/ai-4dfc1be4e6854a75a833aab9b956128c/service-e5893ba5c1154a1192cb8e60af11e276/v1/chat/completions"  # noqa: E501
-
-APP_CODE = "B0m6Tuglt5shfY7t3GyoJn1V5yVAm0Ba"
+API_ENDPOINT = os.environ.get("JT_VL_CHAT_API_BASE", "")
+APP_CODE = os.environ.get("JT_VL_CHAT_APP_CODE", "")
 
 
 class JTVLChatWrapper(BaseAPI):
@@ -37,8 +36,8 @@ class JTVLChatWrapper(BaseAPI):
 
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.api_base = API_ENDPOINT
-        self.app_code = APP_CODE
+        self.api_base = api_base or API_ENDPOINT
+        self.app_code = app_code or APP_CODE
 
 
         super().__init__(wait=wait, retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
@@ -224,6 +223,8 @@ class JTVLChatWrapper(BaseAPI):
                 stream=True)
 
         json_data = json.dumps(send_data)
+        if not self.api_base or not self.app_code:
+            raise RuntimeError("JT_VL_CHAT_API_BASE and JT_VL_CHAT_APP_CODE are required for JTVLChatAPI.")
 
         header_dict = {'Content-Type': 'application/json', 'Authorization': self.app_code}
 

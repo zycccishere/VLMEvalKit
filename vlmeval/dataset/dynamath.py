@@ -10,18 +10,82 @@ import argparse
 
 from .image_base import ImageBaseDataset
 from .utils import build_judge
+from .utils.prompt_tail import tail_tokens_for_judge
 from ..utils import track_progress_rich
 from ..smp import load, dump, d2df, toliststr
 from ..smp.file import get_intermediate_file_path
 
 
 def preprocess(str1):
-    str1 = str(str1)
-    if 0 <= str1.find("{") < str1.rfind("}"):
-        str1 = str1[str1.find("{"): str1.rfind("}") + 1]
-    str2 = str1.replace("\\", "")
-    str2 = str2.replace("\\n", "\n")
-    return str2
+    str1 = str(str1).strip()
+    str1 = str1.replace("\\n", "\n")
+    if str1.startswith("```"):
+        lines = [x for x in str1.splitlines() if not x.strip().startswith("```")]
+        str1 = "\n".join(lines).strip()
+    return str1
+
+
+def _extract_boxed_content(text):
+    matches = re.findall(r'\\+boxed\s*\{([^{}]+)\}', text)
+    if matches:
+        return matches[-1].strip()
+    return None
+
+
+def _iter_balanced_brace_chunks(text):
+    chunks = []
+    start = None
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == '{':
+            if depth == 0:
+                start = idx
+            depth += 1
+            continue
+
+        if ch == '}':
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                chunks.append(text[start: idx + 1])
+                start = None
+
+    return chunks
+
+
+def _extract_short_answer_from_json_like(text):
+    text = str(text)
+    text = text.replace('\\{', '{').replace('\\}', '}')
+    cands = [text]
+    cands.extend(reversed(_iter_balanced_brace_chunks(text)))
+    for cand in cands:
+        try:
+            obj = json.loads(cand, strict=False)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        for key in ("short answer", "short_answer", "answer"):
+            if key in obj and obj[key] is not None:
+                return str(obj[key]).strip()
+    return None
 
 
 def transfer(str1):
@@ -33,30 +97,82 @@ def transfer(str1):
         return float(str1)
 
 
+def _normalize_text_answer(text):
+    return re.sub(r'[^a-z0-9]+', '', str(text).strip().lower())
+
+
+def _text_answers_match(pred_answer, gold_answer):
+    pred_norm = _normalize_text_answer(pred_answer)
+    gold_norm = _normalize_text_answer(gold_answer)
+
+    if not pred_norm or not gold_norm:
+        return False
+    if pred_norm == gold_norm:
+        return True
+    if pred_norm in gold_norm or gold_norm in pred_norm:
+        return True
+    return False
+
+
 def parse_answer(answer, answer_type="multiple choice"):
+    answer = str(answer).strip()
+    boxed = _extract_boxed_content(answer)
+    if boxed is not None:
+        answer = boxed
+
     if answer_type == "float":
-        if answer.isdigit():
-            return True, float(answer)
-        else:
-            parts = answer.split(' ')
-            answer = parts[0]
-            try:
-                answer = transfer(answer)
-                return True, answer
-            except:
-                return False, None
-    elif answer_type == "multiple choice":
-        if len(answer) == 1:
-            return True, answer.upper()
-        else:
-            in_flag = [ch in answer.upper() for ch in 'ABCDE']
-            if sum(in_flag) == 1:
-                for ch in 'ABCDE':
-                    if ch in answer.upper():
-                        return True, ch
+        answer = answer.replace(",", "")
+        m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:\s*\u03c0)?', answer)
+        if m is None:
             return False, None
+        token = m.group(0).replace(" ", "")
+        try:
+            if "\u03c0" in token:
+                return True, transfer(token)
+            return True, float(token)
+        except Exception:
+            return False, None
+    elif answer_type == "multiple choice":
+        letters = re.findall(r'[A-Z]', answer.upper())
+        if len(set(letters)) == 1 and len(letters) >= 1:
+            return True, letters[0]
+        return False, None
     else:
         return True, answer
+
+
+def _extract_final_answer_line(text):
+    text = preprocess(text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines[-8:]):
+        stripped = line.strip().strip('*').strip()
+        lowered = stripped.lower()
+        if lowered.startswith('final answer'):
+            parts = re.split(r'[:：]', stripped, maxsplit=1)
+            return parts[1].strip() if len(parts) == 2 else stripped
+        if lowered.startswith('answer'):
+            parts = re.split(r'[:：]', stripped, maxsplit=1)
+            return parts[1].strip() if len(parts) == 2 else stripped
+    return None
+
+
+def _extract_safe_short_answer_candidate(pred):
+    pred = preprocess(pred)
+    short_answer = _extract_short_answer_from_json_like(pred)
+    if short_answer is not None:
+        return short_answer
+
+    boxed = _extract_boxed_content(pred)
+    if boxed is not None:
+        boxed_json = _extract_short_answer_from_json_like(boxed)
+        return boxed_json if boxed_json is not None else boxed
+
+    final_line = _extract_final_answer_line(pred)
+    if final_line is not None:
+        final_json = _extract_short_answer_from_json_like(final_line)
+        return final_json if final_json is not None else final_line
+
+    return None
 
 
 def DynaMath_auxeval(model, line):
@@ -65,29 +181,35 @@ def DynaMath_auxeval(model, line):
 
     succeed, short_answer = None, None
     try:
-        dj = json.loads(pred, strict=False)
-        short_answer = dj.get("short answer")
-        assert short_answer is not None
+        short_answer = _extract_safe_short_answer_candidate(pred)
+        if short_answer is None:
+            raise ValueError('No safe local short-answer candidate found.')
         succeed, short_answer = parse_answer(short_answer, answer_type=line['answer_type'])
         assert succeed
     except:
         # Failed to parse the JSON, use an auxiliary LLM to get the short answer
         if line['answer_type'] == 'multiple choice':
-            inst = "Output the corresponing choice option, such as 'A', 'B', 'C', 'D', in a single line."
+            inst = (
+                "Output only the final selected choice letter in a single line, "
+                "such as 'A', 'B', 'C', or 'F'. If no valid choice is selected, output Z."
+            )
         elif line['answer_type'] == 'float':
-            inst = "Output a three-digit floating-point number in a single line."
+            inst = "Output only the final short answer as a single floating-point number in one line."
         else:
             inst = (
-                "Output a short answer in a single line. Any float numbers in the answer "
-                "should be formatted as three-digit floating-point numbers."
+                "Output only the final short answer in a single line. "
+                "Any float numbers in the answer should be formatted as three-digit floating-point numbers."
             )
 
-        prompt = f"Free-form answer: {pred}\nInstruction: {inst}"
-        response = pred
+        pred_tail = tail_tokens_for_judge(pred, max_tokens=96)
+        prompt = (
+            "Extract the final short answer from the response below.\n"
+            f"Instruction: {inst}\n"
+            f"Free-form answer tail (last 96 tokens): {pred_tail}\n"
+            "Output:"
+        )
+        response = model.generate(prompt)
         succeed, short_answer = parse_answer(response, line['answer_type'])
-        if not succeed:
-            response = model.generate(prompt)
-            succeed, short_answer = parse_answer(response, line['answer_type'])
 
     if line['answer_type'] == 'float':
         if succeed:
@@ -102,41 +224,51 @@ def DynaMath_auxeval(model, line):
         if succeed:
             return dict(parse=True, extracted=short_answer, correct=(short_answer == line['answer']))
         else:
-            if line['answer'] in pred[:3].upper():
-                return dict(parse=False, extracted=None, correct=True)
-            else:
-                return dict(parse=False, extracted=None, correct=False)
+            return dict(parse=False, extracted=None, correct=False)
     else:
         if succeed:
-            return dict(parse=True, extracted=short_answer, correct=(short_answer.lower() in line['answer'].lower()))
+            return dict(parse=True, extracted=short_answer, correct=_text_answers_match(short_answer, line['answer']))
         else:
-            return dict(parse=False, extracted=None, correct=(short_answer.lower() in line['answer'].lower()))
+            return dict(parse=False, extracted=None, correct=False)
 
 
 class Dynamath(ImageBaseDataset):
 
     TYPE = 'VQA'
     DATASET_URL = {
-        'DynaMath': 'https://opencompass.openxlab.space/utils/VLMEval/DynaMath.tsv',
+        # 'DynaMath': 'https://opencompass.openxlab.space/utils/VLMEval/DynaMath.tsv',
+        'DynaMath': '/datasets/vlmeval/DynaMath.tsv',
         'DynaMath_noprompt': 'https://opencompass.openxlab.space/utils/VLMEval/DynaMath.tsv',
+        'DynaMathSmall': '/datasets/small_benchmarks/DynaMath_small.tsv'
     }
     DATASET_MD5 = {
         'DynaMath': 'b8425ad9a7114571fc9366e013699494',
         'DynaMath_noprompt': 'b8425ad9a7114571fc9366e013699494',
+        'DynaMathSmall': 'dd1b1ab7cd1bb7d9021f1758544ebd9e'
     }
     GUIDE = """
 ## Answer Instruction Please provide an answer to the question outlined above. Your response should adhere \
-to the following JSON format, which includes two keys: 'solution' and 'short answer'. The 'solution' key can contain \
-detailed steps needed to solve the question, and the 'short answer' key should provide a concise response. {INST}
+to the following JSON format, which includes one key: 'short answer'. {INST}
 
 Example of expected JSON response format:
 
 """
-    EXAMPLE = {
+    EXAMPLE = {"short answer": "[Concise Answer]"}
+    LEGACY_EXAMPLE = {
         "solution": "[Detailed step-by-step explanation]",
-        "short answer": "[Concise Answer]"
+        "short answer": "[Concise Answer]",
     }
     TEXT_EXAMPLE = json.dumps(EXAMPLE, indent=4)
+    LEGACY_TEXT_EXAMPLE = json.dumps(LEGACY_EXAMPLE, indent=4)
+
+    @staticmethod
+    def _dynamath_prompt_schema():
+        # short_answer_only (default): ask only for short answer.
+        # legacy_two_keys: keep original solution + short answer schema.
+        schema = os.environ.get('DYNAMATH_PROMPT_SCHEMA', 'short_answer_only').strip().lower()
+        if schema not in {'short_answer_only', 'legacy_two_keys'}:
+            schema = 'short_answer_only'
+        return schema
 
     # Given one data record, return the built prompt (a multi-modal message), can override
     def build_prompt(self, line):
@@ -157,7 +289,23 @@ Example of expected JSON response format:
             inst = "Float numbers in the answer should be formatted as three-digit floating-point numbers."
 
         if 'noprompt' not in self.dataset_name:
-            prompt = prompt + self.GUIDE.format(INST=inst) + self.TEXT_EXAMPLE
+            # In directly-answer template mode, avoid extra JSON-schema instructions.
+            # This keeps dataset prompt compatible with global answer-only templating.
+            if os.environ.get('REPLAY_PROMPT_TEMPLATE_NAME', '').strip().lower() == 'directly_answer':
+                if line['answer_type'] == 'multiple choice':
+                    direct_inst = "Answer with only the corresponding choice option, such as 'A', 'B', 'C', or 'D'."
+                elif line['answer_type'] == 'float':
+                    direct_inst = "Answer with only a three-digit floating-point number."
+                else:
+                    direct_inst = "Answer with a short phrase only. Any float number should use three-digit floating-point format."
+                prompt = prompt + f"\n## Answer Instruction\n{direct_inst}"
+            else:
+                schema = self._dynamath_prompt_schema()
+                if schema == 'legacy_two_keys':
+                    legacy_guide = self.GUIDE.replace("one key: 'short answer'", "two keys: 'solution' and 'short answer'. The 'solution' key can contain detailed steps needed to solve the question, and the 'short answer' key should provide a concise response")
+                    prompt = prompt + legacy_guide.format(INST=inst) + self.LEGACY_TEXT_EXAMPLE
+                else:
+                    prompt = prompt + self.GUIDE.format(INST=inst) + self.TEXT_EXAMPLE
 
         msgs = []
         if isinstance(tgt_path, list):

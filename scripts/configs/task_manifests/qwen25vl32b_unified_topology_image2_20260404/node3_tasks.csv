@@ -1,0 +1,8 @@
+model_key,policy,mode,transform,dataset,kind,status,weight
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,AI2D_TEST,replace,missing,6176.00
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,DynaMath,replace,missing,10020.00
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,LogicVista,replace,missing,894.00
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,MathVision,replace,missing,6080.00
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,OCRBench,replace,missing,2000.00
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,SEEDBench2_Plus,replace,missing,4554.00
+qwen25vl_32b,default,image_text_image,shift_right_onepatch_wrap,VisualPuzzles,replace,missing,2336.00

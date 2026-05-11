@@ -1,0 +1,106 @@
+{
+  "split_rule": "node=(mode_index+dataset_index+model_index)%4",
+  "nodes": [
+    {
+      "node_rank": 0,
+      "task_count": 24,
+      "weighted_load": 66.0,
+      "models": {
+        "qwen25vl_32b": 6,
+        "qwen25vl_3b": 6,
+        "qwen25vl_72b": 6,
+        "qwen25vl_7b": 6
+      },
+      "datasets": {
+        "DynaMath": 6,
+        "LogicVista": 6,
+        "MathVision": 6,
+        "VisualPuzzles": 6
+      },
+      "modes": {
+        "image_image_text": 4,
+        "image_text": 4,
+        "image_text_image": 4,
+        "image_text_image_text": 4,
+        "image_text_text": 4,
+        "text_image": 4
+      }
+    },
+    {
+      "node_rank": 1,
+      "task_count": 24,
+      "weighted_load": 66.0,
+      "models": {
+        "qwen25vl_32b": 6,
+        "qwen25vl_3b": 6,
+        "qwen25vl_72b": 6,
+        "qwen25vl_7b": 6
+      },
+      "datasets": {
+        "DynaMath": 6,
+        "LogicVista": 6,
+        "MathVision": 6,
+        "VisualPuzzles": 6
+      },
+      "modes": {
+        "image_image_text": 4,
+        "image_text": 4,
+        "image_text_image": 4,
+        "image_text_image_text": 4,
+        "image_text_text": 4,
+        "text_image": 4
+      }
+    },
+    {
+      "node_rank": 2,
+      "task_count": 24,
+      "weighted_load": 66.0,
+      "models": {
+        "qwen25vl_32b": 6,
+        "qwen25vl_3b": 6,
+        "qwen25vl_72b": 6,
+        "qwen25vl_7b": 6
+      },
+      "datasets": {
+        "DynaMath": 6,
+        "LogicVista": 6,
+        "MathVision": 6,
+        "VisualPuzzles": 6
+      },
+      "modes": {
+        "image_image_text": 4,
+        "image_text": 4,
+        "image_text_image": 4,
+        "image_text_image_text": 4,
+        "image_text_text": 4,
+        "text_image": 4
+      }
+    },
+    {
+      "node_rank": 3,
+      "task_count": 24,
+      "weighted_load": 66.0,
+      "models": {
+        "qwen25vl_32b": 6,
+        "qwen25vl_3b": 6,
+        "qwen25vl_72b": 6,
+        "qwen25vl_7b": 6
+      },
+      "datasets": {
+        "DynaMath": 6,
+        "LogicVista": 6,
+        "MathVision": 6,
+        "VisualPuzzles": 6
+      },
+      "modes": {
+        "image_image_text": 4,
+        "image_text": 4,
+        "image_text_image": 4,
+        "image_text_image_text": 4,
+        "image_text_text": 4,
+        "text_image": 4
+      }
+    }
+  ],
+  "total_tasks": 96
+}

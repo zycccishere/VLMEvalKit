@@ -1,0 +1,125 @@
+env_profiles:
+  main_vlmeval:
+    python: "{conda_root}/envs/vlmevalkit/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    base_env:
+      HF_ENDPOINT: https://hf-mirror.com
+      HUGGINGFACE_HUB_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+  minicpm45_vllm:
+    python: "{conda_root}/envs/vlmeval_qwen35_vllm/bin/python"
+    pythonpath:
+      - "{repo_root}"
+    ensure_modules:
+      - librosa
+    base_env:
+      HF_ENDPOINT: https://hf-mirror.com
+      HUGGINGFACE_HUB_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: "1"
+      FORCE_LOCAL: "True"
+      OLD_VERSION: "False"
+      PYTHONNOUSERSITE: "1"
+      VLMEVAL_USE_MINICPM45_MINIMAL_CONFIG: "1"
+      VLMEVAL_API_MINIMAL_IMPORT: "1"
+      VLMEVAL_VLM_MINIMAL_IMPORT: "1"
+      VLMEVAL_LAZY_INIT: "1"
+      MINICPM45_USE_VLLM: "1"
+
+models:
+  qwen25vl_3b:
+    display_name: Qwen2.5-VL-3B-Instruct
+    registry_name: Qwen2VLChatReplay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-3B-Instruct"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 0.8
+    task_env:
+      MODEL_PATH: "{model_root}/Qwen2.5-VL-3B-Instruct"
+      MODEL_PATH_QWEN25: "{model_root}/Qwen2.5-VL-3B-Instruct"
+
+  qwen25vl_7b:
+    display_name: Qwen2.5-VL-7B-Instruct
+    registry_name: Qwen2VLChatReplay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-7B-Instruct"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.1
+    task_env:
+      MODEL_PATH: "{model_root}/Qwen2.5-VL-7B-Instruct"
+      MODEL_PATH_QWEN25: "{model_root}/Qwen2.5-VL-7B-Instruct"
+
+  qwen25vl_32b:
+    display_name: Qwen2.5-VL-32B-Instruct
+    registry_name: Qwen2VLChatReplay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-32B-Instruct"
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 4.0
+    task_env:
+      MODEL_PATH: "{model_root}/Qwen2.5-VL-32B-Instruct"
+      MODEL_PATH_QWEN25: "{model_root}/Qwen2.5-VL-32B-Instruct"
+
+  qwen25vl_72b:
+    display_name: Qwen2.5-VL-72B-Instruct
+    registry_name: Qwen2VLChatReplay
+    env_profile: main_vlmeval
+    model_path: "{model_root}/Qwen2.5-VL-72B-Instruct"
+    runtime:
+      gpus_per_job: 4
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 4
+      max_model_len: 32768
+      estimated_dataset_cost: 6.0
+    task_env:
+      MODEL_PATH: "{model_root}/Qwen2.5-VL-72B-Instruct"
+      MODEL_PATH_QWEN25: "{model_root}/Qwen2.5-VL-72B-Instruct"
+
+  minicpm_v_45:
+    display_name: MiniCPM-V-4_5
+    registry_name: MiniCPM-V-4_5-Replay
+    env_profile: minicpm45_vllm
+    model_path: "{model_root}/MiniCPM-V-4_5"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 8192
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPM45: "{model_root}/MiniCPM-V-4_5"
+
+  minicpm_o_45:
+    display_name: MiniCPM-o-4_5
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: minicpm45_vllm
+    model_path: "{model_root}/MiniCPM-o-4_5"
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 8192
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPMO45: "{model_root}/MiniCPM-o-4_5"
