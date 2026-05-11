@@ -39,6 +39,22 @@ bash scripts/run_benchmark.sh \
 
 The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. It can keep an 8-GPU node filled with combinations such as one `tp=4` task plus two `tp=2` tasks when the matrix contains both 72B and 32B jobs.
 
+### Final Table Reproduction Map
+
+Use [`docs/FINAL_TABLE_REPRODUCTION.md`](docs/FINAL_TABLE_REPRODUCTION.md) when reproducing the current WorkHub `final_table.csv`. It maps each model/dataset family to the correct release or legacy entrypoint and records judge/evaluator differences observed in the source artifacts.
+
+The short version is:
+
+- Gemma3 4B/12B/27B, all 11 datasets, all replay modes: `scripts/run_gemma3_family_all11_replay6_2nodes_20260422.sh`.
+- Qwen2.5 3B/32B/72B and MiniCPM-V/O on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar`: `scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh`.
+- Qwen2.5 7B on those four new benchmarks is mixed-source: most cells use `scripts/run_qwen25vl_all4_reasoning_perception4_new_entry_4nodes_20260421.sh`, while 8 cells use the later mixed Qwen/MiniCPM two-node run. Use the cell-level map before rerunning Qwen2.5-7B new-four cells.
+- Qwen2.5 on `LogicVista` and `VisualPuzzles`: `scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_qwen25vl_all4_reasoning4_new_entry_20260421.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool --datasets LogicVista VisualPuzzles`.
+- Qwen2.5 legacy `AI2D_TEST`/`DynaMath`/`MathVision`/`OCRBench`/`SEEDBench2_Plus` cells: use the source-equivalent scripts in `scripts_legacy/`; `scripts/run_final_table_legacy_backfill_20260512.sh` is the cleaner release-runner backfill for cells missing from active matrices.
+- MiniCPM-V/O core-set cells: use `matrix_qwen25vl7b_minicpm45_table_20260406.yaml`, `matrix_minicpm_default_infer_only_fresh_20260317.yaml`, and `scripts/run_legacy_dynamath_infer_only_all_replay.sh` according to the detailed CSV.
+- MiniCPM-V/O `LogicVista` and `VisualPuzzles`: use `matrix_minicpm_logicvista_all_replay_eval_20260419.yaml` and `matrix_minicpm_visualpuzzles_all_replay_eval_realign_20260420.yaml`.
+
+The source-group map is [`docs/final_table_reproduction_entries.csv`](docs/final_table_reproduction_entries.csv). The per-cell map is [`docs/final_table_cell_sources.csv`](docs/final_table_cell_sources.csv). The latter is the authoritative entrypoint map when a model/dataset family is mixed-source, and it records five MathVision provenance caveats where the current artifact scan found manual overrides, near matches, or missing exact metrics.
+
 ### Main Matrices
 
 - `scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml`: Qwen2.5-VL 3B/7B/32B/72B plus MiniCPM-V/O-4.5 on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, and `MMStar`.
