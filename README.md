@@ -47,6 +47,7 @@ The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. 
 - `scripts/configs/matrix_qwen25vl7b_minicpm45_table_20260406.yaml`: preserved legacy table matrix for Qwen2.5-7B and MiniCPM-4.5.
 - `scripts/configs/matrix_legacy_dynamath_infer_only_all_replay.yaml`: preserved legacy Dynamath infer-only matrix.
 - `scripts/configs/matrix_minicpm45_wemath_cot_rerun_20260429.yaml`: MiniCPM-4.5 WeMath CoT rerun matrix.
+- `scripts/configs/matrix_final_table_legacy_backfill_20260512.yaml` plus `scripts/configs/task_manifests/final_table_legacy_backfill_20260512/all_tasks.csv`: exact backfill manifest for the 21 legacy standard-run cells needed to cover every non-public, non-derived `final_table.csv` benchmark cell with the release runner.
 
 ### Code Map
 
@@ -63,6 +64,8 @@ The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. 
 - Active image-replay model and data locations are controlled by environment variables, not hardcoded private paths. Set `MODEL_ROOT`, `CONDA_ROOT`, `LMUData`, `LLAVA_ROOT`, and `QWEN35_PYDEPS` as needed.
 - LLM-judge based datasets use `OPENAI_API_KEY_JUDGE`/`OPENAI_API_BASE_JUDGE` first, then `OPENAI_API_KEY`/`OPENAI_API_BASE`; generic non-OpenAI-compatible endpoints can be supplied with `OPENAI_COMPATIBLE_API_KEY`/`OPENAI_COMPATIBLE_API_BASE`.
 - Non-default API wrappers such as `JTVLChatAPI` have no bundled private endpoint. Configure their endpoint and token explicitly with the documented environment variables in the wrapper before use.
+- The release matrices plus `matrix_final_table_legacy_backfill_20260512` cover every non-public, non-derived benchmark cell in `final_table.csv`. Public/reference rows are external report numbers, and `MMStar no-reason only` is a derived subset summary rather than a separate VLMEvalKit run.
+- Exact numeric reproduction still depends on matching model checkpoints, dataset/cache versions, evaluator dependencies, and the LLM judge endpoint/model used for judge-scored datasets.
 - `scripts_legacy/` is intentionally retained for old final-table provenance. Treat these scripts as historical launch references rather than the preferred active interface.
 
 ---
