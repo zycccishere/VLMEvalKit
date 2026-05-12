@@ -41,7 +41,7 @@ The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. 
 
 ### Final Table Reproduction
 
-The public release surface has two result-relevant execution stacks. The detailed source-group and per-cell audit remains in [`docs/FINAL_TABLE_REPRODUCTION.md`](docs/FINAL_TABLE_REPRODUCTION.md), [`docs/final_table_reproduction_entries.csv`](docs/final_table_reproduction_entries.csv), and [`docs/final_table_cell_sources.csv`](docs/final_table_cell_sources.csv).
+The public release surface has two result-relevant execution stacks. In practice, the score-relevant new/legacy differences are judge/evaluator choice, dataset/cache lineage, and a few runtime knobs rather than scheduler shape. The detailed source-group and per-cell audit remains in [`docs/FINAL_TABLE_REPRODUCTION.md`](docs/FINAL_TABLE_REPRODUCTION.md), [`docs/final_table_reproduction_entries.csv`](docs/final_table_reproduction_entries.csv), and [`docs/final_table_cell_sources.csv`](docs/final_table_cell_sources.csv).
 
 Run the new stack with the maintained matrix runner:
 
