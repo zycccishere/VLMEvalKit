@@ -29,6 +29,15 @@ The table labels map to runner replay modes as follows:
 
 ## Reproduction Policy
 
+At the execution-stack level, the final table has two result-relevant launch families:
+
+| Stack | Entrypoint shape | When to use it |
+|---|---|---|
+| New matrix runner | `bash scripts/run_benchmark.sh --matrix-config ... --model-config ... --scheduler gpu_pool`, or a thin wrapper under `scripts/run_*.sh` that calls it | Preferred route for new reruns, Gemma3, Qwen/MiniCPM four-new-benchmark runs, and most cleaned/eval-realigned source groups. |
+| Legacy launch shape | `scripts_legacy/*.sh`, plus preserved legacy-semantic wrappers such as `scripts/run_legacy_dynamath_infer_only_all_replay.sh` | Use when the source cell came from the older March/early-April launch stack and exact table provenance requires the old prompt/eval/judge shape. |
+
+Most of the many entries below are not different experimental ideas. They are matrix partitions, model/dataset slices, or source-group aliases over those two stacks. The exception is exact historical reproduction: the source group still matters because it fixes the dataset cache, judge model, rerun/eval-realign state, and a few manually accepted caveat cells.
+
 Use `scripts/run_benchmark.sh` and the matrix YAMLs for new reruns. Use `scripts_legacy/` when you need to match the old launch shape exactly. The legacy scripts are kept because part of the main table came from those old runs.
 
 The current provenance scan accounts for the main table as follows:

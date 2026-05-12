@@ -43,7 +43,14 @@ The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. 
 
 Use [`docs/FINAL_TABLE_REPRODUCTION.md`](docs/FINAL_TABLE_REPRODUCTION.md) when reproducing the current WorkHub `final_table.csv`. It maps each model/dataset family to the correct release or legacy entrypoint and records judge/evaluator differences observed in the source artifacts.
 
-The short version is:
+The short version is that there are only two result-relevant execution stacks, even though the table has many source groups:
+
+- **New stack:** `scripts/run_benchmark.sh` plus the thin `scripts/run_*.sh` wrappers and matrix YAMLs. This is the preferred public rerun interface.
+- **Legacy stack:** `scripts_legacy/*.sh` plus preserved legacy-semantic wrappers such as `scripts/run_legacy_dynamath_infer_only_all_replay.sh`. Use this only when a final-table cell was produced by the old launch/eval shape and exact historical parity matters.
+
+The many entries in the detailed CSVs are source-group partitions, not separate replay methods. They are still needed because exact reproduction depends on the source run, judge model, dataset cache, and a few documented MathVision provenance caveats.
+
+Main command chooser:
 
 - Gemma3 4B/12B/27B, all 11 datasets, all replay modes: `scripts/run_gemma3_family_all11_replay6_2nodes_20260422.sh`.
 - Qwen2.5 3B/32B/72B and MiniCPM-V/O on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar`: `scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh`.
