@@ -23,7 +23,27 @@ repos:
             "--max-line-length=120",
             "--ignore=F401,F403,F405,E402,E722,E741,W503,E231,E702",
           ]
-        exclude: ^configs/
+        # This fork intentionally keeps historical replay/provenance entrypoints
+        # needed to reproduce the final table. Many of those files were copied
+        # from dirty experiment worktrees and are not style-normalized; keep
+        # them tracked, but do not block publishing on legacy formatting.
+        exclude: |
+          (?x)^(
+              configs/|
+              scripts_legacy/|
+              vlmeval/api/(gpt|ori_gpt_client)\.py|
+              vlmeval/cross_image_flow\.py|
+              vlmeval/dataset/(__init__|dynamath|image_mcq|image_vqa)\.py|
+              vlmeval/dataset/utils/(judge_util|logicvista|visulogic)\.py|
+              vlmeval/inference\.py|
+              vlmeval/vlm/__init__\.py|
+              vlmeval/vlm/(dual_thinker.*|duplex.*|jointmodel|vllm_jointmodel.*|single_thinker.*)\.py|
+              vlmeval/vlm/(modeling_qwen_custom_vl_hw|modeling_llava_baseline)\.py|
+              vlmeval/vlm/(qwen25vl_custom.*|qwen2_5_vl_custom|qwen_gpt_vl|qwen35_vl_replay)\.py|
+              vlmeval/vlm/(gemma4_replay|minicpm_v_4_5_replay|replay_image_transform|replay_policy)\.py|
+              vlmeval/vlm/qwen2_vl/model\.py|
+              vlmeval/vlm/duplexpts2/
+          )
   - repo: https://github.com/google/yapf
     rev: v0.43.0
     hooks:
