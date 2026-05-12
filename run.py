@@ -39,7 +39,11 @@ if LOCAL_WORLD_SIZE > 1 and len(GPU_LIST):
     )
 
 
-from vlmeval.config import supported_VLM
+# Use the runtime registry so matrix-controlled minimal registries are honored.
+# Without this, importing the full experimental config can pull in inactive
+# model files before the actual inference path has a chance to select the
+# intended Qwen/MiniCPM/Gemma registry.
+from vlmeval.config_runtime import supported_VLM
 from vlmeval.dataset.video_dataset_config import supported_video_datasets
 from vlmeval.dataset import build_dataset
 from vlmeval.inference import infer_data_job
