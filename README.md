@@ -187,7 +187,7 @@ This model-by-dataset map uses the majority stack across replay settings for tha
 - LLM-judge based datasets use `OPENAI_API_KEY_JUDGE`/`OPENAI_API_BASE_JUDGE` first, then `OPENAI_API_KEY`/`OPENAI_API_BASE`; generic non-OpenAI-compatible endpoints can be supplied with `OPENAI_COMPATIBLE_API_KEY`/`OPENAI_COMPATIBLE_API_BASE`.
 - Non-default API wrappers such as `JTVLChatAPI` have no bundled private endpoint. Configure their endpoint and token explicitly with the documented environment variables in the wrapper before use.
 - The release matrices plus `matrix_final_table_legacy_backfill_20260512` cover every non-public, non-derived benchmark cell in `final_table.csv`. Public/reference rows are external report numbers, and `MMStar no-reason only` is a derived subset summary rather than a separate VLMEvalKit run.
-- Exact numeric reproduction still depends on matching model checkpoints, dataset/cache versions, evaluator dependencies, and the LLM judge endpoint/model used for judge-scored datasets.
+- Exact numeric reproduction still depends on matching model checkpoints, dataset/cache versions, evaluator dependencies, vLLM engine/runtime knobs such as `VLLM_USE_V1`, and the LLM judge endpoint/model used for judge-scored datasets.
 - `scripts_legacy/` is intentionally retained for old final-table provenance. Treat these scripts as historical launch references rather than the preferred active interface.
 
 ---
