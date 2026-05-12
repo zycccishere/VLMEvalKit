@@ -42,6 +42,22 @@ In this document, `mixed source` means that one apparent table family is assembl
 
 Use `scripts/run_benchmark.sh` and the matrix YAMLs for new reruns. Use `scripts_legacy/` when you need to match the old launch shape exactly. The legacy scripts are kept because part of the main table came from those old runs.
 
+## Final Table Source Stack
+
+This model-by-dataset map uses the majority stack across replay settings for that model and dataset. Full per-cell provenance remains in `docs/final_table_cell_sources.csv`.
+
+| Model | DynaMath | MathVision | LogicVista | VisualPuzzles | MMMU single image | We-Math | AI2D_TEST | OCRBench | SEEDBench2_Plus | MMBench_DEV_EN_V11 | MMStar |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen2.5 72B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| Qwen2.5 32B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| Qwen2.5 7B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| Qwen2.5 3B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| MiniCPM-V | New | New | New | New | New | New | New | New | New | New | New |
+| MiniCPM-o | New | New | New | New | New | New | New | New | New | New | New |
+| Gemma3 27B | New | New | New | New | New | New | New | New | New | New | New |
+| Gemma3 12B | New | New | New | New | New | New | New | New | New | New | New |
+| Gemma3 4B | New | New | New | New | New | New | New | New | New | New | New |
+
 ## Result-Relevant New vs Legacy Differences
 
 `New` and `legacy` are execution/provenance labels, not two different replay algorithms. The scheduler, node count, tmux launcher, log directory layout, and task partitioning should not change benchmark semantics. The result-relevant differences are the following:

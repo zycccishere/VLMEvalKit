@@ -77,6 +77,22 @@ bash scripts/run_legacy_dynamath_infer_only_all_replay.sh
 
 Use the source-stack table below to choose `New` or `Legacy` at the model-by-dataset level. It uses the majority stack across replay settings for each model and dataset; use the detailed CSVs only when exact per-cell provenance is needed.
 
+### Final Table Source Stack
+
+This model-by-dataset map uses the majority stack across replay settings for that model and dataset. Full per-cell provenance remains in `docs/final_table_cell_sources.csv`.
+
+| Model | DynaMath | MathVision | LogicVista | VisualPuzzles | MMMU single image | We-Math | AI2D_TEST | OCRBench | SEEDBench2_Plus | MMBench_DEV_EN_V11 | MMStar |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen2.5 72B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| Qwen2.5 32B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| Qwen2.5 7B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| Qwen2.5 3B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
+| MiniCPM-V | New | New | New | New | New | New | New | New | New | New | New |
+| MiniCPM-o | New | New | New | New | New | New | New | New | New | New | New |
+| Gemma3 27B | New | New | New | New | New | New | New | New | New | New | New |
+| Gemma3 12B | New | New | New | New | New | New | New | New | New | New | New |
+| Gemma3 4B | New | New | New | New | New | New | New | New | New | New | New |
+
 ### Final Table
 
 The table below is copied from `assets/topics/topic-image-replay/resources/final-tables/final_table.csv`.
@@ -144,22 +160,6 @@ The table below is copied from `assets/topics/topic-image-replay/resources/final
 | Gemma3 4B | I-Q-I | 23.19 | 21.97 | 27.74 | 14.73 | 42.82 | 28.48 | 26.49 | -0.21 | 75.1 | 66.5 | 61.97 | 68.65 | 46.4 | 63.72 | 0.75 | 43.41 | 0.22 |
 | Gemma3 4B | I-Q-Q | 22.12 | 22.7 | 29.53 | 14.81 | 41.77 | 29.24 | 26.7 | 0 | 73.7 | 66.2 | 61.88 | 67.96 | 45.33 | 63.01 | 0.04 | 43.2 | 0.01 |
 | Gemma3 4B | I-Q-I-Q | 22.61 | 22.96 | 27.29 | 16.01 | 41.89 | 29.71 | 26.75 | 0.05 | 74.71 | 65.6 | 61.48 | 69.12 | 46.33 | 63.45 | 0.47 | 43.43 | 0.24 |
-
-### Final Table Source Stack
-
-This model-by-dataset map uses the majority stack across replay settings for that model and dataset. Full per-cell provenance remains in `docs/final_table_cell_sources.csv`.
-
-| Model | DynaMath | MathVision | LogicVista | VisualPuzzles | MMMU single image | We-Math | AI2D_TEST | OCRBench | SEEDBench2_Plus | MMBench_DEV_EN_V11 | MMStar |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen2.5 72B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
-| Qwen2.5 32B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
-| Qwen2.5 7B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
-| Qwen2.5 3B | Legacy | Legacy | New | New | New | New | Legacy | Legacy | Legacy | New | New |
-| MiniCPM-V | New | New | New | New | New | New | New | New | New | New | New |
-| MiniCPM-o | New | New | New | New | New | New | New | New | New | New | New |
-| Gemma3 27B | New | New | New | New | New | New | New | New | New | New | New |
-| Gemma3 12B | New | New | New | New | New | New | New | New | New | New | New |
-| Gemma3 4B | New | New | New | New | New | New | New | New | New | New | New |
 
 ### Main Matrices
 
