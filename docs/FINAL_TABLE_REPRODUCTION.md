@@ -38,6 +38,8 @@ At the execution-stack level, the final table has two result-relevant launch fam
 
 Most of the many entries below are not different experimental ideas. They are matrix partitions, model/dataset slices, or source-group aliases over those two stacks. The exception is exact historical reproduction: the source group still matters because it fixes the dataset cache, judge model, rerun/eval-realign state, and a few manually accepted caveat cells.
 
+In this document, `mixed source` means that one apparent table family is assembled from more than one historical source run directory. It does not mean that the replay method changed inside one cell, and it usually does not mean a judge-model mismatch. For example, Qwen2.5-7B on the four new benchmarks uses 16 cells from `runs/qwen25vl_all4_reasoning_perception4_new_entry_20260421` and 8 cells from `runs/qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422`; both source groups use `gpt-4o-mini` for LLM-judged cells plus rule/local metrics for non-LLM-evaluated cells.
+
 Use `scripts/run_benchmark.sh` and the matrix YAMLs for new reruns. Use `scripts_legacy/` when you need to match the old launch shape exactly. The legacy scripts are kept because part of the main table came from those old runs.
 
 The current provenance scan accounts for the main table as follows:
@@ -60,7 +62,7 @@ The provenance README reports 5 unresolved cells before manual override handling
 | Gemma3 4B/12B/27B on all 11 table datasets and all 6 replay modes | `bash scripts/run_gemma3_family_all11_replay6_2nodes_20260422.sh <node_rank> [gpu_ids]` |
 | Gemma3 12B I-Q on `MathVision`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` when matching the recorded table provenance | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_gemma3_12b_reference4_image_text_20260422.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool` |
 | Qwen2.5 3B/32B/72B and MiniCPM-V/O on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | `bash scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh <node_rank> [gpu_ids]` |
-| Qwen2.5 7B on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | Mixed source: most cells use `bash scripts/run_qwen25vl_all4_reasoning_perception4_new_entry_4nodes_20260421.sh <node_rank> [gpu_ids]`, while 8 cells use `bash scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh <node_rank> [gpu_ids]`. Use `docs/final_table_cell_sources.csv` for the exact split. |
+| Qwen2.5 7B on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | Mixed source: 16 cells use `bash scripts/run_qwen25vl_all4_reasoning_perception4_new_entry_4nodes_20260421.sh <node_rank> [gpu_ids]`, while 8 cells use `bash scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh <node_rank> [gpu_ids]`. This is a source-run split, not a judge-model split. Use `docs/final_table_cell_sources.csv` for the exact cell list. |
 | Qwen2.5 3B/7B/32B/72B on `LogicVista` and `VisualPuzzles` | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_qwen25vl_all4_reasoning4_new_entry_20260421.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool --datasets LogicVista VisualPuzzles` |
 | Qwen2.5 legacy cells on `AI2D_TEST`, `DynaMath`, `MathVision`, `OCRBench`, `SEEDBench2_Plus` | Use the legacy scripts listed in `docs/final_table_reproduction_entries.csv`; `bash scripts/run_final_table_legacy_backfill_20260512.sh` is only the 21-cell release backfill for `Qwen2.5 3B/72B` on `AI2D_TEST`, `OCRBench`, and `SEEDBench2_Plus`. |
 | MiniCPM-V/O on `AI2D_TEST`, `DynaMath`, `MathVision`, `OCRBench`, `SEEDBench2_Plus` | Use `matrix_qwen25vl7b_minicpm45_table_20260406.yaml`, `matrix_minicpm_default_infer_only_fresh_20260317.yaml`, and `run_legacy_dynamath_infer_only_all_replay.sh` as listed in the CSV. |
@@ -92,6 +94,8 @@ The source artifacts show a mixture of judge/evaluator modes:
 | MiniCPM April table/infer-only runs | Mostly `gpt-4o-mini` where an LLM judge/extractor was used, plus rule/local metrics. |
 
 To reproduce exact historical numbers, match both the model checkpoint and the judge endpoint/model. For new public reruns, prefer the release default environment variables and record `OPENAI_API_BASE_JUDGE`, `OPENAI_API_KEY_JUDGE`, and the actual judge model in the run metadata.
+
+The practical rule from the current provenance scan is: new-stack LLM-judged cells use `gpt-4o-mini`; March legacy standard cells mostly use `gpt-4o`; rule/local metrics have no LLM judge. There are two documented MathVision legacy-source caveat cells recorded with `gpt-4o-mini`, so do not infer the judge model from the directory name alone when auditing exact numbers.
 
 ## Known Provenance Caveats
 
