@@ -156,15 +156,38 @@ def _select_attention_mask(
     attention_mask: torch.Tensor | None,
     query_index: torch.Tensor,
     kv_len: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor | None:
     if attention_mask is None:
         return None
     if attention_mask.dim() == 4:
         sliced = attention_mask[:, :, :, :kv_len]
-        return sliced.index_select(2, query_index)
+        return sliced.index_select(2, query_index).to(dtype=dtype)
     if attention_mask.dim() == 2:
-        return attention_mask[:, None, None, :kv_len]
+        valid = attention_mask[:, None, None, :kv_len].to(torch.bool)
+        mask = torch.zeros(
+            attention_mask.shape[0],
+            1,
+            1,
+            kv_len,
+            device=attention_mask.device,
+            dtype=dtype,
+        )
+        return mask.masked_fill(~valid, torch.finfo(dtype).min)
     raise ValueError(f"Unsupported attention_mask rank for tracing: {attention_mask.dim()}")
+
+
+def _apply_causal_mask(
+    scores: torch.Tensor,
+    *,
+    query_index: torch.Tensor,
+    kv_len: int,
+) -> torch.Tensor:
+    key_index = torch.arange(kv_len, device=scores.device, dtype=query_index.dtype)
+    future_mask = key_index.unsqueeze(0) > query_index.unsqueeze(1)
+    if not bool(future_mask.any()):
+        return scores
+    return scores.masked_fill(future_mask[None, None, :, :], torch.finfo(scores.dtype).min)
 
 
 class QwenPrefillAttentionTracer:
@@ -355,10 +378,12 @@ class QwenPrefillAttentionTracer:
         query_index = torch.as_tensor(query_positions, device=query_states.device, dtype=torch.long)
         selected_queries = query_states.index_select(2, query_index)
         scores = torch.matmul(selected_queries, key_states_for_scores.transpose(2, 3)) * scaling
+        scores = _apply_causal_mask(scores, query_index=query_index, kv_len=kv_len)
         selected_mask = _select_attention_mask(
             attention_mask=attention_mask,
             query_index=query_index,
             kv_len=kv_len,
+            dtype=scores.dtype,
         )
         if selected_mask is not None:
             scores = scores + selected_mask
