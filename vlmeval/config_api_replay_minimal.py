@@ -6,8 +6,8 @@ os.environ.setdefault("VLMEVAL_VLM_MINIMAL_IMPORT", "1")
 
 from vlmeval.api import GPT4V, GPT4VReplay
 
-API_MAX_TOKENS = int(os.environ.get("VLMEVAL_API_MAX_TOKENS", "2048"))
-API_TIMEOUT = int(os.environ.get("VLMEVAL_API_TIMEOUT", "60"))
+API_MAX_TOKENS = int(os.environ.get("VLMEVAL_API_MAX_TOKENS", "32768"))
+API_TIMEOUT = int(os.environ.get("VLMEVAL_API_TIMEOUT", "600"))
 API_IMG_SIZE = int(os.environ.get("VLMEVAL_API_IMG_SIZE", "-1"))
 
 
