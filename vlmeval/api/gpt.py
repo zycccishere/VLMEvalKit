@@ -1,4 +1,5 @@
 from ..smp import *
+import json
 import os
 import sys
 import time
@@ -9,6 +10,7 @@ import code, traceback, signal
 
 APIBASES = {
     'OFFICIAL': 'https://api.openai.com/v1/chat/completions',
+    'MODELBEST': 'https://llm-center.ali.modelbest.cn/llm/v1/chat/completions',
 }
 
 
@@ -40,6 +42,8 @@ def resolve_openai_key_from_env() -> str:
         os.environ.get('OPENAI_API_KEY', '').strip()
         or os.environ.get('OPENAI_API_KEY_JUDGE', '').strip()
         or os.environ.get('OPENAI_COMPATIBLE_API_KEY', '').strip()
+        or os.environ.get('MODELBEST_API_KEY', '').strip()
+        or os.environ.get('LLM_CENTER_API_KEY', '').strip()
     )
 
 
@@ -83,6 +87,103 @@ def throttle_openai_compatible_request():
         f.seek(0)
         f.truncate()
         f.write(f'{now:.6f}')
+        f.flush()
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _find_replay_meta(obj):
+    if isinstance(obj, dict):
+        if isinstance(obj.get('replay_meta'), dict):
+            return obj['replay_meta']
+        for value in obj.values():
+            found = _find_replay_meta(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_replay_meta(value)
+            if found:
+                return found
+    return {}
+
+
+def _estimate_cost_from_usage(model: str, usage: dict) -> dict:
+    # USD per 1M tokens. These defaults are for monitoring estimates only;
+    # final accounting should replace them with the billing source of record.
+    rates = {
+        'gpt-4o-mini': {'input': 0.15, 'cached_input': 0.075, 'output': 0.60},
+        'gpt-4o-mini-2024-07-18': {'input': 0.15, 'cached_input': 0.075, 'output': 0.60},
+        'gpt-5-mini': {'input': 0.25, 'cached_input': 0.025, 'output': 2.00},
+        'gpt-5-chat': {'input': 1.25, 'cached_input': 0.125, 'output': 10.00},
+        'claude-haiku-4-5-20251001': {'input': 1.00, 'cached_input': 0.10, 'output': 5.00},
+        'gemini-2.5-flash-lite': {'input': 0.10, 'cached_input': 0.025, 'output': 0.40},
+        'gemini-2.5-flash-nothinking': {'input': 0.30, 'cached_input': 0.075, 'output': 2.50},
+        'gemini-2.5-flash-thinking': {'input': 0.30, 'cached_input': 0.075, 'output': 2.50},
+        'gemini-3-flash-preview-nothinking': {'input': 0.50, 'cached_input': 0.05, 'output': 3.00},
+        'gemini-3.1-flash-lite': {'input': 0.25, 'cached_input': 0.25, 'output': 1.50},
+    }
+    rate = rates.get(model)
+    if not rate or not isinstance(usage, dict):
+        return {'cost_usd': None, 'rate_note': 'missing_rate_or_usage'}
+    prompt_tokens = int(usage.get('prompt_tokens') or usage.get('input_tokens') or 0)
+    completion_tokens = int(usage.get('completion_tokens') or usage.get('output_tokens') or 0)
+    prompt_details = usage.get('prompt_tokens_details') or {}
+    cached_tokens = int(prompt_details.get('cached_tokens') or usage.get('cached_input_tokens') or 0)
+    uncached_tokens = max(prompt_tokens - cached_tokens, 0)
+    cost_usd = (
+        uncached_tokens * rate['input']
+        + cached_tokens * rate['cached_input']
+        + completion_tokens * rate['output']
+    ) / 1_000_000
+    return {
+        'cost_usd': cost_usd,
+        'rate_note': 'default_monitoring_rate_table',
+        'uncached_prompt_tokens': uncached_tokens,
+        'cached_prompt_tokens': cached_tokens,
+    }
+
+
+def log_openai_compatible_usage_event(
+    *,
+    model: str,
+    inputs,
+    payload: dict,
+    api_base: str,
+    status_code: int,
+    ret_code,
+    latency_s: float,
+    response_json,
+):
+    log_file = os.environ.get('VLMEVAL_API_USAGE_LOG_FILE') or os.environ.get('TOKEN_USAGE_LOG_FILE')
+    if not log_file:
+        return
+    usage = response_json.get('usage') if isinstance(response_json, dict) else None
+    meta = _find_replay_meta(inputs)
+    entry = {
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        'model': model,
+        'api_base': api_base,
+        'status_code': status_code,
+        'ret_code': ret_code,
+        'latency_s': round(latency_s, 3),
+        'usage_present': isinstance(usage, dict),
+        'usage': usage if isinstance(usage, dict) else None,
+        'cost': _estimate_cost_from_usage(model, usage if isinstance(usage, dict) else {}),
+        'request_max_tokens': payload.get('max_tokens'),
+        'temperature': payload.get('temperature'),
+        'replay_mode': os.environ.get('REPLAY_MODE'),
+        'replay_image_transform': os.environ.get('REPLAY_IMAGE_TRANSFORM'),
+        'replay_prompt_template_name': os.environ.get('REPLAY_PROMPT_TEMPLATE_NAME'),
+        'work_dir': os.environ.get('MMEVAL_ROOT'),
+        'sample_index': meta.get('sample_index'),
+        'dataset_name': meta.get('dataset_name'),
+        'source_first_image_ref': meta.get('source_first_image_ref'),
+    }
+    log_path = os.path.abspath(log_file)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, 'a', encoding='utf-8') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
         f.flush()
         fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -148,7 +249,6 @@ class OpenAIWrapper(BaseAPI):
         self.timeout = timeout
 
         super().__init__(wait=wait, retry=retry, system_prompt=system_prompt, verbose=verbose, **kwargs)
-        return
 
         if use_azure:
             api_base_template = (
@@ -171,6 +271,12 @@ class OpenAIWrapper(BaseAPI):
                 if 'OPENAI_API_BASE' in os.environ and os.environ['OPENAI_API_BASE'] != '':
                     self.logger.info('Environment variable OPENAI_API_BASE is set. Will use it as api_base. ')
                     api_base = os.environ['OPENAI_API_BASE']
+                elif 'OPENAI_API_BASE_JUDGE' in os.environ and os.environ['OPENAI_API_BASE_JUDGE'] != '':
+                    self.logger.info('Environment variable OPENAI_API_BASE_JUDGE is set. Will use it as api_base. ')
+                    api_base = os.environ['OPENAI_API_BASE_JUDGE']
+                elif 'OPENAI_COMPATIBLE_API_BASE' in os.environ and os.environ['OPENAI_COMPATIBLE_API_BASE'] != '':
+                    self.logger.info('Environment variable OPENAI_COMPATIBLE_API_BASE is set. Will use it as api_base. ')
+                    api_base = os.environ['OPENAI_COMPATIBLE_API_BASE']
                 else:
                     api_base = 'OFFICIAL'
 
@@ -253,6 +359,24 @@ class OpenAIWrapper(BaseAPI):
             n=1,
             temperature=temperature,
             **kwargs)
+        chat_template_kwargs_raw = os.environ.get('VLMEVAL_OPENAI_CHAT_TEMPLATE_KWARGS', '').strip()
+        if chat_template_kwargs_raw:
+            try:
+                chat_template_kwargs = json.loads(chat_template_kwargs_raw)
+                if isinstance(chat_template_kwargs, dict):
+                    payload['chat_template_kwargs'] = chat_template_kwargs
+                else:
+                    self.logger.warning(
+                        'Ignoring VLMEVAL_OPENAI_CHAT_TEMPLATE_KWARGS because it is not a JSON object: '
+                        f'{chat_template_kwargs_raw!r}'
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f'Ignoring invalid VLMEVAL_OPENAI_CHAT_TEMPLATE_KWARGS={chat_template_kwargs_raw!r}: {e}'
+                )
+        enable_thinking = os.environ.get('VLMEVAL_OPENAI_ENABLE_THINKING', '').strip().lower()
+        if enable_thinking in {'0', 'false', 'no'}:
+            payload.setdefault('chat_template_kwargs', {})['enable_thinking'] = False
 
         # # START ORIGIN ##
         # response = requests.post(
@@ -269,26 +393,41 @@ class OpenAIWrapper(BaseAPI):
                 os.environ.get('OPENAI_API_BASE', '').strip()
                 or os.environ.get('OPENAI_API_BASE_JUDGE', '').strip()
                 or os.environ.get('OPENAI_COMPATIBLE_API_BASE', '').strip()
+                or os.environ.get('MODELBEST_BASE_URL', '').strip()
+                or os.environ.get('LLM_CENTER_BASE_URL', '').strip()
             )
             api_base = env_base if env_base else APIBASES['OFFICIAL']
             self.api_base = api_base
         if isinstance(api_base, str):
             api_base = normalize_openai_compatible_api_base(api_base)
         throttle_openai_compatible_request()
+        request_started = time.time()
         response = requests.post(
             api_base,
             headers=headers,
             data=json.dumps(payload),
             timeout=self.timeout * 1.1,
         )
+        latency_s = time.time() - request_started
         ret_code = response.status_code
         ret_code = 0 if (200 <= int(ret_code) < 300) else ret_code
         answer = self.fail_msg
+        resp_struct = None
         try:
             resp_struct = json.loads(response.text)
             answer = resp_struct['choices'][0]['message']['content'].strip()
         except Exception:
             pass
+        log_openai_compatible_usage_event(
+            model=self.model,
+            inputs=inputs,
+            payload=payload,
+            api_base=api_base,
+            status_code=response.status_code,
+            ret_code=ret_code,
+            latency_s=latency_s,
+            response_json=resp_struct,
+        )
         return ret_code, answer, response
 
     def get_image_token_len(self, img_path, detail='low'):

@@ -1,5 +1,4 @@
 from ..smp import *
-from ..dataset import img_root_map, DATASET_TYPE
 from abc import abstractmethod
 
 
@@ -186,6 +185,8 @@ class BaseModel:
                 'assistant': assistant
             }
             if assistant == '':
+                from ..dataset import DATASET_TYPE
+
                 if listinstr(['MCQ'], DATASET_TYPE(dataset)):
                     question['assistant'] = 'Best Option: ('
                 else:
