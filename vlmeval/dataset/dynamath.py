@@ -270,13 +270,13 @@ Example of expected JSON response format:
 
     @staticmethod
     def _dynamath_prompt_schema():
-        # Default to the legacy public-table prompt: ask for both reasoning
-        # (`solution`) and final answer (`short answer`). Set
-        # DYNAMATH_PROMPT_SCHEMA=short_answer_only for the newer answer-only
-        # schema.
-        schema = os.environ.get('DYNAMATH_PROMPT_SCHEMA', 'legacy_two_keys').strip().lower()
+        # The standard replay entry explicitly sets legacy_two_keys only for
+        # Qwen2.5-VL DynaMath table reproduction. Other callers default to the
+        # answer-only schema so non-Qwen routes do not silently inherit Qwen's
+        # legacy public-table prompt.
+        schema = os.environ.get('DYNAMATH_PROMPT_SCHEMA', 'short_answer_only').strip().lower()
         if schema not in {'short_answer_only', 'legacy_two_keys'}:
-            schema = 'legacy_two_keys'
+            raise ValueError(f'Unsupported DYNAMATH_PROMPT_SCHEMA: {schema}')
         return schema
 
     # Given one data record, return the built prompt (a multi-modal message), can override

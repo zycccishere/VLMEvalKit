@@ -32,7 +32,7 @@ All active main-table matrices use `replay_times: 1`, `template_on_last_replay_t
 
 | Dataset | Active route | Notes |
 | --- | --- | --- |
-| DynaMath | Dataset builder plus replay wrapper; standard entry sets `DYNAMATH_PROMPT_SCHEMA=legacy_two_keys` only for Qwen2.5-VL and `short_answer_only` for MiniCPM/Gemma3. | Judge fallback is fail-fast when local parsing cannot settle pending rows and the judge is unavailable. |
+| DynaMath | Dataset builder plus replay wrapper; standard entry sets `DYNAMATH_PROMPT_SCHEMA=legacy_two_keys` only for Qwen2.5-VL and `short_answer_only` for MiniCPM/Gemma3. | The legacy two-key JSON prompt is the `default` / `identity` Qwen2.5-VL reproduction route. The `direct` / `directly_answer` policy intentionally uses answer-only wording for every model family. Judge fallback is fail-fast when local parsing cannot settle pending rows and the judge is unavailable. |
 | MathVision | Image VQA/LLM-judge route. | Uses external `LMUData`; repository does not vendor TSV/image payloads. |
 | LogicVista | LogicVista dataset/eval route. | Qwen2.5-VL LogicVista is the only active route that forces vLLM v0. |
 | VisualPuzzles | Custom prompt/eval route. | Included in Qwen reasoning and MiniCPM/Gemma3 matrices. |
