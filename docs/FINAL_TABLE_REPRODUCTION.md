@@ -33,8 +33,8 @@ At the execution-stack level, the final table has two result-relevant launch fam
 
 | Stack | Entrypoint shape | When to use it |
 |---|---|---|
-| New matrix runner | `bash scripts/run_benchmark.sh --matrix-config ... --model-config ... --scheduler gpu_pool`, or a thin wrapper under `scripts/run_*.sh` that calls it | Preferred route for new reruns, Gemma3, Qwen/MiniCPM four-new-benchmark runs, and most cleaned/eval-realigned source groups. |
-| Legacy launch shape | `scripts_legacy/*.sh`, plus preserved legacy-semantic wrappers such as `scripts/run_legacy_dynamath_infer_only_all_replay.sh` | Use when the source cell came from the older March/early-April launch stack and exact table provenance requires the old prompt/eval/judge shape. |
+| New matrix runner | `bash scripts/run_benchmark.sh --matrix-config ... --model-config ... --scheduler gpu_pool` | Preferred route for new reruns, Gemma3, Qwen/MiniCPM four-new-benchmark runs, and most cleaned/eval-realigned source groups. |
+| Legacy launch shape | `scripts_legacy/*.sh`, plus documented lower-level Python runners for legacy matrix configs | Use when the source cell came from the older March/early-April launch stack and exact table provenance requires the old prompt/eval/judge shape. |
 
 Most of the many entries below are not different experimental ideas. They are matrix partitions, model/dataset slices, or source-group aliases over those two stacks. The exception is exact historical reproduction: the source group still matters because it fixes the dataset cache, judge model, rerun/eval-realign state, and a few manually accepted caveat cells.
 
@@ -89,9 +89,9 @@ The following items are the real knobs/files that can change table numbers. Sche
 | Gemma3 prompt and sampling | Gemma3 replay uses `Gemma3Replay` with `temperature=0.0`, `max_new_tokens=4096`, vLLM seed `0`, and the default system prompt `You are a helpful assistant. `. It uses the same replay ordering controls as Qwen but its own message serialization and image limit handling. |
 | Replay and prompt template | Main matrices use `replay_prompt_template_name: identity`, `replay_times: 1`, `template_on_last_replay_text: 1`, `image_copy_mode: reuse_path`, and `limit_mm_per_prompt: 2`. Lower-level legacy helpers may default to `directly_answer`; that strips or replaces dataset instructions for datasets such as DynaMath/VisualPuzzles and is score-changing if run without the final-table wrapper. |
 | Common-prompt ablations | `REPLAY_FORCE_COMMON_PROMPT=1` changes prompt construction in `vlmeval/inference.py` and is only for explicit common-prompt probes. The main final table does not use it. The file named `matrix_minicpm45_wemath_cot_rerun_20260429.yaml` still lists dataset `WeMath`; the CoT behavior comes from MiniCPM's model wrapper, not from the `WeMath_COT` dataset alias. |
-| Dataset modeling and cache | Exact dataset names matter. `MMMU_DEV_VAL_SINGLE_IMAGE` is a filtered alias over `MMMU_DEV_VAL` that keeps only single-image rows. `WeMath` and `WeMath_COT` share the same TSV but build different prompts only when the dataset alias contains `COT`. `DynaMath` defaults to `DYNAMATH_PROMPT_SCHEMA=short_answer_only` unless overridden. VisualPuzzles appends a step-by-step and `Answer: $LETTER` suffix in the dataset prompt. The repository does not vendor TSV/image payloads, so `LMUData`/absolute dataset caches and MD5-compatible payloads must match the source artifacts. |
+| Dataset modeling and cache | Exact dataset names matter. `MMMU_DEV_VAL_SINGLE_IMAGE` is a filtered alias over `MMMU_DEV_VAL` that keeps only single-image rows. `WeMath` and `WeMath_COT` share the same TSV but build different prompts only when the dataset alias contains `COT`. The DynaMath dataset builder falls back to `legacy_two_keys`; the standard runner keeps that legacy schema for Qwen2.5-VL and explicitly sets `short_answer_only` for MiniCPM/Gemma3. VisualPuzzles appends a step-by-step and `Answer: $LETTER` suffix in the dataset prompt. The repository does not vendor TSV/image payloads, so `LMUData`/absolute dataset caches and MD5-compatible payloads must match the source artifacts. |
 | Judge and extraction | New matrices pass `--judge gpt-4o-mini`. Historical legacy source groups include many `gpt-4o` judged cells. Several datasets have custom extraction before or during judge use: MMMU single-image extracts the last `Answer: [A-I]`; MMStar/MMBench/AI2D extract `Answer: [A-D]`; WeMath first tries deterministic option inference and then uses a WeMath-specific judge prompt; MathVision, LogicVista, and DynaMath rely on LLM auxiliary evaluators; VisualPuzzles can fall back to exact/local extraction. |
-| Failure/fallback hygiene | Qwen replay has `REPLAY_SAFE_FALLBACK=1`: if replay generation fails, it can retry as `image_text` with transforms disabled, then retry with truncated text. Inference also defaults `SKIP_OVERLONG_SAMPLE=1`; overlong prompts can be recorded as blank skipped outputs rather than failed samples. Exact reproduction audits should check logs for `[safe-fallback]`, `[SKIPPED_OVERLONG_PROMPT]`, quota errors, invalid tokens, and disk errors before accepting a cell. |
+| Failure/fallback hygiene | The active standard runner sets `REPLAY_SAFE_FALLBACK=0` and `VLMEVAL_STRICT_BATCH=1`, so replay or batch failures fail the task instead of silently changing prompt shape. Historical legacy artifacts can still contain fallback behavior, and exact reproduction audits should check logs for `[safe-fallback]`, `[SKIPPED_OVERLONG_PROMPT]`, quota errors, invalid tokens, and disk errors before accepting a cell. |
 | Answer-format report | `scripts/postprocess_answer_format.py` is a QA/reporting pass in the maintained runners. With the current invocation it checks/extracts format statistics but does not rewrite the prediction file used by evaluation, so it should not be treated as a score-changing postprocessor unless the script is changed. |
 
 The current provenance scan accounts for the main table as follows:
@@ -111,13 +111,13 @@ The provenance README reports 5 unresolved cells before manual override handling
 
 | Model/dataset scope | Use this entrypoint |
 |---|---|
-| Gemma3 4B/12B/27B on all 11 table datasets and all 6 replay modes | `bash scripts/run_gemma3_family_all11_replay6_2nodes_20260422.sh <node_rank> [gpu_ids]` |
+| Gemma3 4B/12B/27B on all 11 table datasets and all 6 replay modes | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml --model-config scripts/configs/models.yaml --nodes 2 --node-rank <node_rank> --gpu-ids <gpu_ids> --task-manifest scripts/configs/task_manifests/gemma3_family_all11_replay6_2node_20260422/node<node_rank>_tasks.csv --manifest-is-node-shard --scheduler gpu_pool` |
 | Gemma3 12B I-Q on `MathVision`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` when matching the recorded table provenance | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_gemma3_12b_reference4_image_text_20260422.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool` |
-| Qwen2.5 3B/32B/72B and MiniCPM-V/O on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | `bash scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh <node_rank> [gpu_ids]` |
-| Qwen2.5 7B on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | Mixed source: 16 cells use `bash scripts/run_qwen25vl_all4_reasoning_perception4_new_entry_4nodes_20260421.sh <node_rank> [gpu_ids]`, while 8 cells use `bash scripts/run_qwen25vl_minicpm45_all4_reasoning_perception4_2nodes_20260422.sh <node_rank> [gpu_ids]`. This is a source-run split, not a judge-model split. Use `docs/final_table_cell_sources.csv` for the exact cell list. |
+| Qwen2.5 3B/32B/72B and MiniCPM-V/O on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml --model-config scripts/configs/models.yaml --nodes 2 --node-rank <node_rank> --gpu-ids <gpu_ids> --task-manifest scripts/configs/task_manifests/qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422/node<node_rank>_tasks.csv --manifest-is-node-shard --scheduler gpu_pool` |
+| Qwen2.5 7B on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, `MMStar` | Mixed source: 16 cells use `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_qwen25vl_all4_reasoning_perception4_new_entry_20260421.yaml --model-config scripts/configs/models.yaml --nodes 4 --node-rank <node_rank> --gpu-ids <gpu_ids> --task-manifest scripts/configs/task_manifests/qwen25vl_all4_reasoning_perception4_new_entry_20260421/node<node_rank>_tasks.csv --manifest-is-node-shard --scheduler gpu_pool`, while 8 cells use `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml --model-config scripts/configs/models.yaml --nodes 2 --node-rank <node_rank> --gpu-ids <gpu_ids> --task-manifest scripts/configs/task_manifests/qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422/node<node_rank>_tasks.csv --manifest-is-node-shard --scheduler gpu_pool`. This is a source-run split, not a judge-model split. Use `docs/final_table_cell_sources.csv` for the exact cell list. |
 | Qwen2.5 3B/7B/32B/72B on `LogicVista` and `VisualPuzzles` | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_qwen25vl_all4_reasoning4_new_entry_20260421.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool --datasets LogicVista VisualPuzzles` |
-| Qwen2.5 legacy cells on `AI2D_TEST`, `DynaMath`, `MathVision`, `OCRBench`, `SEEDBench2_Plus` | Use the legacy scripts listed in `docs/final_table_reproduction_entries.csv`; `bash scripts/run_final_table_legacy_backfill_20260512.sh` is only the 21-cell release backfill for `Qwen2.5 3B/72B` on `AI2D_TEST`, `OCRBench`, and `SEEDBench2_Plus`. |
-| MiniCPM-V/O on `AI2D_TEST`, `DynaMath`, `MathVision`, `OCRBench`, `SEEDBench2_Plus` | Use `matrix_qwen25vl7b_minicpm45_table_20260406.yaml`, `matrix_minicpm_default_infer_only_fresh_20260317.yaml`, and `run_legacy_dynamath_infer_only_all_replay.sh` as listed in the CSV. |
+| Qwen2.5 legacy cells on `AI2D_TEST`, `DynaMath`, `MathVision`, `OCRBench`, `SEEDBench2_Plus` | Use the legacy scripts listed in `docs/final_table_reproduction_entries.csv`; `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_final_table_legacy_backfill_20260512.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool --gpu-ids <gpu_ids> --task-manifest scripts/configs/task_manifests/final_table_legacy_backfill_20260512/all_tasks.csv` is only the 21-cell release backfill for `Qwen2.5 3B/72B` on `AI2D_TEST`, `OCRBench`, and `SEEDBench2_Plus`. |
+| MiniCPM-V/O on `AI2D_TEST`, `DynaMath`, `MathVision`, `OCRBench`, `SEEDBench2_Plus` | Use `matrix_qwen25vl7b_minicpm45_table_20260406.yaml`, `matrix_minicpm_default_infer_only_fresh_20260317.yaml`, and the legacy DynaMath matrix/Python runner listed in the CSV. |
 | MiniCPM-V/O on `LogicVista` | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_minicpm_logicvista_all_replay_eval_20260419.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool` |
 | MiniCPM-V/O on `VisualPuzzles` | `bash scripts/run_benchmark.sh --matrix-config scripts/configs/matrix_minicpm_visualpuzzles_all_replay_eval_realign_20260420.yaml --model-config scripts/configs/models.yaml --scheduler gpu_pool` |
 
@@ -178,13 +178,26 @@ bash scripts/run_benchmark.sh \
 Run a single node-rank of the Gemma3 family matrix:
 
 ```bash
-bash scripts/run_gemma3_family_all11_replay6_2nodes_20260422.sh 0 0,1,2,3,4,5,6,7
+bash scripts/run_benchmark.sh \
+  --matrix-config scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml \
+  --model-config scripts/configs/models.yaml \
+  --nodes 2 \
+  --node-rank 0 \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --task-manifest scripts/configs/task_manifests/gemma3_family_all11_replay6_2node_20260422/node0_tasks.csv \
+  --manifest-is-node-shard \
+  --scheduler gpu_pool
 ```
 
 Run the release backfill manifest for legacy table cells:
 
 ```bash
-bash scripts/run_final_table_legacy_backfill_20260512.sh
+bash scripts/run_benchmark.sh \
+  --matrix-config scripts/configs/matrix_final_table_legacy_backfill_20260512.yaml \
+  --model-config scripts/configs/models.yaml \
+  --scheduler gpu_pool \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --task-manifest scripts/configs/task_manifests/final_table_legacy_backfill_20260512/all_tasks.csv
 ```
 
 Run MiniCPM VisualPuzzles final-table parity:
