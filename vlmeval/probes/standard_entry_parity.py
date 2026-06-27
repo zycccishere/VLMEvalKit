@@ -921,8 +921,8 @@ def dump_standard_payload(args: argparse.Namespace) -> None:
                     "raw_prompt_image_count": prompt_counts.get("image", 0),
                     "processed_image_count": processed_images,
                     "processed_image_count_ok": processed_images == expected_images,
-                    "dynamath_legacy_prompt_ok": None,
-                    "dynamath_non_qwen_short_prompt_ok": None,
+                    "dynamath_qwen_prompt_policy_ok": None,
+                    "dynamath_non_qwen_prompt_policy_ok": None,
                     "logicvista_qwen_sampling_ok": None,
                     "minicpm_no_upsize_ok": None,
                     "gemma3_temperature_ok": None,
@@ -936,14 +936,14 @@ def dump_standard_payload(args: argparse.Namespace) -> None:
                     has_two_key_legacy = "two keys" in lowered_prompt and "solution" in lowered_prompt
                     if family == "qwen25vl":
                         if args.policy == "default":
-                            checks["dynamath_legacy_prompt_ok"] = has_solution and has_short_answer
+                            checks["dynamath_qwen_prompt_policy_ok"] = has_solution and has_short_answer
                         else:
-                            checks["dynamath_legacy_prompt_ok"] = (not has_solution) and has_direct_answer
+                            checks["dynamath_qwen_prompt_policy_ok"] = (not has_solution) and has_direct_answer
                     elif family in {"minicpm45", "gemma3"}:
                         if args.policy == "default":
-                            checks["dynamath_non_qwen_short_prompt_ok"] = (not has_solution) and (not has_two_key_legacy)
+                            checks["dynamath_non_qwen_prompt_policy_ok"] = (not has_solution) and (not has_two_key_legacy)
                         else:
-                            checks["dynamath_non_qwen_short_prompt_ok"] = (not has_solution) and has_direct_answer
+                            checks["dynamath_non_qwen_prompt_policy_ok"] = (not has_solution) and has_direct_answer
                 if dataset_name == "LogicVista" and family == "qwen25vl":
                     checks["logicvista_qwen_sampling_ok"] = all(env.get(k) == v for k, v in LOGICVISTA_QWEN_SAMPLING.items())
                 if family == "minicpm45":
