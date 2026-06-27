@@ -22,17 +22,17 @@ Run a dry plan before launching work:
 
 ```bash
 bash scripts/run_benchmark.sh \
-  --matrix-config scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml \
-  --model-config scripts/configs/models.yaml \
+  --matrix-config configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml \
+  --model-config configs/models.yaml \
   --scheduler gpu_pool \
   --plan-only
 ```
 
 ### Active Entrypoints
 
-- `bash scripts/run_benchmark.sh ...`: the only maintained shell entrypoint under `scripts/`. It reads `scripts/configs/models.yaml` plus a matrix YAML, supports `--resume-infer`, and has `--scheduler gpu_pool` for mixed tensor-parallel packing.
+- `bash scripts/run_benchmark.sh ...`: the only maintained shell entrypoint under `scripts/`. It reads `configs/models.yaml` plus a matrix YAML, supports `--resume-infer`, and has `--scheduler gpu_pool` for mixed tensor-parallel packing.
 
-Top-level `scripts/` is intentionally limited to the maintained runner, its direct support utilities, and validation probes. Reproduce main-table cells by selecting the documented matrix config and, for sharded historical source groups, passing `--nodes`, `--node-rank`, `--gpu-ids`, `--task-manifest`, and `--manifest-is-node-shard` directly to `run_benchmark.sh`. Historical shell launchers that are kept only for provenance live under `scripts_legacy/`.
+Top-level `scripts/` is intentionally limited to `scripts/run_benchmark.sh`. Reproduce main-table cells by selecting the documented matrix config and, for sharded historical source groups, passing `--nodes`, `--node-rank`, `--gpu-ids`, `--task-manifest`, and `--manifest-is-node-shard` directly to `run_benchmark.sh`. Historical shell launchers that are kept only for provenance live under `scripts_legacy/`.
 
 The `gpu_pool` scheduler is the expected scheduler for mixed-size model queues. It can keep an 8-GPU node filled with combinations such as one `tp=4` task plus two `tp=2` tasks when the matrix contains both 72B and 32B jobs.
 
@@ -45,13 +45,13 @@ Run the new stack with the maintained matrix runner:
 ```bash
 bash scripts/run_benchmark.sh \
   --matrix-config <matrix.yaml> \
-  --model-config scripts/configs/models.yaml \
+  --model-config configs/models.yaml \
   --scheduler gpu_pool \
   --plan-only
 
 bash scripts/run_benchmark.sh \
   --matrix-config <matrix.yaml> \
-  --model-config scripts/configs/models.yaml \
+  --model-config configs/models.yaml \
   --scheduler gpu_pool
 ```
 
@@ -59,19 +59,19 @@ For the main sharded new matrices, launch one `run_benchmark.sh` command per nod
 
 ```bash
 bash scripts/run_benchmark.sh \
-  --matrix-config scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml \
-  --model-config scripts/configs/models.yaml \
+  --matrix-config configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml \
+  --model-config configs/models.yaml \
   --nodes 2 \
   --node-rank 0 \
   --gpu-ids 0,1,2,3,4,5,6,7 \
-  --task-manifest scripts/configs/task_manifests/qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422/node0_tasks.csv \
+  --task-manifest configs/task_manifests/qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422/node0_tasks.csv \
   --manifest-is-node-shard \
   --scheduler gpu_pool
 ```
 
-Gemma3-family all-11 benchmark reproduction uses the same entrypoint with `scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml` and the matching `scripts/configs/task_manifests/gemma3_family_all11_replay6_2node_20260422/node<N>_tasks.csv`.
+Gemma3-family all-11 benchmark reproduction uses the same entrypoint with `configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml` and the matching `configs/task_manifests/gemma3_family_all11_replay6_2node_20260422/node<N>_tasks.csv`.
 
-Run legacy shell stacks only from `scripts_legacy/`. Legacy DynaMath infer-only provenance is represented by `scripts/configs/matrix_legacy_dynamath_infer_only_all_replay.yaml` and the lower-level `python scripts/run_benchmark_task_balanced.py` path, not by a top-level `scripts/*.sh` wrapper.
+Run legacy shell stacks only from `scripts_legacy/`. Legacy DynaMath infer-only provenance is represented by `configs/matrix_legacy_dynamath_infer_only_all_replay.yaml` and the lower-level `python scripts_legacy/run_benchmark_task_balanced.py` path, not by a top-level `scripts/*.sh` wrapper.
 
 Use the source-stack table below to choose `New` or `Legacy` at the model-by-dataset level. It uses the majority stack across replay settings for each model and dataset; use the detailed CSVs only when exact per-cell provenance is needed.
 
@@ -161,13 +161,13 @@ The table below is copied from `assets/topics/topic-image-replay/resources/final
 
 ### Main Matrices
 
-- `scripts/configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml`: Qwen2.5-VL 3B/7B/32B/72B plus MiniCPM-V/O-4.5 on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, and `MMStar`.
-- `scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml`: Gemma3 family on `DynaMath`, `MathVision`, `LogicVista`, `VisualPuzzles`, `AI2D_TEST`, `OCRBench`, `SEEDBench2_Plus`, and the four newer benchmarks.
-- `scripts/configs/matrix_qwen25vl_all4_reasoning_perception4_new_entry_20260421.yaml`: earlier Qwen2.5-only four-new-benchmark matrix.
-- `scripts/configs/matrix_qwen25vl7b_minicpm45_table_20260406.yaml`: preserved legacy table matrix for Qwen2.5-7B and MiniCPM-4.5.
-- `scripts/configs/matrix_legacy_dynamath_infer_only_all_replay.yaml`: preserved legacy Dynamath infer-only matrix.
-- `scripts/configs/matrix_minicpm45_wemath_cot_rerun_20260429.yaml`: MiniCPM-4.5 WeMath CoT rerun matrix.
-- `scripts/configs/matrix_final_table_legacy_backfill_20260512.yaml` plus `scripts/configs/task_manifests/final_table_legacy_backfill_20260512/all_tasks.csv`: exact backfill manifest for the 21 legacy standard-run cells needed to cover every non-public, non-derived `final_table.csv` benchmark cell with the release runner.
+- `configs/matrix_qwen25vl_minicpm45_all4_reasoning_perception4_2node_20260422.yaml`: Qwen2.5-VL 3B/7B/32B/72B plus MiniCPM-V/O-4.5 on `MMMU_DEV_VAL_SINGLE_IMAGE`, `WeMath`, `MMBench_DEV_EN_V11`, and `MMStar`.
+- `configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml`: Gemma3 family on `DynaMath`, `MathVision`, `LogicVista`, `VisualPuzzles`, `AI2D_TEST`, `OCRBench`, `SEEDBench2_Plus`, and the four newer benchmarks.
+- `configs/matrix_qwen25vl_all4_reasoning_perception4_new_entry_20260421.yaml`: earlier Qwen2.5-only four-new-benchmark matrix.
+- `configs/matrix_qwen25vl7b_minicpm45_table_20260406.yaml`: preserved legacy table matrix for Qwen2.5-7B and MiniCPM-4.5.
+- `configs/matrix_legacy_dynamath_infer_only_all_replay.yaml`: preserved legacy Dynamath infer-only matrix.
+- `configs/matrix_minicpm45_wemath_cot_rerun_20260429.yaml`: MiniCPM-4.5 WeMath CoT rerun matrix.
+- `configs/matrix_final_table_legacy_backfill_20260512.yaml` plus `configs/task_manifests/final_table_legacy_backfill_20260512/all_tasks.csv`: exact backfill manifest for the 21 legacy standard-run cells needed to cover every non-public, non-derived `final_table.csv` benchmark cell with the release runner.
 
 ### Code Map
 
@@ -177,8 +177,8 @@ The table below is copied from `assets/topics/topic-image-replay/resources/final
 - Gemma3 replay wrapper: `vlmeval/vlm/gemma3_replay.py`.
 - Minimal model registries: `vlmeval/config_qwen_minimal.py`, `vlmeval/config_minicpm45_minimal.py`, and `vlmeval/config_gemma3_minimal.py`.
 - Dataset/eval adaptations: `vlmeval/dataset/dynamath.py`, `vlmeval/dataset/image_mcq.py`, `vlmeval/dataset/image_vqa.py`, and `vlmeval/dataset/utils/{logicvista,mathv,visualpuzzles,wemath}.py`.
-- Matrix orchestration and result collection: `scripts/run_benchmark.py`, `scripts/collect_matrix_results.py`, and `scripts/configs/`.
-- Runtime parity probes: `scripts/step7_standard_entry_parity.py` and `vlmeval/probes/standard_entry_parity.py`. These are validation tools for the release route, not benchmark launchers.
+- Matrix orchestration and result collection: `vlmeval/cli/run_benchmark.py`, `vlmeval/cli/collect_matrix_results.py`, and `configs/`.
+- Runtime parity probes: `python -m vlmeval.probes.step7_standard_entry_parity` and `vlmeval/probes/standard_entry_parity.py`. These are validation tools for the release route, not benchmark launchers.
 
 ### Reproducibility Notes
 

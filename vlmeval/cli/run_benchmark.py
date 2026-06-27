@@ -22,7 +22,7 @@ from typing import Any
 try:
     import yaml
 except ImportError as exc:
-    raise SystemExit("PyYAML is required to run scripts/run_benchmark.py") from exc
+    raise SystemExit("PyYAML is required to run vlmeval.cli.run_benchmark") from exc
 
 
 def truthy(value: Any) -> bool:
@@ -69,7 +69,7 @@ def load_repo_env(repo_root: str) -> None:
 def require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
-        raise SystemExit(f"{name} is not set. Export {name} or define it in the repo .env before running run_benchmark.py.")
+        raise SystemExit(f"{name} is not set. Export {name} or define it in the repo .env before running vlmeval.cli.run_benchmark.")
     return value
 
 
@@ -280,12 +280,12 @@ class Task:
 
 
 class BenchmarkRunner:
-    def __init__(self, script_dir: Path, args: argparse.Namespace) -> None:
-        self.script_dir = script_dir
+    def __init__(self, repo_root: Path, args: argparse.Namespace) -> None:
+        self.repo_root_path = repo_root
         self.args = args
         matrix = load_yaml(args.matrix_config)
         models_cfg = load_yaml(args.model_config)
-        default_repo_root = str(script_dir.parent)
+        default_repo_root = str(repo_root)
         load_repo_env(default_repo_root)
         self.repo_root = str(format_value(matrix.get("repo_root", default_repo_root), default_repo_root))
         self.results_root = self._resolve_results_root(matrix["results_root"])
@@ -870,7 +870,9 @@ class BenchmarkRunner:
         if allowlist_path:
             env["DATASET_INDEX_ALLOWLIST_FILE"] = str(allowlist_path)
         if task.mode == "image_text_blankimg":
-            blank_asset = Path(self.repo_root) / "scripts" / "assets" / "blank-white-1x1.png"
+            blank_asset = Path(self.repo_root) / "assets" / "blank-white-1x1.png"
+            if not blank_asset.exists():
+                raise FileNotFoundError(f"blank image asset not found: {blank_asset}")
             env["REPLAY_BLANK_IMAGE_POSITIONS"] = "2"
             env["REPLAY_BLANK_IMAGE_PATH"] = str(blank_asset)
         max_num_seqs = self.max_num_seqs_for_task(model, task)
@@ -1344,7 +1346,8 @@ except Exception:
         log_path = self.log_root(task) / "answer_format" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         cmd = [
             self.env_profiles[model.env_profile].python,
-            str(self.script_dir / "postprocess_answer_format.py"),
+            "-m",
+            "vlmeval.cli.postprocess_answer_format",
             "--pred-file",
             str(pred_file),
             "--out-json",
@@ -1514,11 +1517,15 @@ except Exception:
         return datetime.now().strftime("%Y%m%d%H%M%S")
 
 
+def default_repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
 def parse_args() -> argparse.Namespace:
-    script_dir = Path(__file__).resolve().parent
+    repo_root = default_repo_root()
     parser = argparse.ArgumentParser(description="Unified replay benchmark launcher.")
     parser.add_argument("--matrix-config", type=Path, required=True)
-    parser.add_argument("--model-config", type=Path, default=script_dir / "configs" / "models.yaml")
+    parser.add_argument("--model-config", type=Path, default=repo_root / "configs" / "models.yaml")
     parser.add_argument("--nodes", type=int, default=detect_num_nodes())
     parser.add_argument("--node-rank", type=int, default=detect_node_rank())
     parser.add_argument("--gpu-ids", type=str, default="")
@@ -1548,7 +1555,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    runner = BenchmarkRunner(Path(__file__).resolve().parent, args)
+    runner = BenchmarkRunner(default_repo_root(), args)
     return runner.run()
 
 

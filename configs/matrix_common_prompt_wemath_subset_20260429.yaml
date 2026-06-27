@@ -6,7 +6,7 @@ scheduler: gpu_pool
 datasets:
   - WeMath
 dataset_index_allowlists:
-  WeMath: "{repo_root}/scripts/configs/index_allowlists/wemath_first80_20260429.txt"
+  WeMath: "{repo_root}/configs/index_allowlists/wemath_first80_20260429.txt"
 policies:
   default:
     replay_prompt_template_name: identity

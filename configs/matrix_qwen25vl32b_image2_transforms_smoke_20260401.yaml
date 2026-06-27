@@ -6,8 +6,8 @@ datasets:
   - SEEDBench2_Plus
   - DynaMath
 dataset_index_allowlists:
-  SEEDBench2_Plus: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_seedbench2_plus_20260401.txt"
-  DynaMath: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_dynamath_20260401.txt"
+  SEEDBench2_Plus: "{repo_root}/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_seedbench2_plus_20260401.txt"
+  DynaMath: "{repo_root}/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_dynamath_20260401.txt"
 policies:
   default:
     replay_prompt_template_name: identity

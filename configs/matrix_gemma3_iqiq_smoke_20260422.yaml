@@ -6,7 +6,7 @@ scheduler: gpu_pool
 datasets:
   - DynaMath
 dataset_index_allowlists:
-  DynaMath: "{repo_root}/scripts/configs/index_allowlists/reasoning_smoke_dynamath_20260418.txt"
+  DynaMath: "{repo_root}/configs/index_allowlists/reasoning_smoke_dynamath_20260418.txt"
 policies:
   default:
     replay_prompt_template_name: identity

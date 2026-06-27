@@ -1,26 +1,19 @@
-name: qwen25vl32b_image2_symmetry_smoke_20260412
+name: minicpm_visualpuzzles_smoke_eval_20260419
 repo_root: "{repo_root}"
-results_root: runs/smoke_qwen25vl32b_image2_symmetry_20260412
+results_root: runs/smoke_minicpm_visualpuzzles_20260419
 node_gpu_ids: "0,1,2,3"
 datasets:
-  - AI2D_TEST
-  - DynaMath
+  - VisualPuzzles
 dataset_index_allowlists:
-  AI2D_TEST: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_ai2d_test_20260403.txt"
-  DynaMath: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_dynamath_20260401.txt"
+  VisualPuzzles: "{repo_root}/configs/index_allowlists/reasoning_smoke_visualpuzzles_20260418.txt"
 policies:
   default:
     replay_prompt_template_name: identity
 replay_modes:
-  - image_text_image
-image_transforms:
-  - baseline
-  - shift_right_halfpatch_wrap
-  - shift_down_halfpatch_wrap
-  - shift_left_halfpatch_wrap
-  - shift_up_halfpatch_wrap
+  - image_text
 models:
-  - qwen25vl_32b
+  - minicpm_v_45
+  - minicpm_o_45
 replay:
   replay_times: 1
   template_on_last_replay_text: 1
@@ -32,11 +25,6 @@ replay:
   stage_debug_samples: 2
   prompt_audit: 1
   prompt_audit_print: 1
-trace:
-  level: full
-  samples: 2
-  dump_max_chars: 24000
-  prompt_audit_print: 1
 answer_format:
   enable: 1
   require_boxed: 0
@@ -44,7 +32,7 @@ answer_format:
   fallback_col: detailed_prediction
   max_fails: 50
 evaluation:
-  launch_mode: skip
+  launch_mode: fg
   nproc: 8
   judge: gpt-4o-mini
   openai_api_key: ""

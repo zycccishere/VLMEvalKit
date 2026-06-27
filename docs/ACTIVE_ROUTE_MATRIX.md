@@ -9,7 +9,7 @@ All active shell launches go through the single maintained entrypoint. `--matrix
 ```bash
 bash scripts/run_benchmark.sh \
   --matrix-config <matrix.yaml> \
-  --model-config scripts/configs/models.yaml \
+  --model-config configs/models.yaml \
   --scheduler gpu_pool
 ```
 
@@ -79,13 +79,13 @@ Qwen2.5-VL LogicVista policy is special: `LOGICVISTA_QWEN25VL_FORCE_V0=1` by def
 | `matrix_minicpm_default_infer_only_fresh_20260317.yaml` | MiniCPM-V/O 4.5 | AI2D, MathVista Mini, OCRBench, SEEDBench2_Plus, LogicVista, VisualPuzzles, DynaMath, MathVision, plus historical VisuLogic slice | MiniCPM infer-only provenance route; VisuLogic is historical/provenance-only for this branch. |
 | `matrix_minicpm_logicvista_all_replay_eval_20260419.yaml` | MiniCPM-V/O 4.5 | LogicVista | MiniCPM LogicVista eval/realign route. |
 | `matrix_minicpm_visualpuzzles_all_replay_eval_realign_20260420.yaml` | MiniCPM-V/O 4.5 | VisualPuzzles | MiniCPM VisualPuzzles eval/realign route. |
-| `matrix_api_replay.yaml` | GPT/OpenAI-compatible, Claude, Gemini aliases in `scripts/configs/models.yaml` | Active table datasets including MathVista Mini | Closed-source API replay route; use explicit model filters for cost control. |
+| `matrix_api_replay.yaml` | GPT/OpenAI-compatible, Claude, Gemini aliases in `configs/models.yaml` | Active table datasets including MathVista Mini | Closed-source API replay route; use explicit model filters for cost control. |
 | `matrix_final_table_legacy_backfill_20260512.yaml` | Qwen2.5-VL 3B/72B | AI2D, OCRBench, SEEDBench2_Plus | Release backfill for remaining legacy standard-run cells. |
-| `matrix_legacy_dynamath_infer_only_all_replay.yaml` | Qwen2.5-VL 3B/7B/32B/72B, MiniCPM-V/O 4.5 | DynaMath | Legacy DynaMath infer-only provenance through `scripts/run_benchmark_task_balanced.py`. |
+| `matrix_legacy_dynamath_infer_only_all_replay.yaml` | Qwen2.5-VL 3B/7B/32B/72B, MiniCPM-V/O 4.5 | DynaMath | Legacy DynaMath infer-only provenance through `scripts_legacy/run_benchmark_task_balanced.py`. |
 
 ## Closed-Source API Routes
 
-Closed-source active routes are exposed through the `api_replay` profile in `scripts/configs/models.yaml`, the explicit `scripts/configs/matrix_api_replay.yaml` matrix, `vlmeval/config_api_replay_minimal.py`, and the standard replay API wrappers:
+Closed-source active routes are exposed through the `api_replay` profile in `configs/models.yaml`, the explicit `configs/matrix_api_replay.yaml` matrix, `vlmeval/config_api_replay_minimal.py`, and the standard replay API wrappers:
 
 | Alias family | Wrapper | Temperature | Max tokens | Notes |
 | --- | --- | ---: | ---: | --- |
@@ -93,12 +93,12 @@ Closed-source active routes are exposed through the `api_replay` profile in `scr
 | Claude aliases | `GPT4VReplay` | 0 | `VLMEVAL_API_MAX_TOKENS`, default 2048 | Matches the main-repo closed-source replay config. |
 | Gemini aliases | `GPT4VReplay` | 0 | `VLMEVAL_API_MAX_TOKENS`, default 2048 | Matches the main-repo closed-source replay config. |
 
-API usage logs are injected by `scripts/run_benchmark.py` unless `VLMEVAL_API_USAGE_LOG_FILE` or `TOKEN_USAGE_LOG_FILE` is already set.
+API usage logs are injected by `vlmeval/cli/run_benchmark.py` unless `VLMEVAL_API_USAGE_LOG_FILE` or `TOKEN_USAGE_LOG_FILE` is already set.
 
 ## Data Flow
 
-1. `scripts/run_benchmark.sh` loads `.env`, requires `LMUData`, and executes `scripts/run_benchmark.py`.
-2. `scripts/run_benchmark.py` resolves matrix/model YAML, canonicalizes dataset aliases, builds task records across model, policy, replay mode, transform, and dataset axes, and schedules them with `gpu_pool` or `model_sequential`.
+1. `scripts/run_benchmark.sh` loads `.env`, requires `LMUData`, and executes `vlmeval/cli/run_benchmark.py`.
+2. `vlmeval/cli/run_benchmark.py` resolves matrix/model YAML, canonicalizes dataset aliases, builds task records across model, policy, replay mode, transform, and dataset axes, and schedules them with `gpu_pool` or `model_sequential`.
 3. Per task, the runner builds environment variables for model path, replay mode, replay template, safe-fallback policy, strict batch behavior, vLLM knobs, judge endpoint, prediction roots, and trace/audit roots.
 4. Inference calls `run.py --mode infer --data <dataset> --model <registry> --batch-size <resolved_batch> --pred-output-dir <fixed_prediction_dir>`.
 5. `run.py` imports `vlmeval.config_runtime`, which selects the minimal active registry from environment flags instead of importing the full experimental registry.
@@ -107,11 +107,11 @@ API usage logs are injected by `scripts/run_benchmark.py` unless `VLMEVAL_API_US
 
 ## Current Runtime Gate
 
-Runtime validation was rerun on the release code at `4c3b2213`; later docs-only commits record that evidence without changing the runtime path:
+Runtime validation was rerun after the strict `scripts/` entrypoint cleanup. The runner now lives in `vlmeval/cli`, configs live in top-level `configs/`, and the only maintained shell entrypoint under `scripts/` is `scripts/run_benchmark.sh`:
 
-- Static route gate: `runs/final_head4c3_step7_context_20260627` covers 9 open-source models x 2 datasets (`DynaMath`, `LogicVista`) x 6 replay modes, all 108 checks passing. Qwen2.5-VL is the only DynaMath `legacy_two_keys` family and the only LogicVista vLLM v0 family; MiniCPM and Gemma3 use vLLM without the LogicVista v0 override.
-- Payload gate: `runs/final_head4c3_step7_payload_default_20260627` covers the same 108 open-source routes with real dataset rows and model-wrapper prompt/payload serialization, all checks passing.
+- Static route gate: `runs/final_strict_scripts_step7_context_20260627` covers 9 open-source models x 2 datasets (`DynaMath`, `LogicVista`) x 6 replay modes, all 108 checks passing. Qwen2.5-VL is the only DynaMath `legacy_two_keys` family and the only LogicVista vLLM v0 family; MiniCPM and Gemma3 use vLLM without the LogicVista v0 override.
+- Payload gate: `runs/final_strict_scripts_step7_payload_20260627` covers the same 108 open-source routes with real dataset rows and model-wrapper prompt/payload serialization, all checks passing.
+- API no-network gate: `runs/final_strict_scripts_api_context_20260627` covers all 11 tracked API aliases through the `api_replay` profile, all checks passing.
 - Direct DynaMath gate: `runs/final_head4c3_step7_payload_direct_dynamath_20260627` covers 9 open-source models x 6 replay modes under the `directly_answer` policy, all 54 checks passing.
 - Main-tree parity gate: `runs/final_head4c3_vs_main_payload_compare_20260627.json` compares the release payload gate with `/user/zyc1781/vlmevalkit`, all 108 rows passing.
-- API no-network gate: `runs/final_head4c3_api_context_20260627` covers all 11 tracked API aliases through the `api_replay` profile, all checks passing.
-- Step 8 speed profiling is recorded in `docs/STEP8_SPEED_BATCHSIZE.md` and `scripts/configs/model_speed_profiles_step8.yaml`; raw logs remain under ignored `runs/step8_speed_20260627`.
+- Step 8 speed profiling is recorded in `docs/STEP8_SPEED_BATCHSIZE.md` and `configs/model_speed_profiles_step8.yaml`; raw logs remain under ignored `runs/step8_speed_20260627`.

@@ -265,15 +265,14 @@ def write_probe_matrix(repo_root: Path, matrix_path: Path, result_root: Path, mo
 
 
 def runtime_env(repo_root: Path, output_root: Path, model_key: str, dataset: str, mode: str, policy: str, gpu_id: str, model_path_override: str = "", lmu_data: str = "") -> tuple[dict[str, str], Any, Any]:
-    script_dir = repo_root / "scripts"
     matrix_path = output_root / "_tmp" / f"matrix_{model_key}_{dataset}_{mode}_{policy}.yaml"
     write_probe_matrix(repo_root, matrix_path, output_root / "_runner_results", model_key, dataset, mode, policy)
     sys.path.insert(0, str(repo_root))
-    from scripts.run_benchmark import BenchmarkRunner
+    from vlmeval.cli.run_benchmark import BenchmarkRunner
 
     args = SimpleNamespace(
         matrix_config=matrix_path,
-        model_config=script_dir / "configs" / "models.yaml",
+        model_config=repo_root / "configs" / "models.yaml",
         nodes=1,
         node_rank=0,
         gpu_ids=gpu_id,
@@ -288,7 +287,7 @@ def runtime_env(repo_root: Path, output_root: Path, model_key: str, dataset: str
         resume_infer=False,
         plan_only=True,
     )
-    runner = BenchmarkRunner(script_dir, args)
+    runner = BenchmarkRunner(repo_root, args)
     if len(runner.tasks) != 1:
         raise RuntimeError(f"expected exactly one task, got {len(runner.tasks)}")
     task = runner.tasks[0]
@@ -550,7 +549,7 @@ def compare_outputs(args: argparse.Namespace) -> None:
 
 def purge_target_imports() -> None:
     for name in list(sys.modules):
-        if name == "vlmeval" or name.startswith("vlmeval.") or name == "scripts" or name.startswith("scripts."):
+        if name == "vlmeval" or name.startswith("vlmeval."):
             sys.modules.pop(name, None)
 
 

@@ -6,8 +6,8 @@ datasets:
   - AI2D_TEST
   - DynaMath
 dataset_index_allowlists:
-  AI2D_TEST: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_ai2d_test_20260403.txt"
-  DynaMath: "{repo_root}/scripts/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_dynamath_20260401.txt"
+  AI2D_TEST: "{repo_root}/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_ai2d_test_20260403.txt"
+  DynaMath: "{repo_root}/configs/index_allowlists/qwen25vl32b_image2_transforms_smoke_dynamath_20260401.txt"
 policies:
   default:
     replay_prompt_template_name: identity

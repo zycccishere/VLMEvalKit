@@ -1,7 +1,7 @@
 {
   "repo_root": "/path/to/vlmevalkit",
   "results_root": "/path/to/vlmevalkit/runs/by_setting_qwen25vl32b_unified_topology_image2_20260404",
-  "matrix_config": "/path/to/vlmevalkit/scripts/configs/matrix_qwen25vl32b_unified_topology_image2_plus_20260404.yaml",
+  "matrix_config": "/path/to/vlmevalkit/configs/matrix_qwen25vl32b_unified_topology_image2_plus_20260404.yaml",
   "task_counts": {
     "all": 141,
     "reuse_full": 105,
@@ -13,28 +13,28 @@
       "node": 0,
       "task_count": 9,
       "estimated_load": 36060.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node0_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node0_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl32b_unified_topology_image2_plus_20260404/run_node0.sh"
     },
     {
       "node": 1,
       "task_count": 9,
       "estimated_load": 36060.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node1_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node1_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl32b_unified_topology_image2_plus_20260404/run_node1.sh"
     },
     {
       "node": 2,
       "task_count": 9,
       "estimated_load": 36060.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node2_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node2_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl32b_unified_topology_image2_plus_20260404/run_node2.sh"
     },
     {
       "node": 3,
       "task_count": 9,
       "estimated_load": 36060.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node3_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl32b_unified_topology_image2_plus_20260404/node3_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl32b_unified_topology_image2_plus_20260404/run_node3.sh"
     }
   ]

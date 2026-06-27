@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import os
+import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from run_benchmark import BenchmarkRunner, parse_args, split_names
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from vlmeval.cli.run_benchmark import BenchmarkRunner, default_repo_root, parse_args, split_names
 
 
 class TaskBalancedBenchmarkRunner(BenchmarkRunner):
@@ -123,7 +128,7 @@ class TaskBalancedBenchmarkRunner(BenchmarkRunner):
 
 def main() -> int:
     args = parse_args()
-    runner = TaskBalancedBenchmarkRunner(Path(__file__).resolve().parent, args)
+    runner = TaskBalancedBenchmarkRunner(default_repo_root(), args)
     return runner.run()
 
 

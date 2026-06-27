@@ -43,4 +43,5 @@ if [[ ! -d "${LMUData}" ]]; then
     exit 1
 fi
 
-exec "${CONTROL_PYTHON}" "${SCRIPT_DIR}/run_benchmark.py" "$@"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+exec "${CONTROL_PYTHON}" -m vlmeval.cli.run_benchmark "$@"

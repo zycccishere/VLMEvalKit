@@ -1,7 +1,7 @@
 {
-  "matrix_config": "scripts/configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml",
-  "model_config": "scripts/configs/models.yaml",
-  "out_dir": "scripts/configs/task_manifests/gemma3_family_all11_replay6_2node_20260422",
+  "matrix_config": "configs/matrix_gemma3_family_all11_replay6_2node_20260422.yaml",
+  "model_config": "configs/models.yaml",
+  "out_dir": "configs/task_manifests/gemma3_family_all11_replay6_2node_20260422",
   "nodes": 2,
   "gpus_per_node": 8,
   "task_count": 198,

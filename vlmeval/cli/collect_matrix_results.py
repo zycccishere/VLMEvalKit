@@ -308,7 +308,7 @@ def eval_complete(metric_file: Path | None) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect matrix-shaped result tables from a unified-runner result root.")
     parser.add_argument("--matrix-config", type=Path, required=True)
-    parser.add_argument("--model-config", type=Path, default=Path("scripts/configs/models.yaml"))
+    parser.add_argument("--model-config", type=Path, default=Path("configs/models.yaml"))
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--results-root", type=Path, default=None, help="Optional override for results_root.")
     parser.add_argument("--models", type=str, default="")

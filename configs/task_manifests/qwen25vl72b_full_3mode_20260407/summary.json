@@ -1,7 +1,7 @@
 {
   "repo_root": "/path/to/vlmevalkit",
   "results_root": "/path/to/vlmevalkit/runs/by_setting_qwen25vl72b_full_3mode_20260407",
-  "matrix_config": "/path/to/vlmevalkit/scripts/configs/matrix_qwen25vl72b_full_3mode_20260407.yaml",
+  "matrix_config": "/path/to/vlmevalkit/configs/matrix_qwen25vl72b_full_3mode_20260407.yaml",
   "task_count": 27,
   "nodes": [
     {
@@ -10,7 +10,7 @@
       "model_display": "Qwen2.5-VL-72B",
       "task_count": 9,
       "estimated_load": 30329.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl72b_full_3mode_20260407/node0_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl72b_full_3mode_20260407/node0_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl72b_full_3mode_20260407/run_node0.sh"
     },
     {
@@ -19,7 +19,7 @@
       "model_display": "Qwen2.5-VL-72B",
       "task_count": 8,
       "estimated_load": 29884.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl72b_full_3mode_20260407/node1_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl72b_full_3mode_20260407/node1_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl72b_full_3mode_20260407/run_node1.sh"
     },
     {
@@ -28,7 +28,7 @@
       "model_display": "Qwen2.5-VL-72B",
       "task_count": 10,
       "estimated_load": 29937.0,
-      "manifest": "/path/to/vlmevalkit/scripts/configs/task_manifests/qwen25vl72b_full_3mode_20260407/node2_tasks.csv",
+      "manifest": "/path/to/vlmevalkit/configs/task_manifests/qwen25vl72b_full_3mode_20260407/node2_tasks.csv",
       "launch_script": "/path/to/vlmevalkit/tmp/qwen25vl72b_full_3mode_20260407/run_node2.sh"
     }
   ]
