@@ -198,12 +198,28 @@ class MiniCPM_V_4_5(BaseModel):
         }
         return force_no_thinking and template_name == "directly_answer"
 
+    def _reasoning_mode_override(self):
+        mode = os.environ.get("MINICPM45_REASONING_MODE", "").strip().lower().replace("-", "_")
+        if mode in {"no_thinking", "no_reasoning", "regular_cot", "regular_reasoning", "long_cot"}:
+            return mode
+        return ""
+
     def _use_general_no_thinking_dataset(self, dataset=None):
+        override = self._reasoning_mode_override()
+        if override in {"regular_cot", "regular_reasoning", "long_cot"}:
+            return False
+        if override in {"no_thinking", "no_reasoning"}:
+            return True
         if dataset is None:
             return False
         return listinstr(["AI2D", "AI2D_TEST", "SEEDBench2_Plus"], dataset)
 
     def _should_disable_thinking(self, dataset=None):
+        override = self._reasoning_mode_override()
+        if override in {"no_thinking", "no_reasoning"}:
+            return True
+        if override in {"regular_cot", "regular_reasoning", "long_cot"}:
+            return False
         return self._prefer_direct_answer_mode() or self._use_general_no_thinking_dataset(dataset)
 
     def _select_hf_chat_template(self, dataset=None):
@@ -212,6 +228,11 @@ class MiniCPM_V_4_5(BaseModel):
         return self._original_chat_template
 
     def use_long_cot(self, dataset=None):
+        override = self._reasoning_mode_override()
+        if override == "long_cot":
+            return True
+        if override in {"no_thinking", "no_reasoning", "regular_cot", "regular_reasoning"}:
+            return False
         if self._use_general_no_thinking_dataset(dataset):
             return False
         if self._prefer_direct_answer_mode():
@@ -238,6 +259,11 @@ class MiniCPM_V_4_5(BaseModel):
         )
 
     def use_cot(self, dataset=None):
+        override = self._reasoning_mode_override()
+        if override in {"regular_cot", "regular_reasoning", "long_cot"}:
+            return True
+        if override in {"no_thinking", "no_reasoning"}:
+            return False
         if self._use_general_no_thinking_dataset(dataset):
             return False
         if self._prefer_direct_answer_mode():
@@ -265,11 +291,12 @@ class MiniCPM_V_4_5(BaseModel):
         )
 
     def use_upsize(self, dataset=None):
-        if dataset is None:
-            return False
-        if self.use_long_cot(dataset):
-            return True
-        return listinstr(["AI2D", "OCRBench", "ChartQA", "TextVQA"], dataset)
+        # Evaluation should preserve the benchmark image as provided. The
+        # previous MiniCPM 4.5 wrapper upsampled selected datasets to roughly
+        # 1344x1344 with a random width, which made the runner apply a
+        # model-specific test-time augmentation. Keep the old policy disabled
+        # for both HF and vLLM paths.
+        return False
 
     def build_prompt(self, line, dataset=None):
         self.tokenizer.chat_template = self._select_hf_chat_template(dataset)
@@ -807,3 +834,21 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             tag=self.__class__.__name__,
         )
         return super().generate_inner(replayed, dataset=dataset)
+
+    def generate_batch_inner(self, messages, dataset=None):
+        replayed_messages = []
+        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+        for message in messages:
+            replayed = self._apply_replay_pipeline(message, dataset=dataset)
+            maybe_debug_print_replay(
+                enabled=self.replay_cfg.get("debug", False),
+                mode=replay_mode,
+                before=message,
+                after=replayed,
+                tag=self.__class__.__name__,
+            )
+            replayed_messages.append(replayed)
+        if self.use_vllm:
+            return self._generate_batch_inner_vllm(replayed_messages, dataset=dataset)
+        generate_one = super().generate_inner
+        return [generate_one(message, dataset=dataset) for message in replayed_messages]

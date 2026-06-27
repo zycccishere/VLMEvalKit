@@ -114,6 +114,26 @@ class BaseModel:
             assert item['type'] in self.allowed_types, f'Invalid input type: {item["type"]}'
         return self.generate_inner(message, dataset)
 
+    def generate_batch(self, messages, dataset=None):
+        """Generate output messages in a batch.
+
+        This mirrors the legacy replay fork surface used by `vlmeval.inference`.
+        Models without `generate_batch_inner` will still fall back in the caller.
+        """
+        if not hasattr(self, 'generate_batch_inner'):
+            raise NotImplementedError(f'{self.__class__.__name__} does not implement generate_batch_inner')
+
+        preprocessed_messages = []
+        for message in messages:
+            assert self.check_content(message) in ['str', 'dict', 'liststr', 'listdict'], f'Invalid input type: {message}'
+            processed_message = self.preproc_content(message)
+            assert processed_message is not None and self.check_content(processed_message) == 'listdict'
+            for item in processed_message:
+                assert item['type'] in self.allowed_types, f'Invalid input type: {item["type"]}'
+            preprocessed_messages.append(processed_message)
+
+        return self.generate_batch_inner(preprocessed_messages, dataset)
+
     def chat(self, messages, dataset=None):
         """The main function for multi-turn chatting. Will call `chat_inner` with the preprocessed input messages."""
         assert hasattr(self, 'chat_inner'), 'The API model should has the `chat_inner` method. '
@@ -152,6 +172,20 @@ class BaseModel:
                 image = images[0]
         return prompt, image
 
+    def messages_to_promptimgs(self, messages, dataset=None):
+        assert not self.INTERLEAVE
+        model_name = self.__class__.__name__
+        warnings.warn(
+            f'Model {model_name} does not support interleaved input. '
+            'Will use the first image and aggregated texts as prompt. ')
+        prompts = []
+        images = []
+        for message in messages:
+            prompt, image = self.message_to_promptimg(message, dataset=dataset)
+            prompts.append(prompt)
+            images.append(image)
+        return prompts, images
+
     def message_to_promptvideo(self, message):
         if self.VIDEO_LLM:
             num_videos = len([x for x in message if x['type'] == 'video'])
@@ -165,6 +199,15 @@ class BaseModel:
         else:
             logging.critical('Model does not support video input.')
             raise NotImplementedError
+
+    def message_to_promptvideos(self, messages):
+        prompts = []
+        videos = []
+        for message in messages:
+            prompt, video = self.message_to_promptvideo(message)
+            prompts.append(prompt)
+            videos.append(video)
+        return prompts, videos
 
     def message_to_promptvideo_withrole(self, message, dataset=None):
         if self.VIDEO_LLM:

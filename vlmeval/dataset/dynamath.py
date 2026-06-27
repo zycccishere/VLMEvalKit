@@ -9,7 +9,7 @@ import os.path as osp
 import argparse
 
 from .image_base import ImageBaseDataset
-from .utils import build_judge
+from .utils import build_judge, DEBUG_MESSAGE
 from .utils.prompt_tail import tail_tokens_for_judge
 from ..utils import track_progress_rich
 from ..smp import load, dump, d2df, toliststr
@@ -175,11 +175,10 @@ def _extract_safe_short_answer_candidate(pred):
     return None
 
 
-def DynaMath_auxeval(model, line):
+def DynaMath_local_parse(line):
     pred = line['prediction']
     pred = preprocess(pred)
 
-    succeed, short_answer = None, None
     try:
         short_answer = _extract_safe_short_answer_candidate(pred)
         if short_answer is None:
@@ -187,6 +186,14 @@ def DynaMath_auxeval(model, line):
         succeed, short_answer = parse_answer(short_answer, answer_type=line['answer_type'])
         assert succeed
     except:
+        return False, None, pred
+    return True, short_answer, pred
+
+
+def DynaMath_auxeval(model, line):
+    succeed, short_answer, pred = DynaMath_local_parse(line)
+
+    if not succeed:
         # Failed to parse the JSON, use an auxiliary LLM to get the short answer
         if line['answer_type'] == 'multiple choice':
             inst = (
@@ -263,11 +270,13 @@ Example of expected JSON response format:
 
     @staticmethod
     def _dynamath_prompt_schema():
-        # short_answer_only (default): ask only for short answer.
-        # legacy_two_keys: keep original solution + short answer schema.
-        schema = os.environ.get('DYNAMATH_PROMPT_SCHEMA', 'short_answer_only').strip().lower()
+        # Default to the legacy public-table prompt: ask for both reasoning
+        # (`solution`) and final answer (`short answer`). Set
+        # DYNAMATH_PROMPT_SCHEMA=short_answer_only for the newer answer-only
+        # schema.
+        schema = os.environ.get('DYNAMATH_PROMPT_SCHEMA', 'legacy_two_keys').strip().lower()
         if schema not in {'short_answer_only', 'legacy_two_keys'}:
-            schema = 'short_answer_only'
+            schema = 'legacy_two_keys'
         return schema
 
     # Given one data record, return the built prompt (a multi-modal message), can override
@@ -334,8 +343,12 @@ You are a helpful assistant that helps me to format free-form answers into a sho
         if not osp.exists(storage):
             data = load(eval_file)
             lt = len(data)
-            payloads = [dict(model=model, line=data.iloc[i]) for i in range(lt) if data.iloc[i]['index'] not in res]
-            keys = [idx for idx in data['index'] if idx not in res]
+            pending_indices = [i for i in range(lt) if data.iloc[i]['index'] not in res]
+            requires_judge = any(not DynaMath_local_parse(data.iloc[i])[0] for i in pending_indices)
+            if requires_judge:
+                assert model.working(), 'DynaMath evaluation requires a working OPENAI API\n' + DEBUG_MESSAGE
+            payloads = [dict(model=model, line=data.iloc[i]) for i in pending_indices]
+            keys = [data.iloc[i]['index'] for i in pending_indices]
 
             if len(keys):
                 results = track_progress_rich(DynaMath_auxeval, payloads, nproc=nproc, save=tmp_file, keys=keys)

@@ -541,6 +541,14 @@ def infer_data(model_name, work_dir, dataset, out_file, verbose=False, api_nproc
                 print(f"Processing batch {i // batch_size + 1} with {len(prompts)} prompts.", flush=True)
                 responses = model.generate_batch(messages=prompts, dataset=dataset_name)
             except Exception as e:
+                strict_batch = os.environ.get('VLMEVAL_STRICT_BATCH', '0').strip().lower() in {
+                    '1', 'true', 'yes', 'on'
+                }
+                if strict_batch:
+                    raise RuntimeError(
+                        f"Batch generation failed for {dataset_name} at offset {i} "
+                        f"with batch_size={batch_size}"
+                    ) from e
                 print(f"Error during batch generation: {e}. Falling back to single-item generation for this batch.")
                 # Fallback to single-item generation if batch fails
                 responses = []

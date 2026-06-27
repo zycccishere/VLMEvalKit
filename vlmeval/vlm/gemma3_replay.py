@@ -38,6 +38,30 @@ def _env_int(name: str, default: int) -> int:
     return default
 
 
+def _env_float_optional(*names: str) -> float | None:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return float(raw)
+        except ValueError:
+            logging.warning("Ignoring invalid float env %s=%r", name, raw)
+    return None
+
+
+def _env_int_optional(*names: str) -> int | None:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            logging.warning("Ignoring invalid int env %s=%r", name, raw)
+    return None
+
+
 def _dataset_type(name: str | None) -> str | None:
     if not name:
         return None
@@ -99,7 +123,14 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         self.max_new_tokens = int(
             kwargs.pop("max_new_tokens", _env_int("GEMMA3_MAX_NEW_TOKENS", max_new_tokens))
         )
-        self.temperature = float(kwargs.pop("temperature", temperature))
+        env_temperature = _env_float_optional("GEMMA3_VLLM_TEMPERATURE", "GEMMA3_TEMPERATURE")
+        self.temperature = float(kwargs.pop("temperature", env_temperature if env_temperature is not None else temperature))
+        self.sampling_top_p = _env_float_optional("GEMMA3_VLLM_TOP_P", "GEMMA3_TOP_P")
+        self.sampling_top_k = _env_int_optional("GEMMA3_VLLM_TOP_K", "GEMMA3_TOP_K")
+        self.sampling_repetition_penalty = _env_float_optional(
+            "GEMMA3_VLLM_REPETITION_PENALTY",
+            "GEMMA3_REPETITION_PENALTY",
+        )
         self.vllm_tensor_parallel_size = tensor_parallel_size
         self.vllm_max_model_len = max_model_len or _env_int(
             "GEMMA3_VLLM_MAX_MODEL_LEN",
@@ -284,10 +315,19 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
     def _build_sampling_params(self):
         from vllm import SamplingParams
 
-        return SamplingParams(
+        kwargs = dict(
             temperature=max(0.0, float(self.temperature)),
             max_tokens=self.max_new_tokens,
         )
+        if self.sampling_top_p is not None:
+            kwargs["top_p"] = self.sampling_top_p
+        if self.sampling_top_k is not None:
+            kwargs["top_k"] = self.sampling_top_k
+        if self.sampling_repetition_penalty is not None:
+            kwargs["repetition_penalty"] = self.sampling_repetition_penalty
+        logging.info("Gemma3 vLLM SamplingParams: %s", kwargs)
+        print(f"Gemma3 vLLM SamplingParams: {kwargs}", flush=True)
+        return SamplingParams(**kwargs)
 
     def _extract_mcq_answer_from_free_form(self, text: str) -> str | None:
         text = str(text).strip()

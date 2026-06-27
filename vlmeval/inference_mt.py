@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from vlmeval.config import supported_VLM
+from vlmeval.config_runtime import supported_VLM
 from vlmeval.utils import track_progress_rich
 from vlmeval.smp import *
 

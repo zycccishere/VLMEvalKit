@@ -29,6 +29,32 @@ _DIRECT_TEMPLATE_STRIP_SUFFIXES = {
 }
 
 
+def _text_keys(item: dict[str, str], preferred_key: str = "text") -> list[str]:
+    keys = []
+    if preferred_key in item:
+        keys.append(preferred_key)
+    for key in ("text", "value"):
+        if key in item and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _text_value(item: dict[str, str], preferred_key: str = "text") -> str:
+    for key in _text_keys(item, preferred_key=preferred_key):
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _set_text_value(item: dict[str, str], value: str, preferred_key: str = "text") -> None:
+    keys = _text_keys(item, preferred_key=preferred_key)
+    if not keys:
+        keys = [preferred_key]
+    for key in keys:
+        item[key] = value
+
+
 def read_prompt_template_config_from_env() -> dict[str, str]:
     template_name = (
         os.environ.get("REPLAY_PROMPT_TEMPLATE_NAME")
@@ -108,9 +134,13 @@ def strip_prompt_template_from_content_for_direct_answer(
             output.append(item)
             continue
         new_item = dict(item)
-        new_item[text_key] = strip_dataset_prompt_template_for_direct_answer(
-            str(item.get(text_key, "")),
-            dataset=dataset,
+        _set_text_value(
+            new_item,
+            strip_dataset_prompt_template_for_direct_answer(
+                _text_value(item, preferred_key=text_key),
+                dataset=dataset,
+            ),
+            preferred_key=text_key,
         )
         output.append(new_item)
     return output
@@ -141,6 +171,7 @@ def apply_prompt_template_to_content(
     content: list[dict[str, str]],
     template_cfg: dict[str, str],
     dataset: str | None = None,
+    text_key: str = "text",
 ) -> list[dict[str, str]]:
     if not content:
         return content
@@ -154,7 +185,7 @@ def apply_prompt_template_to_content(
             continue
         if item.get("type") != "text":
             continue
-        if item.get("text", "") in _TEXT_MARKERS_TO_SKIP:
+        if _text_value(item, preferred_key=text_key) in _TEXT_MARKERS_TO_SKIP:
             continue
         target_idx = idx
 
@@ -167,10 +198,14 @@ def apply_prompt_template_to_content(
             output.append(item)
             continue
         new_item = dict(item)
-        new_item["text"] = render_prompt_with_template(
-            item.get("text", ""),
-            template_cfg,
-            dataset=dataset,
+        _set_text_value(
+            new_item,
+            render_prompt_with_template(
+                _text_value(item, preferred_key=text_key),
+                template_cfg,
+                dataset=dataset,
+            ),
+            preferred_key=text_key,
         )
         output.append(new_item)
     return output

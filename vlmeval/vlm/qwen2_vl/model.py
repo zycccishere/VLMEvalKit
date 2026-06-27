@@ -871,6 +871,31 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
     def _build_vllm_sampling_params(self):
         from vllm import SamplingParams
 
+        env = os.environ
+        override_keys = {
+            "temperature": "QWEN2VL_VLLM_TEMPERATURE",
+            "top_p": "QWEN2VL_VLLM_TOP_P",
+            "top_k": "QWEN2VL_VLLM_TOP_K",
+            "repetition_penalty": "QWEN2VL_VLLM_REPETITION_PENALTY",
+            "max_tokens": "QWEN2VL_VLLM_MAX_TOKENS",
+        }
+        if any(env.get(name, "").strip() for name in override_keys.values()):
+            kwargs = {
+                "temperature": float(env.get("QWEN2VL_VLLM_TEMPERATURE", "0.0")),
+                "top_p": float(env.get("QWEN2VL_VLLM_TOP_P", "1.0")),
+                "top_k": int(env.get("QWEN2VL_VLLM_TOP_K", "0")),
+                "repetition_penalty": float(env.get("QWEN2VL_VLLM_REPETITION_PENALTY", "1.0")),
+                "max_tokens": int(env.get("QWEN2VL_VLLM_MAX_TOKENS", str(self.max_new_tokens))),
+            }
+            stop_ids = env.get("QWEN2VL_VLLM_STOP_TOKEN_IDS", "").strip()
+            if stop_ids:
+                kwargs["stop_token_ids"] = [int(x) for x in stop_ids.replace(",", " ").split() if x]
+            else:
+                kwargs["stop_token_ids"] = None
+            sampling_params = SamplingParams(**kwargs)
+            print(f"using sampling_params: {sampling_params}", flush=True)
+            return sampling_params
+
         return SamplingParams(
             temperature=0.0,
             max_tokens=self.max_new_tokens,
@@ -1086,7 +1111,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             f"[Qwen2VLChatReplay] template_on_last_replay_text={self.template_on_last_replay_text}",
             flush=True,
         )
-        self.safe_fallback_enabled = os.environ.get("REPLAY_SAFE_FALLBACK", "1").strip().lower() in {
+        self.safe_fallback_enabled = os.environ.get("REPLAY_SAFE_FALLBACK", "0").strip().lower() in {
             "1",
             "true",
             "yes",

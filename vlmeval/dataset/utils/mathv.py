@@ -13,8 +13,7 @@ from math_verify import parse, verify, LatexExtractionConfig
 FAIL_MSG = 'Failed to obtain answer via API.'
 
 
-@timeout_decorator.timeout(30, use_signals=False)
-def is_equal(asw: str, gt_asw: str) -> bool:
+def _is_equal_impl(asw: str, gt_asw: str) -> bool:
     if not isinstance(asw, str) != str or not isinstance(gt_asw, str):
         print('Warning: input is not string')
         print(asw, gt_asw)
@@ -43,6 +42,23 @@ def is_equal(asw: str, gt_asw: str) -> bool:
     except Exception:
         return False
     return False
+
+
+@timeout_decorator.timeout(30, use_signals=False)
+def _is_equal_with_timeout(asw: str, gt_asw: str) -> bool:
+    return _is_equal_impl(asw, gt_asw)
+
+
+def is_equal(asw: str, gt_asw: str) -> bool:
+    # The process-based timeout backend cannot be used inside multiprocessing
+    # daemon workers, which MathVision uses for API answer extraction.
+    try:
+        import multiprocessing
+        if multiprocessing.current_process().daemon:
+            return _is_equal_impl(asw, gt_asw)
+    except Exception:
+        pass
+    return _is_equal_with_timeout(asw, gt_asw)
 
 
 def get_gpt4_ICE():
@@ -92,13 +108,13 @@ Please read the following example.
 Then extract the answer from the model response and type it at the end of the prompt.\n
 """
     question = line['question']
-    prediction = tail_tokens_for_judge(line['prediction'], max_tokens=512)
+    prediction = tail_tokens_for_judge(line['prediction'], max_tokens=96)
     prompt = task_description
     examples = get_gpt4_ICE()
     for example in examples:
         prompt += example + '\n'
     prompt += question + '\n'
-    prompt += 'Model response tail (last 512 tokens): ' + prediction
+    prompt += 'Model response tail (last 96 tokens): ' + prediction
     prompt += 'Extracted answer:'
     return prompt
 
