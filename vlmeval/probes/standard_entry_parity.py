@@ -125,9 +125,9 @@ ACTIVE_MODEL_KEYS = [
     "minicpm_v_45", "minicpm_o_45", "gemma3_4b", "gemma3_12b", "gemma3_27b",
 ]
 API_MODEL_KEYS = [
-    "gpt-4o-mini", "gpt-5-mini", "gpt-5-2025-08-07", "gpt-5-chat",
-    "claude-haiku-4-5-20251001", "gemini-2.5-flash-lite", "gemini-2.5-flash-nothinking",
-    "gemini-2.5-flash-thinking", "gemini-3-flash-preview-nothinking", "gemini-3.1-flash-lite",
+    "gpt4o_mini", "gpt_4o_mini", "gpt_5_mini", "gpt_5_2025_08_07", "gpt_5_chat",
+    "claude_haiku_4_5_20251001", "gemini_25_flash_lite", "gemini_25_flash_nothinking",
+    "gemini_25_flash_thinking", "gemini_3_flash_preview_nothinking", "gemini_31_flash_lite",
 ]
 
 
@@ -663,6 +663,9 @@ def context_checks(model_key: str, dataset: str, env: dict[str, str], model_spec
         "dynamath_prompt_schema": None,
         "logicvista_qwen_v0_policy": None,
         "non_qwen_no_logicvista_v0_override": None,
+        "api_profile_ok": None,
+        "api_minimal_config_ok": None,
+        "api_no_open_source_minimal_config": None,
         "standard_route_backend": "api" if family == "api" else "vllm",
         "logits_probe_backend": None,
     }
@@ -673,6 +676,17 @@ def context_checks(model_key: str, dataset: str, env: dict[str, str], model_spec
         checks["logicvista_qwen_v0_policy"] = env.get("VLLM_USE_V1") == "0" and all(env.get(k) == v for k, v in LOGICVISTA_QWEN_SAMPLING.items())
     if dataset == "LogicVista" and family in {"minicpm45", "gemma3"}:
         checks["non_qwen_no_logicvista_v0_override"] = env.get("VLLM_USE_V1", "1") != "0"
+    if family == "api":
+        checks["api_profile_ok"] = model_spec.env_profile == "api_replay"
+        checks["api_minimal_config_ok"] = env.get("VLMEVAL_USE_API_REPLAY_MINIMAL_CONFIG") == "1"
+        checks["api_no_open_source_minimal_config"] = not any(
+            env.get(key)
+            for key in (
+                "VLMEVAL_USE_QWEN_MINIMAL_CONFIG",
+                "VLMEVAL_USE_MINICPM45_MINIMAL_CONFIG",
+                "VLMEVAL_USE_GEMMA3_MINIMAL_CONFIG",
+            )
+        )
     return checks
 
 

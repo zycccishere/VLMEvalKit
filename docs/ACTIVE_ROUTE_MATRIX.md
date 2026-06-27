@@ -79,12 +79,13 @@ Qwen2.5-VL LogicVista policy is special: `LOGICVISTA_QWEN25VL_FORCE_V0=1` by def
 | `matrix_minicpm_default_infer_only_fresh_20260317.yaml` | MiniCPM-V/O 4.5 | AI2D, MathVista Mini, OCRBench, SEEDBench2_Plus, LogicVista, VisualPuzzles, DynaMath, MathVision, plus historical VisuLogic slice | MiniCPM infer-only provenance route; VisuLogic is historical/provenance-only for this branch. |
 | `matrix_minicpm_logicvista_all_replay_eval_20260419.yaml` | MiniCPM-V/O 4.5 | LogicVista | MiniCPM LogicVista eval/realign route. |
 | `matrix_minicpm_visualpuzzles_all_replay_eval_realign_20260420.yaml` | MiniCPM-V/O 4.5 | VisualPuzzles | MiniCPM VisualPuzzles eval/realign route. |
+| `matrix_api_replay.yaml` | GPT/OpenAI-compatible, Claude, Gemini aliases in `scripts/configs/models.yaml` | Active table datasets including MathVista Mini | Closed-source API replay route; use explicit model filters for cost control. |
 | `matrix_final_table_legacy_backfill_20260512.yaml` | Qwen2.5-VL 3B/72B | AI2D, OCRBench, SEEDBench2_Plus | Release backfill for remaining legacy standard-run cells. |
 | `matrix_legacy_dynamath_infer_only_all_replay.yaml` | Qwen2.5-VL 3B/7B/32B/72B, MiniCPM-V/O 4.5 | DynaMath | Legacy DynaMath infer-only provenance through `scripts/run_benchmark_task_balanced.py`. |
 
 ## Closed-Source API Routes
 
-Closed-source active routes are registered through `vlmeval/config_api_replay_minimal.py` and the standard replay API wrappers:
+Closed-source active routes are exposed through the `api_replay` profile in `scripts/configs/models.yaml`, the explicit `scripts/configs/matrix_api_replay.yaml` matrix, `vlmeval/config_api_replay_minimal.py`, and the standard replay API wrappers:
 
 | Alias family | Wrapper | Temperature | Max tokens | Notes |
 | --- | --- | ---: | ---: | --- |

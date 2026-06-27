@@ -13,6 +13,23 @@ env_profiles:
       VLMEVAL_API_MINIMAL_IMPORT: '1'
       VLMEVAL_VLM_MINIMAL_IMPORT: '1'
       VLMEVAL_LAZY_INIT: '1'
+  api_replay:
+    python: '{conda_root}/envs/vlmevalkit/bin/python'
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_USE_API_REPLAY_MINIMAL_CONFIG: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      VLMEVAL_API_MAX_TOKENS: '2048'
+      VLMEVAL_API_TIMEOUT: '60'
   minicpm45_vllm:
     python: '{conda_root}/envs/vlmeval_minicpm45_vllm/bin/python'
     pythonpath:
@@ -249,3 +266,135 @@ models:
     task_env:
       MODEL_PATH_GEMMA3_27B: '{model_root}/gemma-3-27b-it'
       GEMMA3_MAX_NEW_TOKENS: '4096'
+  gpt4o_mini:
+    display_name: GPT-4o-mini
+    registry_name: GPT4o_MINI
+    env_profile: api_replay
+    model_path: api://GPT4o_MINI
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gpt_4o_mini:
+    display_name: gpt-4o-mini
+    registry_name: gpt-4o-mini
+    env_profile: api_replay
+    model_path: api://gpt-4o-mini
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gpt_5_mini:
+    display_name: gpt-5-mini
+    registry_name: gpt-5-mini
+    env_profile: api_replay
+    model_path: api://gpt-5-mini
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gpt_5_2025_08_07:
+    display_name: gpt-5-2025-08-07
+    registry_name: gpt-5-2025-08-07
+    env_profile: api_replay
+    model_path: api://gpt-5-2025-08-07
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gpt_5_chat:
+    display_name: gpt-5-chat
+    registry_name: gpt-5-chat
+    env_profile: api_replay
+    model_path: api://gpt-5-chat
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  claude_haiku_4_5_20251001:
+    display_name: claude-haiku-4-5-20251001
+    registry_name: claude-haiku-4-5-20251001
+    env_profile: api_replay
+    model_path: api://claude-haiku-4-5-20251001
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gemini_25_flash_lite:
+    display_name: gemini-2.5-flash-lite
+    registry_name: gemini-2.5-flash-lite
+    env_profile: api_replay
+    model_path: api://gemini-2.5-flash-lite
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gemini_25_flash_nothinking:
+    display_name: gemini-2.5-flash-nothinking
+    registry_name: gemini-2.5-flash-nothinking
+    env_profile: api_replay
+    model_path: api://gemini-2.5-flash-nothinking
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gemini_25_flash_thinking:
+    display_name: gemini-2.5-flash-thinking
+    registry_name: gemini-2.5-flash-thinking
+    env_profile: api_replay
+    model_path: api://gemini-2.5-flash-thinking
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gemini_3_flash_preview_nothinking:
+    display_name: gemini-3-flash-preview-nothinking
+    registry_name: gemini-3-flash-preview-nothinking
+    env_profile: api_replay
+    model_path: api://gemini-3-flash-preview-nothinking
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
+  gemini_31_flash_lite:
+    display_name: gemini-3.1-flash-lite
+    registry_name: gemini-3.1-flash-lite
+    env_profile: api_replay
+    model_path: api://gemini-3.1-flash-lite
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: null
+      estimated_dataset_cost: 0.1
