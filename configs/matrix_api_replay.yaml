@@ -28,7 +28,6 @@ replay_modes:
   - image_text_image
   - image_text_image_text
 models:
-  - gpt4o_mini
   - gpt_4o_mini
   - gpt_5_mini
   - gpt_5_2025_08_07

@@ -125,7 +125,7 @@ ACTIVE_MODEL_KEYS = [
     "minicpm_v_45", "minicpm_o_45", "gemma3_4b", "gemma3_12b", "gemma3_27b",
 ]
 API_MODEL_KEYS = [
-    "gpt4o_mini", "gpt_4o_mini", "gpt_5_mini", "gpt_5_2025_08_07", "gpt_5_chat",
+    "gpt_4o_mini", "gpt_5_mini", "gpt_5_2025_08_07", "gpt_5_chat",
     "claude_haiku_4_5_20251001", "gemini_25_flash_lite", "gemini_25_flash_nothinking",
     "gemini_25_flash_thinking", "gemini_3_flash_preview_nothinking", "gemini_31_flash_lite",
 ]

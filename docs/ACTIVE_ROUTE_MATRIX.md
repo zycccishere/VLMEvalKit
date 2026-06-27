@@ -85,7 +85,7 @@ Qwen2.5-VL LogicVista policy is special: `LOGICVISTA_QWEN25VL_FORCE_V0=1` by def
 
 ## Closed-Source API Routes
 
-Closed-source active routes are exposed through the `api_replay` profile in `configs/models.yaml`, the explicit `configs/matrix_api_replay.yaml` matrix, `vlmeval/config_api_replay_minimal.py`, and the standard replay API wrappers:
+Closed-source active routes are exposed through the `api_replay` profile in `configs/models.yaml`, the explicit `configs/matrix_api_replay.yaml` matrix, `vlmeval/config_api_replay_minimal.py`, and the standard replay API wrappers. Historical non-replay aliases such as `GPT4o_MINI` are intentionally not active in this release route; every active API alias must instantiate a replay-capable wrapper.
 
 | Alias family | Wrapper | Temperature | Max tokens | Notes |
 | --- | --- | ---: | ---: | --- |
@@ -111,7 +111,7 @@ Runtime validation was rerun after the strict `scripts/` entrypoint cleanup. The
 
 - Static route gate: `runs/final_strict_scripts_step7_context_20260627` covers 9 open-source models x 2 datasets (`DynaMath`, `LogicVista`) x 6 replay modes, all 108 checks passing. Qwen2.5-VL is the only DynaMath `legacy_two_keys` family and the only LogicVista vLLM v0 family; MiniCPM and Gemma3 use vLLM without the LogicVista v0 override.
 - Payload gate: `runs/final_strict_scripts_step7_payload_20260627` covers the same 108 open-source routes with real dataset rows and model-wrapper prompt/payload serialization, all checks passing.
-- API no-network gate: `runs/final_strict_scripts_api_context_20260627` covers all 11 tracked API aliases through the `api_replay` profile, all checks passing.
+- API no-network gate: `runs/api_alias_cleanup_20260627` covers the cleanup surface. Context checks pass for 10 replay-capable API aliases x 12 active datasets x 6 replay modes x 2 policies; payload smoke passes for all 10 aliases on DynaMath `IIQ` and `IQIQ` under default/direct policy, and every active alias instantiates `GPT4VReplay`. The old `gpt4o_mini` / `GPT4o_MINI` alias was removed because it bound to the non-replay `GPT4V` wrapper.
 - Direct DynaMath gate: `runs/final_head4c3_step7_payload_direct_dynamath_20260627` covers 9 open-source models x 6 replay modes under the `directly_answer` policy, all 54 checks passing.
 - Main-tree parity gate: `runs/final_head4c3_vs_main_payload_compare_20260627.json` compares the release payload gate with `/user/zyc1781/vlmevalkit`, all 108 rows passing.
 - Step 8 speed profiling is recorded in `docs/STEP8_SPEED_BATCHSIZE.md` and `configs/model_speed_profiles_step8.yaml`; raw logs remain under ignored `runs/step8_speed_20260627`.

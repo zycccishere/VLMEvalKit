@@ -4,7 +4,7 @@ from functools import partial
 os.environ.setdefault("VLMEVAL_API_MINIMAL_IMPORT", "1")
 os.environ.setdefault("VLMEVAL_VLM_MINIMAL_IMPORT", "1")
 
-from vlmeval.api import GPT4V, GPT4VReplay
+from vlmeval.api import GPT4VReplay
 
 API_MAX_TOKENS = int(os.environ.get("VLMEVAL_API_MAX_TOKENS", "2048"))
 API_TIMEOUT = int(os.environ.get("VLMEVAL_API_TIMEOUT", "60"))
@@ -12,16 +12,6 @@ API_IMG_SIZE = int(os.environ.get("VLMEVAL_API_IMG_SIZE", "-1"))
 
 
 supported_VLM = {
-    "GPT4o_MINI": partial(
-        GPT4V,
-        model="gpt-4o-mini-2024-07-18",
-        temperature=0,
-        max_tokens=API_MAX_TOKENS,
-        timeout=API_TIMEOUT,
-        img_size=API_IMG_SIZE,
-        img_detail="high",
-        retry=10,
-    ),
     "gpt-4o-mini": partial(
         GPT4VReplay,
         model="gpt-4o-mini",

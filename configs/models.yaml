@@ -266,18 +266,6 @@ models:
     task_env:
       MODEL_PATH_GEMMA3_27B: '{model_root}/gemma-3-27b-it'
       GEMMA3_MAX_NEW_TOKENS: '4096'
-  gpt4o_mini:
-    display_name: GPT-4o-mini
-    registry_name: GPT4o_MINI
-    env_profile: api_replay
-    model_path: api://GPT4o_MINI
-    runtime:
-      gpus_per_job: 1
-      infer_batch_size: 1
-      max_num_seqs: 1
-      tp_size: 1
-      max_model_len: null
-      estimated_dataset_cost: 0.1
   gpt_4o_mini:
     display_name: gpt-4o-mini
     registry_name: gpt-4o-mini
