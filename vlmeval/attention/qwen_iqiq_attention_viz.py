@@ -5,7 +5,6 @@ import argparse
 import csv
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -14,11 +13,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(THIS_DIR)
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
 
 os.environ.setdefault("VLMEVAL_VLM_MINIMAL_IMPORT", "1")
 os.environ.setdefault("VLMEVAL_USE_QWEN_MINIMAL_CONFIG", "1")
