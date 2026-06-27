@@ -23,7 +23,7 @@ if REPO_ROOT not in sys.path:
 os.environ.setdefault("VLMEVAL_VLM_MINIMAL_IMPORT", "1")
 os.environ.setdefault("VLMEVAL_USE_QWEN_MINIMAL_CONFIG", "1")
 
-from qwen25vl_image2_probe import (  # noqa: E402
+from vlmeval.attention.qwen_inputs import (  # noqa: E402
     build_base_content,
     build_inputs,
     build_replayed_content,
