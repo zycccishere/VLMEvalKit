@@ -107,4 +107,11 @@ API usage logs are injected by `scripts/run_benchmark.py` unless `VLMEVAL_API_US
 
 ## Current Runtime Gate
 
-Static Step 6 and Step 7 standard-entry parity have been run for the active source routes. The current runtime evidence covers Qwen2.5-VL, MiniCPM-V/O 4.5, and Gemma3 families on DynaMath and LogicVista replay settings, with Qwen2.5-VL as the only DynaMath legacy-prompt family and the only LogicVista vLLM v0 family. Step 8 speed profiling is recorded separately once the 512-row batch search completes.
+Runtime validation was rerun on the release code at `4c3b2213`; later docs-only commits record that evidence without changing the runtime path:
+
+- Static route gate: `runs/final_head4c3_step7_context_20260627` covers 9 open-source models x 2 datasets (`DynaMath`, `LogicVista`) x 6 replay modes, all 108 checks passing. Qwen2.5-VL is the only DynaMath `legacy_two_keys` family and the only LogicVista vLLM v0 family; MiniCPM and Gemma3 use vLLM without the LogicVista v0 override.
+- Payload gate: `runs/final_head4c3_step7_payload_default_20260627` covers the same 108 open-source routes with real dataset rows and model-wrapper prompt/payload serialization, all checks passing.
+- Direct DynaMath gate: `runs/final_head4c3_step7_payload_direct_dynamath_20260627` covers 9 open-source models x 6 replay modes under the `directly_answer` policy, all 54 checks passing.
+- Main-tree parity gate: `runs/final_head4c3_vs_main_payload_compare_20260627.json` compares the release payload gate with `/user/zyc1781/vlmevalkit`, all 108 rows passing.
+- API no-network gate: `runs/final_head4c3_api_context_20260627` covers all 11 tracked API aliases through the `api_replay` profile, all checks passing.
+- Step 8 speed profiling is recorded in `docs/STEP8_SPEED_BATCHSIZE.md` and `scripts/configs/model_speed_profiles_step8.yaml`; raw logs remain under ignored `runs/step8_speed_20260627`.
