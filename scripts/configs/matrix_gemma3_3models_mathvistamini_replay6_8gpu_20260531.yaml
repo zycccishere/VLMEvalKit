@@ -1,14 +1,10 @@
-name: qwen25vl_all4_reasoning_perception4_new_entry_20260421
+name: gemma3_3models_mathvistamini_replay6_8gpu_20260531
 repo_root: "{repo_root}"
-results_root: runs/qwen25vl_all4_reasoning_perception4_new_entry_20260421
+results_root: runs/gemma3_3models_mathvistamini_replay6_8gpu_20260531
 node_gpu_ids: "0,1,2,3,4,5,6,7"
+scheduler: gpu_pool
 datasets:
-  # Reasoning benchmarks.
-  - MMMU_DEV_VAL_SINGLE_IMAGE
-  - WeMath
-  # Perception benchmarks.
-  - MMBench_DEV_EN_V11
-  - MMStar
+  - MathVista_MINI
 policies:
   default:
     replay_prompt_template_name: identity
@@ -22,10 +18,9 @@ replay_modes:
 image_transforms:
   - baseline
 models:
-  - qwen25vl_72b
-  - qwen25vl_32b
-  - qwen25vl_7b
-  - qwen25vl_3b
+  - gemma3_27b
+  - gemma3_12b
+  - gemma3_4b
 replay:
   replay_times: 1
   template_on_last_replay_text: 1
@@ -33,6 +28,7 @@ replay:
   limit_mm_per_prompt: 2
   safe_fallback: 0
   safe_truncate_chars: 6000
+  strict_batch: 1
   stage_debug: 1
   stage_debug_samples: 1
   prompt_audit: 1
@@ -52,8 +48,6 @@ evaluation:
   launch_mode: fg
   nproc: 8
   judge: gpt-4o-mini
-  # Fallback only. scripts/run_benchmark.sh sources repo .env first on the target machine.
-  openai_api_base: https://api.openai.com/v1
 worker_monitor:
   enable: true
   interval_seconds: 600

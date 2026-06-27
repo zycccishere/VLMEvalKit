@@ -5,7 +5,7 @@ node_gpu_ids: "0,1,2,3"
 datasets:
   - VisualPuzzles
 dataset_index_allowlists:
-  VisualPuzzles: "{repo_root}/scripts/configs/index_allowlists/gemma4_reasoning_smoke_visualpuzzles_20260418.txt"
+  VisualPuzzles: "{repo_root}/scripts/configs/index_allowlists/reasoning_smoke_visualpuzzles_20260418.txt"
 policies:
   default:
     replay_prompt_template_name: identity
@@ -19,7 +19,7 @@ replay:
   template_on_last_replay_text: 1
   image_copy_mode: reuse_path
   limit_mm_per_prompt: 2
-  safe_fallback: 1
+  safe_fallback: 0
   safe_truncate_chars: 6000
   stage_debug: 1
   stage_debug_samples: 2

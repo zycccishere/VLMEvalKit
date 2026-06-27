@@ -1,17 +1,19 @@
-name: replay6_full
+name: replay6_active_example
 repo_root: "{repo_root}"
-results_root: runs/by_setting
+results_root: runs/by_setting_active_example
 node_gpu_ids: "0,1,2,3,4,5,6,7"
 datasets:
-  - AI2D_TEST
-  - MathVista_MINI
-  - OCRBench
-  - SEEDBench2_Plus
-  - VisuLogic
-  - LogicVista
-  - VisualPuzzles
   - DynaMath
   - MathVision
+  - LogicVista
+  - VisualPuzzles
+  - MMMU_DEV_VAL_SINGLE_IMAGE
+  - WeMath
+  - AI2D_TEST
+  - OCRBench
+  - SEEDBench2_Plus
+  - MMBench_DEV_EN_V11
+  - MMStar
 policies:
   direct:
     replay_prompt_template_name: directly_answer
@@ -21,24 +23,25 @@ replay_modes:
   - image_text
   - text_image
   - image_text_text
+  - image_image_text
   - image_text_image
   - image_text_image_text
-  - image_image_text
 models:
-  - qwen2vl_7b
+  - qwen25vl_3b
   - qwen25vl_7b
-  - qwen35_35b_a3b
-  - qwen35_27b
-  - qwen35_9b
-  - qwen35_4b
+  - qwen25vl_32b
+  - qwen25vl_72b
   - minicpm_v_45
   - minicpm_o_45
+  - gemma3_4b
+  - gemma3_12b
+  - gemma3_27b
 replay:
   replay_times: 1
   template_on_last_replay_text: 1
   image_copy_mode: reuse_path
   limit_mm_per_prompt: 2
-  safe_fallback: 1
+  safe_fallback: 0
   safe_truncate_chars: 6000
   stage_debug: 1
   stage_debug_samples: 8

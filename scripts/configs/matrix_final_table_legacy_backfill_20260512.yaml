@@ -27,7 +27,7 @@ replay:
   template_on_last_replay_text: 1
   image_copy_mode: reuse_path
   limit_mm_per_prompt: 2
-  safe_fallback: 1
+  safe_fallback: 0
   safe_truncate_chars: 6000
   stage_debug: 1
   stage_debug_samples: 1

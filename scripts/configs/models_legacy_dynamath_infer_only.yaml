@@ -11,7 +11,7 @@ env_profiles:
       OLD_VERSION: "False"
       PYTHONNOUSERSITE: "1"
   minicpm45_vllm:
-    python: "{conda_root}/envs/vlmeval_qwen35_vllm/bin/python"
+    python: "{conda_root}/envs/vlmeval_minicpm45_vllm/bin/python"
     pythonpath:
       - "{repo_root}"
     ensure_modules:
