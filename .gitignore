@@ -166,6 +166,10 @@ cache_dir/*
 
 # Ignore data and ckpts
 *.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
 data
 
 # Evaluation Outputs

@@ -1,7 +1,10 @@
 import json
+import gc
 import os
+import shutil
 import subprocess
 from functools import partial
+import inspect
 
 
 # GET the number of GPUs on the node without importing libs like torch
@@ -99,6 +102,37 @@ def build_dataset_from_config(cfg, dataset_name):
         raise ValueError(f'Class {cls_name} is not supported in `vlmeval.dataset`')
 
 
+def link_prediction_files(pred_root, pred_root_meta, model_name, dataset_name):
+    """Expose timestamped release outputs at the legacy model root."""
+    files = os.listdir(pred_root)
+    files = [x for x in files if (f'{model_name}_{dataset_name}' in x or "status.json" in x)]
+    for f in files:
+        cwd = os.getcwd()
+        file_addr = osp.join(cwd, pred_root, f)
+        link_addr = osp.join(cwd, pred_root_meta, f)
+        if osp.exists(link_addr) or osp.islink(link_addr):
+            os.remove(link_addr)
+        os.symlink(file_addr, link_addr)
+
+
+def copy_prediction_file(src_file, out_dir, result_file_base):
+    """Copy an immutable prediction file to an explicit artifact directory."""
+    if not src_file:
+        raise ValueError('src_file is required')
+    if not osp.exists(src_file):
+        raise FileNotFoundError(f'Prediction file not found: {src_file}')
+    os.makedirs(out_dir, exist_ok=True)
+    dst_file = osp.join(out_dir, result_file_base)
+    if osp.abspath(src_file) != osp.abspath(dst_file):
+        shutil.copy2(src_file, dst_file)
+    return dst_file
+
+
+def call_with_supported_kwargs(func, **kwargs):
+    sig = inspect.signature(func)
+    return func(**{k: v for k, v in kwargs.items() if k in sig.parameters})
+
+
 def parse_args():
     help_msg = """\
 You can launch the evaluation by setting either --data and --model or --config.
@@ -183,6 +217,7 @@ You can launch the evaluation by setting either --data and --model or --config.
     parser.add_argument('--mode', type=str, default='all', choices=['all', 'infer', 'eval'])
     # API Kwargs, Apply to API VLMs and Judge API LLMs
     parser.add_argument('--api-nproc', type=int, default=4, help='Parallel API calling')
+    parser.add_argument('--batch-size', type=int, default=4, help='Batch size for local VLM inference')
     parser.add_argument('--retry', type=int, default=None, help='retry numbers for API VLMs')
     parser.add_argument('--judge-args', type=str, default=None, help='Judge arguments in JSON format')
     # Explicitly Set the Judge Model
@@ -197,6 +232,25 @@ You can launch the evaluation by setting either --data and --model or --config.
     # Reuse-aux: if set, when reuse is True, will also reuse the auxiliary evaluation files
     parser.add_argument('--reuse-aux', type=int, default=True, help='reuse auxiliary evaluation files')
     parser.add_argument(
+        '--pred-file',
+        type=str,
+        default=None,
+        help='Explicit prediction file for --mode eval. Bypasses timestamp/reuse prediction discovery.')
+    parser.add_argument(
+        '--pred-output-dir',
+        type=str,
+        default=None,
+        help='If set, copy infer prediction to this deterministic directory after generation.')
+    parser.add_argument(
+        '--eval-dir',
+        type=str,
+        default=None,
+        help='If set with --pred-file, copy the prediction into this directory and write eval artifacts there.')
+    parser.add_argument(
+        '--no-link-predictions',
+        action='store_true',
+        help='Do not expose timestamped predictions through legacy symlinks at the model root.')
+    parser.add_argument(
         '--use-vllm', action='store_true', help='use vllm to generate, the flag is only supported in Llama4 for now')
     parser.add_argument('--use-verifier', action='store_true', help='use verifier to evaluate')
 
@@ -204,9 +258,105 @@ You can launch the evaluation by setting either --data and --model or --config.
     return args
 
 
+def _env_truthy(name: str, default: str = "1") -> bool:
+    value = os.environ.get(name, default)
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_qwen25vl_model(model_name: str) -> bool:
+    pieces = [
+        model_name,
+        os.environ.get("MODEL_PATH", ""),
+        os.environ.get("MODEL_PATH_QWEN25", ""),
+        os.environ.get("MODEL_PATH_QWEN25_3B", ""),
+        os.environ.get("MODEL_PATH_QWEN25_32B", ""),
+        os.environ.get("MODEL_PATH_QWEN25_72B", ""),
+    ]
+    text = " ".join(str(x) for x in pieces).lower()
+    return (
+        "qwen2.5-vl" in text
+        or "qwen25vl" in text
+        or model_name == "Qwen2VLChatReplay"
+    )
+
+
+QWEN25VL_LOGICVISTA_SAMPLING_KEYS = [
+    "QWEN2VL_VLLM_REPETITION_PENALTY",
+    "QWEN2VL_VLLM_TEMPERATURE",
+    "QWEN2VL_VLLM_TOP_P",
+    "QWEN2VL_VLLM_TOP_K",
+    "QWEN2VL_VLLM_MAX_TOKENS",
+    "QWEN2VL_VLLM_STOP_TOKEN_IDS",
+]
+
+
+def _drop_model_reference():
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def apply_dataset_runtime_policy(args, model_name: str, dataset_name: str):
+    """Central place for dataset-specific replay runtime compatibility."""
+    is_qwen25vl = _is_qwen25vl_model(model_name)
+    if dataset_name == "DynaMath":
+        os.environ["DYNAMATH_PROMPT_SCHEMA"] = "legacy_two_keys" if is_qwen25vl else "short_answer_only"
+    else:
+        os.environ.pop("DYNAMATH_PROMPT_SCHEMA", None)
+
+    if (
+        dataset_name == "LogicVista"
+        and is_qwen25vl
+        and _env_truthy("LOGICVISTA_QWEN25VL_FORCE_V0", "1")
+    ):
+        batch_size = int(os.environ.get("LOGICVISTA_QWEN25VL_BATCH_SIZE", "128"))
+        max_num_seqs = int(os.environ.get("LOGICVISTA_QWEN25VL_MAX_NUM_SEQS", str(batch_size)))
+        os.environ["LOGICVISTA_QWEN25VL_FORCE_V0"] = "1"
+        os.environ.setdefault("LOGICVISTA_QWEN25VL_LEGACY_SAMPLING", "1")
+        os.environ["VLLM_USE_V1"] = "0"
+        os.environ["VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
+        os.environ.setdefault("QWEN2VL_VLLM_REPETITION_PENALTY", "1.05")
+        os.environ.setdefault("QWEN2VL_VLLM_TEMPERATURE", "0.01")
+        os.environ.setdefault("QWEN2VL_VLLM_TOP_P", "1.0")
+        os.environ.setdefault("QWEN2VL_VLLM_TOP_K", "0")
+        os.environ.setdefault("QWEN2VL_VLLM_MAX_TOKENS", "2048")
+        os.environ.setdefault("QWEN2VL_VLLM_STOP_TOKEN_IDS", "151645,151643")
+        args.batch_size = batch_size
+        print(
+            "[RUNTIME_POLICY] LogicVista+Qwen2.5-VL -> "
+            f"VLLM_USE_V1=0 batch_size={batch_size} VLLM_MAX_NUM_SEQS={max_num_seqs} "
+            f"QWEN2VL_VLLM_MAX_TOKENS={os.environ.get('QWEN2VL_VLLM_MAX_TOKENS')}",
+            flush=True,
+        )
+        return (
+            "qwen25vl_logicvista_v0",
+            os.environ.get("VLLM_USE_V1", ""),
+            os.environ.get("VLLM_MAX_NUM_SEQS", ""),
+            tuple(os.environ.get(key, "") for key in QWEN25VL_LOGICVISTA_SAMPLING_KEYS),
+        )
+
+    if is_qwen25vl:
+        os.environ.setdefault("VLLM_USE_V1", "1")
+        os.environ.pop("LOGICVISTA_QWEN25VL_LEGACY_SAMPLING", None)
+        for key in QWEN25VL_LOGICVISTA_SAMPLING_KEYS:
+            os.environ.pop(key, None)
+
+    return (
+        "default",
+        os.environ.get("VLLM_USE_V1", ""),
+        os.environ.get("VLLM_MAX_NUM_SEQS", ""),
+        (),
+    )
+
+
 def main():
     logger = get_logger('RUN')
     args = parse_args()
+    had_error = False
     use_config, cfg = False, None
     if args.config is not None:
         assert args.data is None and args.model is None, '--data and --model should not be set when using --config'
@@ -216,8 +366,23 @@ def main():
     else:
         assert len(args.data), '--data should be a list of data files'
 
+    if args.pred_file is not None:
+        if args.mode != 'eval':
+            raise ValueError('--pred-file is only supported with --mode eval')
+        if len(args.model) != 1 or len(args.data) != 1:
+            raise ValueError('--pred-file expects exactly one --model and one --data')
+        args.pred_file = osp.abspath(args.pred_file)
+        if args.eval_dir is not None:
+            args.eval_dir = osp.abspath(args.eval_dir)
+    elif args.eval_dir is not None:
+        raise ValueError('--eval-dir requires --pred-file')
+    if args.pred_output_dir is not None:
+        args.pred_output_dir = osp.abspath(args.pred_output_dir)
+
     if RANK == 0:
-        if not args.reuse:
+        if args.pred_file is not None:
+            logger.warning('--pred-file is set, will bypass timestamp/reuse prediction discovery')
+        elif not args.reuse:
             logger.warning('--reuse is not set, will not reuse previous (before one day) temporary files')
         else:
             logger.warning('--reuse is set, will reuse the latest prediction & temporary pickle files')
@@ -253,6 +418,7 @@ def main():
 
     for _, model_name in enumerate(args.model):
         model = None
+        model_runtime_policy = None
         date, commit_id = timestr('day'), githash(digits=8)
         eval_id = f"T{date}_G{commit_id}"
 
@@ -267,10 +433,15 @@ def main():
         if not osp.exists(pred_root):
             os.makedirs(pred_root, exist_ok=True)
 
-        if use_config:
-            model = build_model_from_config(cfg['model'], model_name, args.use_vllm)
-
         for _, dataset_name in enumerate(args.data):
+            runtime_policy = apply_dataset_runtime_policy(args, model_name, dataset_name)
+            if model is not None and runtime_policy != model_runtime_policy:
+                logger.warning(
+                    f"Runtime policy changed for {model_name} before {dataset_name}; "
+                    "dropping the previous model instance so vLLM engine settings are rebuilt.")
+                model = None
+                model_runtime_policy = None
+                _drop_model_reference()
             if WORLD_SIZE > 1:
                 dist.barrier()
 
@@ -279,6 +450,9 @@ def main():
                 result_file_base = f'{model_name}_{dataset_name}.{pred_format}'
 
                 if use_config:
+                    if model is None:
+                        model = build_model_from_config(cfg['model'], model_name, args.use_vllm)
+                        model_runtime_policy = runtime_policy
                     if WORLD_SIZE > 1:
                         if RANK == 0:
                             dataset = build_dataset_from_config(cfg['data'], dataset_name)
@@ -306,7 +480,7 @@ def main():
                 # Handling Multi-Turn Dataset
                 result_file = osp.join(pred_root, result_file_base)
                 # Reuse the previous prediction file if exists
-                if RANK == 0 and len(prev_pred_roots):
+                if RANK == 0 and len(prev_pred_roots) and args.pred_file is None:
                     prepare_reuse_files(
                         pred_root_meta=pred_root_meta, eval_id=eval_id, model_name=model_name,
                         dataset_name=dataset_name, reuse=args.reuse, reuse_aux=args.reuse_aux
@@ -315,14 +489,28 @@ def main():
                 if WORLD_SIZE > 1:
                     dist.barrier()
 
+                if args.pred_file is not None:
+                    result_file = args.pred_file
+                    if args.eval_dir is not None:
+                        result_file = copy_prediction_file(args.pred_file, args.eval_dir, result_file_base)
+                elif args.mode == 'eval' and RANK == 0 and not osp.exists(result_file):
+                    legacy_result_file = osp.join(pred_root_meta, result_file_base)
+                    if osp.exists(legacy_result_file):
+                        logger.warning(
+                            f'Eval result file missing at {result_file}; '
+                            f'falling back to legacy prediction file {legacy_result_file}.')
+                        result_file = legacy_result_file
+
                 if model is None:
                     model = model_name  # which is only a name
+                    model_runtime_policy = runtime_policy
 
                 if args.mode != "eval":
                     # Perform the Inference
                     if dataset.MODALITY == 'VIDEO':
-                        model = infer_data_job_video(
-                            model,
+                        model = call_with_supported_kwargs(
+                            infer_data_job_video,
+                            model=model,
                             work_dir=pred_root,
                             model_name=model_name,
                             dataset=dataset,
@@ -331,32 +519,38 @@ def main():
                             api_nproc=args.api_nproc,
                             use_vllm=args.use_vllm)
                     elif dataset.TYPE == 'MT':
-                        model = infer_data_job_mt(
-                            model,
+                        model = call_with_supported_kwargs(
+                            infer_data_job_mt,
+                            model=model,
                             work_dir=pred_root,
                             model_name=model_name,
                             dataset=dataset,
                             verbose=args.verbose,
                             api_nproc=args.api_nproc,
                             ignore_failed=args.ignore,
-                            use_vllm=args.use_vllm)
+                            use_vllm=args.use_vllm,
+                        )
                     else:
-                        model = infer_data_job(
-                            model,
+                        model = call_with_supported_kwargs(
+                            infer_data_job,
+                            model=model,
                             work_dir=pred_root,
                             model_name=model_name,
                             dataset=dataset,
                             verbose=args.verbose,
                             api_nproc=args.api_nproc,
                             ignore_failed=args.ignore,
-                            use_vllm=args.use_vllm)
+                            use_vllm=args.use_vllm,
+                            batch_size=args.batch_size)
+                    model_runtime_policy = runtime_policy
+                    if RANK == 0 and args.pred_output_dir is not None:
+                        result_file = copy_prediction_file(result_file, args.pred_output_dir, result_file_base)
 
                 # Set the judge kwargs first before evaluation or dumping
 
                 judge_kwargs = {
                     'nproc': args.api_nproc,
                     'verbose': args.verbose,
-                    'retry': args.retry if args.retry is not None else 3,
                     **(json.loads(args.judge_args) if args.judge_args else {}),
                 }
 
@@ -445,6 +639,8 @@ def main():
 
                     # Skip the evaluation part if only infer
                     if args.mode == 'infer':
+                        if not args.no_link_predictions:
+                            link_prediction_files(pred_root, pred_root_meta, model_name, dataset_name)
                         continue
 
                     # Skip the evaluation part if the dataset evaluation is not supported or annotations are missing
@@ -492,23 +688,19 @@ def main():
                         proxy_set(old_proxy)
 
                     # Create the symbolic links for the prediction files
-                    files = os.listdir(pred_root)
-                    files = [x for x in files if (f'{model_name}_{dataset_name}' in x or "status.json" in x)]
-                    for f in files:
-                        cwd = os.getcwd()
-                        file_addr = osp.join(cwd, pred_root, f)
-                        link_addr = osp.join(cwd, pred_root_meta, f)
-                        if osp.exists(link_addr) or osp.islink(link_addr):
-                            os.remove(link_addr)
-                        os.symlink(file_addr, link_addr)
+                    if not args.no_link_predictions:
+                        link_prediction_files(pred_root, pred_root_meta, model_name, dataset_name)
 
             except Exception as e:
+                had_error = True
                 logger.exception(f'Model {model_name} x Dataset {dataset_name} combination failed: {e}, '
                                  'skipping this combination.')
                 continue
 
     if WORLD_SIZE > 1:
         dist.destroy_process_group()
+    if had_error:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

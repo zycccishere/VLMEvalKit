@@ -51,6 +51,49 @@ def split_names(raw: str) -> list[str]:
     return [part for part in raw.replace(",", " ").split() if part]
 
 
+def load_repo_env(repo_root: str) -> None:
+    env_path = Path(repo_root) / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise SystemExit(f"{name} is not set. Export {name} or define it in the repo .env before running run_benchmark.py.")
+    return value
+
+
+DATASET_ALIASES = {
+    "MMMU_DEV_VAL_SINGLE": "MMMU_DEV_VAL_SINGLE_IMAGE",
+}
+
+
+def canonical_dataset_name(name: str) -> str:
+    return DATASET_ALIASES.get(str(name), str(name))
+
+
+def canonical_dataset_names(names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        canonical = canonical_dataset_name(name)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append(canonical)
+    return out
+
+
 def load_task_manifest_rows(path: Path) -> list[dict[str, str]]:
     lower = path.name.lower()
     rows: list[dict[str, str]] = []
@@ -96,7 +139,10 @@ def task_matches_manifest(task: "Task", rows: list[dict[str, str]]) -> bool:
     supported = set(aliases.keys())
     for row in rows:
         filtered = {key: value for key, value in row.items() if key in supported}
-        if filtered and all(aliases[key] == value for key, value in filtered.items()):
+        if filtered and all(
+            aliases[key] == (canonical_dataset_name(value) if key == "dataset" else value)
+            for key, value in filtered.items()
+        ):
             return True
     return False
 
@@ -119,9 +165,7 @@ def format_value(value: Any, repo_root: str) -> Any:
             "repo_root": repo_root,
             "model_root": os.environ.get("MODEL_ROOT", "/models"),
             "conda_root": os.environ.get("CONDA_ROOT", os.environ.get("HOME", "") + "/miniconda3"),
-            "lmu_data": os.environ.get("LMUData", str(Path(repo_root) / "LMUData")),
-            "llava_root": os.environ.get("LLAVA_ROOT", str(Path(repo_root).parent / "LLaVA")),
-            "qwen35_pydeps": os.environ.get("QWEN35_PYDEPS", ""),
+            "lmu_data": require_env("LMUData"),
         }
         try:
             return value.format(**mapping)
@@ -242,6 +286,7 @@ class BenchmarkRunner:
         matrix = load_yaml(args.matrix_config)
         models_cfg = load_yaml(args.model_config)
         default_repo_root = str(script_dir.parent)
+        load_repo_env(default_repo_root)
         self.repo_root = str(format_value(matrix.get("repo_root", default_repo_root), default_repo_root))
         self.results_root = self._resolve_results_root(matrix["results_root"])
         self.matrix_name = matrix["name"]
@@ -254,7 +299,10 @@ class BenchmarkRunner:
         self.scheduler = str(args.scheduler or matrix.get("scheduler", "model_sequential")).strip()
         if self.scheduler not in {"model_sequential", "gpu_pool"}:
             raise ValueError(f"Unsupported scheduler: {self.scheduler}")
-        self.dataset_index_allowlists = format_value(matrix.get("dataset_index_allowlists", {}), self.repo_root)
+        raw_allowlists = format_value(matrix.get("dataset_index_allowlists", {}), self.repo_root)
+        self.dataset_index_allowlists = {
+            canonical_dataset_name(str(dataset)): path for dataset, path in raw_allowlists.items()
+        }
         self.explicit_transform_axis = "image_transforms" in matrix
         self.worker_monitor_cfg = matrix.get("worker_monitor", {})
         self.worker_monitor_enabled = truthy(self.worker_monitor_cfg.get("enable", True))
@@ -268,6 +316,8 @@ class BenchmarkRunner:
         self.expected_count_cache: dict[tuple[str, str], int] = {}
         self.env_ready: set[str] = set()
         self.env_ready_lock = threading.Lock()
+        self.failures: list[str] = []
+        self.failure_lock = threading.Lock()
         self.task_manifest_path = args.task_manifest
         self.task_manifest_rows: list[dict[str, str]] = []
         self._load_profiles(models_cfg)
@@ -295,13 +345,13 @@ class BenchmarkRunner:
         policy_filters = split_names(self.args.policies)
         mode_filters = split_names(self.args.modes)
         transform_filters = split_names(self.args.transforms)
-        dataset_filters = split_names(self.args.datasets)
+        dataset_filters = canonical_dataset_names(split_names(self.args.datasets))
         model_filters = split_names(self.args.models)
 
         policy_order = list(matrix["policies"].keys())
         mode_order = list(matrix["replay_modes"])
         transform_order = list(matrix.get("image_transforms", ["baseline"]))
-        dataset_order = list(matrix["datasets"])
+        dataset_order = canonical_dataset_names([str(name) for name in matrix["datasets"]])
         model_order = list(matrix["models"])
 
         self.policy_order = [name for name in policy_order if not policy_filters or name in policy_filters]
@@ -316,7 +366,7 @@ class BenchmarkRunner:
         }
         self.models: dict[str, ModelSpec] = {}
         for key in self.model_order:
-            raw = models_cfg["models"][key]
+            raw = format_value(models_cfg["models"][key], self.repo_root)
             runtime = raw["runtime"]
             self.models[key] = ModelSpec(
                 key=key,
@@ -472,6 +522,11 @@ class BenchmarkRunner:
             return 0
         if self.scheduler == "gpu_pool":
             self.run_gpu_pool(assigned)
+            if self.failures:
+                print(f"[NODE][FAIL] node_rank={self.args.node_rank} failures={len(self.failures)}", flush=True)
+                for failure in self.failures:
+                    print(f"[NODE][FAILURE] {failure}", flush=True)
+                return 1
             print(f"[NODE][DONE] node_rank={self.args.node_rank}", flush=True)
             return 0
 
@@ -509,6 +564,11 @@ class BenchmarkRunner:
                     )
                 for future in futures:
                     future.result()
+        if self.failures:
+            print(f"[NODE][FAIL] node_rank={self.args.node_rank} failures={len(self.failures)}", flush=True)
+            for failure in self.failures:
+                print(f"[NODE][FAILURE] {failure}", flush=True)
+            return 1
         print(f"[NODE][DONE] node_rank={self.args.node_rank}", flush=True)
         return 0
 
@@ -582,6 +642,7 @@ class BenchmarkRunner:
                     try:
                         future.result()
                     except Exception as exc:
+                        self.record_failure(task, f"{type(exc).__name__}: {exc}")
                         print(f"[GPU_POOL][FAIL] {task.tag}: {type(exc).__name__}: {exc}", flush=True)
                     available_gpus.extend(gpu_ids)
                     available_gpus.sort(key=lambda gpu: gpu_order[gpu])
@@ -701,11 +762,54 @@ class BenchmarkRunner:
         prepend_pythonpath(env, list(profile.pythonpath))
         return env
 
+    def _is_qwen25vl_model(self, model: ModelSpec) -> bool:
+        text = " ".join([model.key, model.display_name, model.registry_name, model.model_path]).lower()
+        return "qwen25vl" in text or "qwen2.5-vl" in text
+
+    def _logicvista_qwen25vl_v0_enabled(self, model: ModelSpec, task: Task) -> bool:
+        value = str(os.environ.get("LOGICVISTA_QWEN25VL_FORCE_V0", "1")).strip().lower()
+        return task.dataset == "LogicVista" and self._is_qwen25vl_model(model) and value not in {"0", "false", "no", "off"}
+
+    def _apply_qwen25vl_sampling_defaults(self, env: dict[str, str], model: ModelSpec, task: Task) -> None:
+        if not self._is_qwen25vl_model(model):
+            return
+        env.setdefault("VLLM_USE_V1", "1")
+        sampling_keys = [
+            "QWEN2VL_VLLM_REPETITION_PENALTY",
+            "QWEN2VL_VLLM_TEMPERATURE",
+            "QWEN2VL_VLLM_TOP_P",
+            "QWEN2VL_VLLM_TOP_K",
+            "QWEN2VL_VLLM_MAX_TOKENS",
+            "QWEN2VL_VLLM_STOP_TOKEN_IDS",
+        ]
+        if not self._logicvista_qwen25vl_v0_enabled(model, task):
+            for key in sampling_keys:
+                env.pop(key, None)
+            return
+        env["LOGICVISTA_QWEN25VL_FORCE_V0"] = "1"
+        env["LOGICVISTA_QWEN25VL_LEGACY_SAMPLING"] = "1"
+        env.setdefault("LOGICVISTA_QWEN25VL_BATCH_SIZE", "128")
+        env.setdefault("LOGICVISTA_QWEN25VL_MAX_NUM_SEQS", "128")
+        env["VLLM_USE_V1"] = "0"
+        env.setdefault("QWEN2VL_VLLM_REPETITION_PENALTY", "1.05")
+        env.setdefault("QWEN2VL_VLLM_TEMPERATURE", "0.01")
+        env.setdefault("QWEN2VL_VLLM_TOP_P", "1.0")
+        env.setdefault("QWEN2VL_VLLM_TOP_K", "0")
+        env.setdefault("QWEN2VL_VLLM_MAX_TOKENS", "2048")
+        env.setdefault("QWEN2VL_VLLM_STOP_TOKEN_IDS", "151645,151643")
+
+    def infer_batch_size_for_task(self, model: ModelSpec, task: Task) -> int:
+        return model.infer_batch_size
+
+    def max_num_seqs_for_task(self, model: ModelSpec, task: Task) -> int:
+        return model.max_num_seqs
+
     def build_env(self, model: ModelSpec, task: Task, gpu_ids: list[str]) -> dict[str, str]:
         profile = self.env_profiles[model.env_profile]
         policy = self.policies[task.policy_key]
         env = self._base_env_for_profile(profile)
         env.update(model.task_env)
+        self._apply_qwen25vl_sampling_defaults(env, model, task)
         judge_api_key = str(
             os.environ.get("OPENAI_API_KEY_JUDGE")
             or os.environ.get("OPENAI_API_KEY")
@@ -722,6 +826,12 @@ class BenchmarkRunner:
         if judge_api_base:
             env["OPENAI_API_BASE"] = judge_api_base
             env["OPENAI_API_BASE_JUDGE"] = judge_api_base
+        if (
+            not env.get("VLMEVAL_API_USAGE_LOG_FILE")
+            and not env.get("TOKEN_USAGE_LOG_FILE")
+            and truthy(env.get("VLMEVAL_API_USAGE_LOG_DEFAULT", "1"))
+        ):
+            env["VLMEVAL_API_USAGE_LOG_FILE"] = str(self.usage_log_path(task, model))
         env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
         env["MODEL_PATH"] = model.model_path
         env["REPLAY_MODE"] = task.mode
@@ -734,12 +844,13 @@ class BenchmarkRunner:
         env["REPLAY_IMAGE_COPY_MODE"] = str(self.replay_cfg.get("image_copy_mode", "reuse_path"))
         env["REPLAY_TEMPLATE_ON_LAST_REPLAY_TEXT"] = str(self.replay_cfg.get("template_on_last_replay_text", 1))
         env["REPLAY_LIMIT_MM_PER_PROMPT"] = str(self.replay_cfg.get("limit_mm_per_prompt", 2))
-        env["REPLAY_SAFE_FALLBACK"] = str(self.replay_cfg.get("safe_fallback", 1))
+        env["REPLAY_SAFE_FALLBACK"] = str(self.replay_cfg.get("safe_fallback", 0))
         env["REPLAY_SAFE_TRUNCATE_CHARS"] = str(self.replay_cfg.get("safe_truncate_chars", 6000))
         env["REPLAY_STAGE_DEBUG"] = str(self.replay_cfg.get("stage_debug", 1))
         env["REPLAY_STAGE_DEBUG_SAMPLES"] = str(self.replay_cfg.get("stage_debug_samples", 8))
         env["REPLAY_PROMPT_AUDIT"] = str(self.replay_cfg.get("prompt_audit", 1))
         env["REPLAY_PROMPT_AUDIT_PRINT"] = str(self.replay_cfg.get("prompt_audit_print", 1))
+        env["VLMEVAL_STRICT_BATCH"] = str(self.replay_cfg.get("strict_batch", 1))
         if "force_common_prompt" in self.replay_cfg:
             env["REPLAY_FORCE_COMMON_PROMPT"] = str(self.replay_cfg.get("force_common_prompt", 0))
         trace_level = str(self.trace_cfg.get("level", "")).strip().lower()
@@ -762,16 +873,21 @@ class BenchmarkRunner:
             blank_asset = Path(self.repo_root) / "scripts" / "assets" / "blank-white-1x1.png"
             env["REPLAY_BLANK_IMAGE_POSITIONS"] = "2"
             env["REPLAY_BLANK_IMAGE_PATH"] = str(blank_asset)
-        env["QWEN35_VLLM_TP_SIZE"] = str(model.tp_size)
-        env["QWEN35_VLLM_MAX_NUM_SEQS"] = str(model.max_num_seqs)
+        max_num_seqs = self.max_num_seqs_for_task(model, task)
         env["MINICPM45_VLLM_TP_SIZE"] = str(model.tp_size)
-        env["MINICPM45_VLLM_MAX_NUM_SEQS"] = str(model.max_num_seqs)
+        env["MINICPM45_VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
         env["GEMMA3_VLLM_TP_SIZE"] = str(model.tp_size)
-        env["GEMMA3_VLLM_MAX_NUM_SEQS"] = str(model.max_num_seqs)
+        env["GEMMA3_VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
         env["VLLM_TP_SIZE"] = str(model.tp_size)
-        env["VLLM_MAX_NUM_SEQS"] = str(model.max_num_seqs)
+        env["VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
+        if self._logicvista_qwen25vl_v0_enabled(model, task):
+            env["VLLM_USE_V1"] = "0"
+            env["VLLM_MAX_NUM_SEQS"] = env.get("LOGICVISTA_QWEN25VL_MAX_NUM_SEQS", "128")
+        if task.dataset == "DynaMath":
+            env["DYNAMATH_PROMPT_SCHEMA"] = "legacy_two_keys" if self._is_qwen25vl_model(model) else "short_answer_only"
+        else:
+            env.pop("DYNAMATH_PROMPT_SCHEMA", None)
         if model.max_model_len is not None:
-            env["QWEN35_VLLM_MAX_MODEL_LEN"] = str(model.max_model_len)
             env["MINICPM45_VLLM_MAX_MODEL_LEN"] = str(model.max_model_len)
             env["GEMMA3_VLLM_MAX_MODEL_LEN"] = str(model.max_model_len)
             env["VLLM_MAX_MODEL_LEN"] = str(model.max_model_len)
@@ -808,7 +924,8 @@ class BenchmarkRunner:
             try:
                 self.run_single_task(model, task, gpu_ids)
             except Exception as exc:
-                print(f"[WORKER][FAIL] {task.tag}: {exc}", flush=True)
+                self.record_failure(task, f"{type(exc).__name__}: {exc}")
+                print(f"[WORKER][FAIL] {task.tag}: {type(exc).__name__}: {exc}", flush=True)
                 with state_lock:
                     state["phase"] = "failed"
             finally:
@@ -825,49 +942,74 @@ class BenchmarkRunner:
         )
 
     def task_root(self, task: Task) -> Path:
+        dataset_key = task.dataset.replace("/", "_")
         if self.explicit_transform_axis:
-            return self.results_root / task.policy_key / task.mode / task.transform / task.model_key
-        return self.results_root / task.policy_key / task.mode / task.model_key
+            return self.results_root / task.policy_key / task.mode / task.transform / task.model_key / dataset_key
+        return self.results_root / task.policy_key / task.mode / task.model_key / dataset_key
 
     def model_output_root(self, task: Task, model: ModelSpec) -> Path:
         return self.task_root(task) / model.registry_name
 
+    def prediction_dir(self, task: Task) -> Path:
+        return self.task_root(task) / "predictions"
+
+    def eval_output_dir(self, task: Task) -> Path:
+        return self.task_root(task) / "eval"
+
+    def prediction_manifest_path(self, task: Task) -> Path:
+        return self.prediction_dir(task) / "manifest.json"
+
+    def eval_manifest_path(self, task: Task) -> Path:
+        return self.eval_output_dir(task) / "manifest.json"
+
     def log_root(self, task: Task) -> Path:
         return self.task_root(task) / "_logs"
+
+    def usage_log_path(self, task: Task, model: ModelSpec) -> Path:
+        return self.log_root(task) / "usage" / f"{model.registry_name}_{task.dataset}.jsonl"
+
+    def record_failure(self, task: Task, reason: str) -> None:
+        message = f"{task.tag}: {reason}"
+        with self.failure_lock:
+            self.failures.append(message)
 
     def worker_log_path(self, model: ModelSpec, worker_idx: int) -> Path:
         return self.results_root / "_logs" / "worker_status" / f"node{self.args.node_rank}_{model.key}_slot{worker_idx}.log"
 
     def infer_file_path(self, task: Task, model: ModelSpec) -> Path | None:
-        model_dir = self.model_output_root(task, model)
-        xlsx = model_dir / f"{model.registry_name}_{task.dataset}.xlsx"
-        tsv = model_dir / f"{model.registry_name}_{task.dataset}.tsv"
-        if xlsx.exists():
-            return xlsx
-        if tsv.exists():
-            return tsv
+        pred_dir = self.prediction_dir(task)
+        for suffix in ("xlsx", "tsv"):
+            candidate = pred_dir / f"{model.registry_name}_{task.dataset}.{suffix}"
+            if candidate.exists():
+                return candidate
         return None
 
     def infer_artifacts(self, task: Task, model: ModelSpec) -> list[Path]:
-        model_dir = self.model_output_root(task, model)
-        return sorted(model_dir.glob(f"{model.registry_name}_{task.dataset}*"))
+        out: list[Path] = []
+        pred_dir = self.prediction_dir(task)
+        if pred_dir.exists():
+            out.append(pred_dir)
+        native_dir = self.model_output_root(task, model)
+        if native_dir.exists():
+            out.append(native_dir)
+        return out
 
     def infer_primary_paths(self, task: Task, model: ModelSpec) -> set[Path]:
-        model_dir = self.model_output_root(task, model)
+        pred_dir = self.prediction_dir(task)
         return {
-            model_dir / f"{model.registry_name}_{task.dataset}.xlsx",
-            model_dir / f"{model.registry_name}_{task.dataset}.tsv",
+            pred_dir / f"{model.registry_name}_{task.dataset}.xlsx",
+            pred_dir / f"{model.registry_name}_{task.dataset}.tsv",
         }
 
     def acc_marker_paths(self, task: Task, model: ModelSpec) -> list[Path]:
-        model_dir = self.model_output_root(task, model)
+        eval_dir = self.eval_output_dir(task)
         paths: list[Path] = []
         for pattern in (
             f"*_{task.dataset}*_acc.csv",
             f"*_{task.dataset}*_score.csv",
             f"*_{task.dataset}*_score.json",
         ):
-            paths.extend(model_dir.glob(pattern))
+            paths.extend(eval_dir.glob(pattern))
         return sorted(set(paths))
 
     def acc_complete(self, task: Task, model: ModelSpec) -> bool:
@@ -880,20 +1022,11 @@ class BenchmarkRunner:
         return False
 
     def eval_artifacts(self, task: Task, model: ModelSpec) -> list[Path]:
-        out: list[Path] = []
-        primary_infer = self.infer_primary_paths(task, model)
-        for path in self.infer_artifacts(task, model):
-            if path in primary_infer:
-                continue
-            if path.name.endswith(("_acc.csv", "_score.csv", "_score.json")):
-                continue
-            if path.name.endswith("_answer_format_report.json") or path.name.endswith("_answer_format_failures.jsonl"):
-                continue
-            out.append(path)
-        return out
+        eval_dir = self.eval_output_dir(task)
+        return [eval_dir] if eval_dir.exists() else []
 
     def cleanup_all_artifacts(self, task: Task, model: ModelSpec) -> None:
-        for path in self.infer_artifacts(task, model):
+        for path in self.infer_artifacts(task, model) + self.eval_artifacts(task, model):
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
             else:
@@ -1030,11 +1163,41 @@ except Exception:
         self.expected_count_cache[cache_key] = count
         return count
 
-    def infer_complete(self, task: Task, model: ModelSpec, expected: int) -> bool:
-        if expected < 0:
-            return False
-        pred_file = self.infer_file_path(task, model)
-        if pred_file is None:
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        ensure_dir(path.parent)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _task_payload(self, task: Task, model: ModelSpec, expected: int) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "matrix": self.matrix_name,
+            "task": {
+                "tag": task.tag,
+                "index": task.index,
+                "model_key": task.model_key,
+                "policy_key": task.policy_key,
+                "mode": task.mode,
+                "transform": task.transform,
+                "dataset": task.dataset,
+            },
+            "model": {
+                "key": model.key,
+                "registry_name": model.registry_name,
+                "model_path": model.model_path,
+            },
+            "expected_rows": expected,
+            "updated_at": self._timestamp(),
+        }
+
+    def prediction_file_valid(self, pred_file: Path | None, expected: int) -> bool:
+        if expected < 0 or pred_file is None or not pred_file.exists():
             return False
         try:
             rows = load_tabular_rows(pred_file)
@@ -1054,37 +1217,48 @@ except Exception:
                 return False
         return True
 
-    def eval_complete(self, task: Task, model: ModelSpec, expected: int) -> bool:
-        if self.acc_complete(task, model):
-            return True
-        eval_files = self.eval_artifacts(task, model)
-        if not eval_files:
+    def write_prediction_manifest(self, task: Task, model: ModelSpec, expected: int, pred_file: Path) -> None:
+        payload = self._task_payload(task, model, expected)
+        payload.update(
+            {
+                "artifact_type": "prediction",
+                "status": "complete",
+                "prediction_file": str(pred_file),
+                "prediction_dir": str(self.prediction_dir(task)),
+            }
+        )
+        self._write_json(self.prediction_manifest_path(task), payload)
+
+    def write_eval_manifest(self, task: Task, model: ModelSpec, expected: int, pred_file: Path, rc: int) -> None:
+        score_files = [str(path) for path in self.acc_marker_paths(task, model) if path.is_file()]
+        payload = self._task_payload(task, model, expected)
+        payload.update(
+            {
+                "artifact_type": "eval",
+                "status": "complete" if rc == 0 and score_files else "failed",
+                "prediction_file": str(pred_file),
+                "eval_dir": str(self.eval_output_dir(task)),
+                "judge": str(self.evaluation_cfg.get("judge", "gpt-4o-mini")),
+                "score_files": score_files,
+                "returncode": rc,
+            }
+        )
+        self._write_json(self.eval_manifest_path(task), payload)
+
+    def infer_complete(self, task: Task, model: ModelSpec, expected: int) -> bool:
+        if expected < 0:
             return False
-        has_sample_pkl = False
-        has_summary = False
-        for path in eval_files:
-            if path.name.endswith("_result.pkl"):
-                has_sample_pkl = True
-                try:
-                    with path.open("rb") as fh:
-                        obj = pickle.load(fh)
-                    if not hasattr(obj, "__len__") or len(obj) != expected:
-                        return False
-                except Exception:
-                    return False
-            elif path.suffix == ".csv":
-                try:
-                    content = path.read_text(encoding="utf-8", errors="ignore").lower()
-                except Exception:
-                    return False
-                if "overall" not in content:
-                    return False
-                has_summary = True
-            elif path.suffix == ".json":
-                if path.stat().st_size <= 0:
-                    return False
-                has_summary = True
-        return has_sample_pkl or has_summary
+        manifest = self._read_json(self.prediction_manifest_path(task))
+        if manifest.get("status") != "complete" or int(manifest.get("expected_rows", -1)) != expected:
+            return False
+        pred_file = self.infer_file_path(task, model)
+        return self.prediction_file_valid(pred_file, expected)
+
+    def eval_complete(self, task: Task, model: ModelSpec, expected: int) -> bool:
+        manifest = self._read_json(self.eval_manifest_path(task))
+        if manifest.get("status") != "complete" or int(manifest.get("expected_rows", -1)) != expected:
+            return False
+        return self.acc_complete(task, model)
 
     def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path) -> int:
         ensure_dir(log_path.parent)
@@ -1163,9 +1337,10 @@ except Exception:
         pred_file = self.infer_file_path(task, model)
         if pred_file is None:
             return
-        model_dir = self.model_output_root(task, model)
-        report = model_dir / f"{model.registry_name}_{task.dataset}_answer_format_report.json"
-        failures = model_dir / f"{model.registry_name}_{task.dataset}_answer_format_failures.jsonl"
+        eval_dir = self.eval_output_dir(task)
+        ensure_dir(eval_dir)
+        report = eval_dir / f"{model.registry_name}_{task.dataset}_answer_format_report.json"
+        failures = eval_dir / f"{model.registry_name}_{task.dataset}_answer_format_failures.jsonl"
         log_path = self.log_root(task) / "answer_format" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         cmd = [
             self.env_profiles[model.env_profile].python,
@@ -1189,9 +1364,11 @@ except Exception:
         if rc != 0:
             print(f"[FAIL][FORMAT] {task.tag}: rc={rc} log={log_path}", flush=True)
 
-    def run_infer(self, task: Task, model: ModelSpec, env: dict[str, str]) -> int:
+    def run_infer(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
         log_path = self.log_root(task) / "infer" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         ensure_dir(self.model_output_root(task, model))
+        ensure_dir(self.prediction_dir(task))
+        batch_size = self.infer_batch_size_for_task(model, task)
         cmd = [
             self.env_profiles[model.env_profile].python,
             "run.py",
@@ -1205,22 +1382,38 @@ except Exception:
             "infer",
             "--verbose",
             "--batch-size",
-            str(model.infer_batch_size),
+            str(batch_size),
+            "--pred-output-dir",
+            str(self.prediction_dir(task)),
+            "--no-link-predictions",
         ]
+        infer_nproc = str(env.get("VLMEVAL_INFER_NPROC", "")).strip()
+        if infer_nproc:
+            cmd.extend(["--api-nproc", infer_nproc])
+        if self.resume_infer:
+            cmd.append("--reuse")
         print(
             f"[START][INFER] {task.tag} model={model.registry_name} path={model.model_path} "
-            f"gpus={env['CUDA_VISIBLE_DEVICES']} batch={model.infer_batch_size}",
+            f"gpus={env['CUDA_VISIBLE_DEVICES']} batch={batch_size}",
             flush=True,
         )
         rc = self.run_subprocess(cmd, env, log_path)
         if rc == 0:
+            pred_file = self.infer_file_path(task, model)
+            if self.prediction_file_valid(pred_file, expected_count):
+                self.write_prediction_manifest(task, model, expected_count, pred_file)
             print(f"[DONE][INFER] {task.tag} log={log_path}", flush=True)
         else:
             print(f"[FAIL][INFER] {task.tag} rc={rc} log={log_path}", flush=True)
         return rc
 
-    def run_eval(self, task: Task, model: ModelSpec, env: dict[str, str]) -> int:
+    def run_eval(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
         log_path = self.log_root(task) / "eval" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
+        pred_file = self.infer_file_path(task, model)
+        if pred_file is None:
+            print(f"[FAIL][EVAL] {task.tag}: missing fixed prediction file", flush=True)
+            return 1
+        ensure_dir(self.eval_output_dir(task))
         cmd = [
             self.env_profiles[model.env_profile].python,
             "run.py",
@@ -1232,7 +1425,12 @@ except Exception:
             str(self.task_root(task)),
             "--mode",
             "eval",
-            "--nproc",
+            "--pred-file",
+            str(pred_file),
+            "--eval-dir",
+            str(self.eval_output_dir(task)),
+            "--no-link-predictions",
+            "--api-nproc",
             str(self.evaluation_cfg.get("nproc", 8)),
             "--verbose",
             "--judge",
@@ -1241,8 +1439,10 @@ except Exception:
         print(f"[START][EVAL] {task.tag}", flush=True)
         rc = self.run_subprocess(cmd, env, log_path)
         if rc == 0:
+            self.write_eval_manifest(task, model, expected_count, pred_file, rc)
             print(f"[DONE][EVAL] {task.tag} log={log_path}", flush=True)
         else:
+            self.write_eval_manifest(task, model, expected_count, pred_file, rc)
             print(f"[FAIL][EVAL] {task.tag} rc={rc} log={log_path}", flush=True)
         return rc
 
@@ -1251,8 +1451,7 @@ except Exception:
         expected_count = self.get_expected_count(model, env, task.dataset)
         print(f"[TASK][START] {task.tag} expected={expected_count}", flush=True)
         if expected_count < 0:
-            print(f"[SKIP][DATASET] {task.tag}: unavailable/build failed", flush=True)
-            return
+            raise RuntimeError(f"dataset unavailable/build failed: {task.dataset}")
 
         infer_was_complete = self.infer_complete(task, model, expected_count)
         if infer_was_complete and self.eval_complete(task, model, expected_count):
@@ -1281,20 +1480,20 @@ except Exception:
                 else:
                     print(f"[CLEAN][INFER+EVAL] {task.tag}: remove stale artifacts", flush=True)
                     self.cleanup_all_artifacts(task, model)
-            if self.run_infer(task, model, env) != 0:
-                return
+            infer_rc = self.run_infer(task, model, env, expected_count)
+            if infer_rc != 0:
+                raise RuntimeError(f"infer failed rc={infer_rc}")
 
         if not self.infer_complete(task, model, expected_count):
-            print(f"[SKIP][EVAL] {task.tag}: infer incomplete", flush=True)
-            return
+            raise RuntimeError("infer incomplete after run")
 
-        self.run_answer_format(task, model, env)
         if self.eval_complete(task, model, expected_count):
             print(f"[SKIP][EVAL] {task.tag}: complete", flush=True)
             return
         if self.eval_artifacts(task, model):
             print(f"[CLEAN][EVAL] {task.tag}: remove stale eval artifacts", flush=True)
             self.cleanup_eval_artifacts(task, model)
+        self.run_answer_format(task, model, env)
 
         launch_mode = str(self.evaluation_cfg.get("launch_mode", "fg")).lower()
         if launch_mode == "skip":
@@ -1302,7 +1501,11 @@ except Exception:
             return
         if launch_mode != "fg":
             raise ValueError(f"Unsupported evaluation launch mode: {launch_mode}")
-        self.run_eval(task, model, env)
+        eval_rc = self.run_eval(task, model, env, expected_count)
+        if eval_rc != 0:
+            raise RuntimeError(f"eval failed rc={eval_rc}")
+        if not self.eval_complete(task, model, expected_count):
+            raise RuntimeError("eval incomplete after run")
 
     @staticmethod
     def _timestamp() -> str:
@@ -1314,7 +1517,7 @@ except Exception:
 def parse_args() -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Unified replay benchmark launcher.")
-    parser.add_argument("--matrix-config", type=Path, default=script_dir / "configs" / "matrix.yaml")
+    parser.add_argument("--matrix-config", type=Path, required=True)
     parser.add_argument("--model-config", type=Path, default=script_dir / "configs" / "models.yaml")
     parser.add_argument("--nodes", type=int, default=detect_num_nodes())
     parser.add_argument("--node-rank", type=int, default=detect_node_rank())
