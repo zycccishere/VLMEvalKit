@@ -914,11 +914,22 @@ def dump_standard_payload(args: argparse.Namespace) -> None:
                     "gemma3_temperature_ok": None,
                 }
                 text_blob = "\n".join(str(x.get("value") or x.get("text") or "") for x in prompt if x.get("type") == "text")
-                if dataset_name == "DynaMath" and family == "qwen25vl":
-                    checks["dynamath_legacy_prompt_ok"] = "solution" in text_blob.lower() and "short answer" in text_blob.lower()
-                if dataset_name == "DynaMath" and family in {"minicpm45", "gemma3"}:
+                if dataset_name == "DynaMath":
                     lowered_prompt = text_blob.lower()
-                    checks["dynamath_non_qwen_short_prompt_ok"] = "solution" not in lowered_prompt and "short answer" not in lowered_prompt
+                    has_solution = "solution" in lowered_prompt
+                    has_short_answer = "short answer" in lowered_prompt
+                    has_direct_answer = env.get("REPLAY_PROMPT_TEMPLATE_NAME") == "directly_answer"
+                    has_two_key_legacy = "two keys" in lowered_prompt and "solution" in lowered_prompt
+                    if family == "qwen25vl":
+                        if args.policy == "default":
+                            checks["dynamath_legacy_prompt_ok"] = has_solution and has_short_answer
+                        else:
+                            checks["dynamath_legacy_prompt_ok"] = (not has_solution) and has_direct_answer
+                    elif family in {"minicpm45", "gemma3"}:
+                        if args.policy == "default":
+                            checks["dynamath_non_qwen_short_prompt_ok"] = (not has_solution) and (not has_two_key_legacy)
+                        else:
+                            checks["dynamath_non_qwen_short_prompt_ok"] = (not has_solution) and has_direct_answer
                 if dataset_name == "LogicVista" and family == "qwen25vl":
                     checks["logicvista_qwen_sampling_ok"] = all(env.get(k) == v for k, v in LOGICVISTA_QWEN_SAMPLING.items())
                 if family == "minicpm45":
