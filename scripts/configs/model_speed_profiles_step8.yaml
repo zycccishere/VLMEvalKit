@@ -1,0 +1,181 @@
+schema_version: 1
+source:
+  run_root: runs/step8_speed_20260627
+  candidate_results: runs/step8_speed_20260627/candidate_results.jsonl
+  dataset: MathVision
+  sample_count: 512
+  sample_manifest_sha256: 3bbec440367bb90ff2bc04664cd6697e93d9b4d7a760da3e64f073352cdf8058
+  mode: image_text_image_text
+  mode_label: IQIQ
+  standard_entry: bash scripts/run_benchmark.sh
+  host: devspace-job-imagereplay-506002-main-0
+  gpu: NVIDIA H100 80GB HBM3
+  gpu_memory_mib: 81559
+  driver_version: 560.35.05
+  torch: 2.10.0+cu128
+  transformers: 4.57.6
+  vllm: 0.17.1
+  batch_cap_reason: 512 real samples; batch sizes above 512 were not tested.
+closed_source_api:
+  batch_speed_search: not_applicable
+models:
+  qwen25vl_3b:
+    family: qwen2.5vl
+    registry_name: Qwen2.5-VL-3B-Instruct-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 1
+    gpus_per_job: 1
+    max_model_len: 32768
+    max_new_tokens: 2048
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 512
+    recommended_samples_per_second: 1.534892
+    recommended_peak_memory_mib: 78290
+    tested_batches:
+    - {batch_size: 512, ok: true, samples_per_second: 1.534892, elapsed_seconds: 333.57, peak_memory_mib: 78290, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/qwen25vl_3b/n512_bs512
+  qwen25vl_7b:
+    family: qwen2.5vl
+    registry_name: Qwen2.5-VL-7B-Instruct-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 1
+    gpus_per_job: 1
+    max_model_len: 32768
+    max_new_tokens: 2048
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 512
+    recommended_samples_per_second: 1.675419
+    recommended_peak_memory_mib: 78290
+    tested_batches:
+    - {batch_size: 512, ok: true, samples_per_second: 1.675419, elapsed_seconds: 305.60, peak_memory_mib: 78290, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/qwen25vl_7b/n512_bs512
+  qwen25vl_32b:
+    family: qwen2.5vl
+    registry_name: Qwen2VLChatReplay
+    backend: vllm_v1
+    tensor_parallel_size: 2
+    gpus_per_job: 2
+    max_model_len: 32768
+    max_new_tokens: 2048
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 256
+    recommended_samples_per_second: 0.898735
+    recommended_peak_memory_mib: 77974
+    tested_batches:
+    - {batch_size: 64, ok: true, samples_per_second: 0.631919, elapsed_seconds: 810.23, peak_memory_mib: 76584, rows: 512}
+    - {batch_size: 128, ok: true, samples_per_second: 0.831889, elapsed_seconds: 615.47, peak_memory_mib: 78328, rows: 512}
+    - {batch_size: 256, ok: true, samples_per_second: 0.898735, elapsed_seconds: 569.69, peak_memory_mib: 77974, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 0.877903, elapsed_seconds: 583.21, peak_memory_mib: 76422, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/qwen25vl_32b/n512_bs256
+  qwen25vl_72b:
+    family: qwen2.5vl
+    registry_name: Qwen2VLChatReplay
+    backend: vllm_v1
+    tensor_parallel_size: 4
+    gpus_per_job: 4
+    max_model_len: 32768
+    max_new_tokens: 2048
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 256
+    recommended_samples_per_second: 0.903592
+    recommended_peak_memory_mib: 79410
+    tested_batches:
+    - {batch_size: 16, ok: true, samples_per_second: 0.419340, elapsed_seconds: 1220.97, peak_memory_mib: 76692, rows: 512}
+    - {batch_size: 32, ok: true, samples_per_second: 0.573586, elapsed_seconds: 892.63, peak_memory_mib: 79124, rows: 512}
+    - {batch_size: 64, ok: true, samples_per_second: 0.647170, elapsed_seconds: 791.14, peak_memory_mib: 76020, rows: 512}
+    - {batch_size: 128, ok: true, samples_per_second: 0.894924, elapsed_seconds: 572.12, peak_memory_mib: 76536, rows: 512}
+    - {batch_size: 256, ok: true, samples_per_second: 0.903592, elapsed_seconds: 566.63, peak_memory_mib: 79410, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 0.826985, elapsed_seconds: 619.12, peak_memory_mib: 78186, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/qwen25vl_72b/n512_bs256
+  minicpm_v_45:
+    family: minicpm_4.5
+    registry_name: MiniCPM-V-4_5-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 1
+    gpus_per_job: 1
+    max_model_len: 32768
+    max_new_tokens: 16384
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 512
+    recommended_samples_per_second: 0.752623
+    recommended_peak_memory_mib: 74232
+    tested_batches:
+    - {batch_size: 256, ok: true, samples_per_second: 0.664264, elapsed_seconds: 770.78, peak_memory_mib: 78288, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 0.752623, elapsed_seconds: 680.29, peak_memory_mib: 74232, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/minicpm_v_45/n512_bs512
+  minicpm_o_45:
+    family: minicpm_4.5
+    registry_name: MiniCPM-o-4_5-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 1
+    gpus_per_job: 1
+    max_model_len: 32768
+    max_new_tokens: 16384
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 256
+    recommended_samples_per_second: 0.912878
+    recommended_peak_memory_mib: 62574
+    tested_batches:
+    - {batch_size: 256, ok: true, samples_per_second: 0.912878, elapsed_seconds: 560.86, peak_memory_mib: 62574, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 0.905041, elapsed_seconds: 565.72, peak_memory_mib: 79082, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/minicpm_o_45/n512_bs256
+  gemma3_4b:
+    family: gemma3
+    registry_name: Gemma3-4B-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 1
+    gpus_per_job: 1
+    max_model_len: 32768
+    max_new_tokens: 4096
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 512
+    recommended_samples_per_second: 1.752788
+    recommended_peak_memory_mib: 75910
+    tested_batches:
+    - {batch_size: 256, ok: true, samples_per_second: 1.719886, elapsed_seconds: 297.69, peak_memory_mib: 75908, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 1.752788, elapsed_seconds: 292.11, peak_memory_mib: 75910, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/gemma3_4b/n512_bs512
+  gemma3_12b:
+    family: gemma3
+    registry_name: Gemma3-12B-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 1
+    gpus_per_job: 1
+    max_model_len: 32768
+    max_new_tokens: 4096
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 512
+    recommended_samples_per_second: 1.165110
+    recommended_peak_memory_mib: 75908
+    tested_batches:
+    - {batch_size: 128, ok: true, samples_per_second: 1.043563, elapsed_seconds: 490.63, peak_memory_mib: 78288, rows: 512}
+    - {batch_size: 256, ok: true, samples_per_second: 1.135280, elapsed_seconds: 450.99, peak_memory_mib: 77950, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 1.165110, elapsed_seconds: 439.44, peak_memory_mib: 75908, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/gemma3_12b/n512_bs512
+  gemma3_27b:
+    family: gemma3
+    registry_name: Gemma3-27B-Replay
+    backend: vllm_v1
+    tensor_parallel_size: 2
+    gpus_per_job: 2
+    max_model_len: 32768
+    max_new_tokens: 4096
+    temperature: 0.0
+    max_safe_batch_size: 512
+    recommended_batch_size: 512
+    recommended_samples_per_second: 1.037543
+    recommended_peak_memory_mib: 75924
+    tested_batches:
+    - {batch_size: 64, ok: true, samples_per_second: 0.604191, elapsed_seconds: 847.41, peak_memory_mib: 74046, rows: 512}
+    - {batch_size: 128, ok: true, samples_per_second: 0.875346, elapsed_seconds: 584.91, peak_memory_mib: 78328, rows: 512}
+    - {batch_size: 256, ok: true, samples_per_second: 0.956727, elapsed_seconds: 535.16, peak_memory_mib: 77974, rows: 512}
+    - {batch_size: 512, ok: true, samples_per_second: 1.037543, elapsed_seconds: 493.47, peak_memory_mib: 75924, rows: 512}
+    raw_root: runs/step8_speed_20260627/search/gemma3_27b/n512_bs512
