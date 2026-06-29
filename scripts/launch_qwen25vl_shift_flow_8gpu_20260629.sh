@@ -23,9 +23,15 @@ gpus = [item for item in sys.argv[3].split(",") if item]
 data = json.loads(manifest_path.read_text(encoding="utf-8"))
 if not isinstance(data, list):
     raise SystemExit(f"manifest must be a JSON list: {manifest_path}")
+manifest_base = manifest_path.resolve().parent
 shards = [[] for _ in gpus]
 for idx, item in enumerate(data):
-    shards[idx % len(gpus)].append(item)
+    copied = dict(item)
+    if copied.get("image"):
+        image_path = Path(str(copied["image"]))
+        if not image_path.is_absolute():
+            copied["image"] = str((manifest_base / image_path).resolve())
+    shards[idx % len(gpus)].append(copied)
 for rank, items in enumerate(shards):
     path = shard_dir / f"shard_{rank}.json"
     path.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

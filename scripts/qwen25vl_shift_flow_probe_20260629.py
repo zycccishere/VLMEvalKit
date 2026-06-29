@@ -99,6 +99,19 @@ def load_manifest(path: str | Path) -> list[dict[str, Any]]:
     return payload
 
 
+def resolve_case_image_path(manifest_path: str | Path, image_ref: str) -> Path:
+    image_path = Path(str(image_ref))
+    if image_path.is_absolute() and image_path.exists():
+        return image_path.resolve()
+    if not image_path.is_absolute():
+        candidate = (Path(manifest_path).resolve().parent / image_path).resolve()
+        if candidate.exists():
+            return candidate
+        if image_path.exists():
+            return image_path.resolve()
+    raise FileNotFoundError(f"Case image not found: {image_ref}")
+
+
 def resolve_dataset_row(dataset, dataset_name: str, sample_index: int) -> pd.Series:
     matches = dataset.data[dataset.data["index"] == sample_index]
     if len(matches) != 1:
@@ -185,6 +198,33 @@ def attach_qwen_pixel_budget(
                 copied["max_pixels"] = int(max_pixels)
         out.append(copied)
     return out
+
+
+def explicit_content_for_case(manifest_path: str | Path, case: dict[str, Any]) -> list[dict[str, Any]]:
+    image_path = resolve_case_image_path(manifest_path, str(case["image"]))
+    question = str(case["question"])
+    return [
+        {"type": "image", "image": str(image_path)},
+        {"type": "text", "text": question},
+    ]
+
+
+def case_dataset_name(case: dict[str, Any]) -> str:
+    if case.get("source_dataset"):
+        return str(case["source_dataset"])
+    source = case.get("source") if isinstance(case.get("source"), dict) else {}
+    return str(source.get("dataset") or "controlled_target_box")
+
+
+def case_sample_index(case: dict[str, Any], fallback: int) -> int | str:
+    for key in ("source_index", "sample_index", "selection_rank"):
+        if key in case:
+            return case[key]
+    source = case.get("source") if isinstance(case.get("source"), dict) else {}
+    for key in ("row_index", "source_index"):
+        if key in source:
+            return source[key]
+    return fallback
 
 
 def target_mass_summary(
@@ -551,16 +591,20 @@ def main() -> int:
     dataset_cache: dict[str, Any] = {}
 
     try:
-        for case in manifest:
-            dataset_name = str(case["source_dataset"])
-            sample_index = int(case["source_index"])
-            dataset = dataset_cache.get(dataset_name)
-            if dataset is None:
-                dataset = build_dataset(dataset_name)
-                dataset_cache[dataset_name] = dataset
-            row = resolve_dataset_row(dataset, dataset_name, sample_index)
+        for case_idx, case in enumerate(manifest):
+            dataset_name = case_dataset_name(case)
+            sample_index = case_sample_index(case, case_idx)
+            if case.get("image") and case.get("question"):
+                base_content_raw = explicit_content_for_case(args.manifest, case)
+            else:
+                dataset = dataset_cache.get(dataset_name)
+                if dataset is None:
+                    dataset = build_dataset(dataset_name)
+                    dataset_cache[dataset_name] = dataset
+                row = resolve_dataset_row(dataset, dataset_name, int(sample_index))
+                base_content_raw = build_base_content(dataset, row)
             base_content = attach_qwen_pixel_budget(
-                build_base_content(dataset, row),
+                base_content_raw,
                 min_pixels=args.qwen_min_pixels,
                 max_pixels=args.qwen_max_pixels,
             )
@@ -713,11 +757,17 @@ def main() -> int:
 
             record = {
                 "case_id": case["id"],
+                "base_id": case.get("base_id", ""),
+                "question_id": case.get("question_id", ""),
                 "group": case.get("group", ""),
                 "source_dataset": dataset_name,
                 "source_index": sample_index,
                 "question": str(case.get("question", "")),
                 "answer": str(case.get("answer", "")),
+                "image": str(case.get("image", "")),
+                "image_size": list(base_image_size) if base_image_size else None,
+                "target_box_xyxy": case.get("target_box_xyxy"),
+                "distractor_box_xyxy": case.get("distractor_box_xyxy"),
                 "mode": args.mode,
                 "policy": args.policy,
                 "selected_layers": selected_layers,
