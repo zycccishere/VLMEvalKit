@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,16 @@ from PIL import Image, ImageDraw
 
 
 BASELINE_IMAGE_TRANSFORM = "baseline"
+VIT_PATCH_IMAGE_TRANSFORMS = {
+    "shift_down_half_vit_patch",
+    "shift_down_one_vit_patch",
+    "shift_up_half_vit_patch",
+    "shift_up_one_vit_patch",
+    "shift_right_half_vit_patch",
+    "shift_right_one_vit_patch",
+    "shift_left_half_vit_patch",
+    "shift_left_one_vit_patch",
+}
 
 SUPPORTED_IMAGE_TRANSFORMS = {
     BASELINE_IMAGE_TRANSFORM,
@@ -51,6 +62,7 @@ SUPPORTED_IMAGE_TRANSFORMS = {
     "shift_down_real_half_patch_wrap",
     "shift_left_real_half_patch_wrap",
     "shift_right_real_half_patch_wrap",
+    *VIT_PATCH_IMAGE_TRANSFORMS,
     "zoom_1p5_uncropped",
 }
 
@@ -63,9 +75,15 @@ QWEN_DEFAULT_MIN_PIXELS = 1280 * QWEN_TOKEN_STRIDE * QWEN_TOKEN_STRIDE
 QWEN_DEFAULT_MAX_PIXELS = 16384 * QWEN_TOKEN_STRIDE * QWEN_TOKEN_STRIDE
 
 
-def canonicalize_image_transform(name: str | None) -> str:
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def canonicalize_image_transform(name: str | None, *, strict: bool | None = None) -> str:
     raw = str(name or BASELINE_IMAGE_TRANSFORM).strip().lower()
     if raw not in SUPPORTED_IMAGE_TRANSFORMS:
+        if strict is True or (strict is None and _env_truthy("REPLAY_IMAGE_TRANSFORM_STRICT")):
+            raise ValueError(f"Unsupported image transform: {raw}")
         return BASELINE_IMAGE_TRANSFORM
     return raw
 
@@ -276,6 +294,90 @@ def _resize_to_match(image: Image.Image, target_size: tuple[int, int]) -> Image.
     return image.resize(target_size, resample=Image.Resampling.BICUBIC)
 
 
+def _resize_to_qwen_processed_size(
+    image: Image.Image,
+    *,
+    min_pixels: int | None,
+    max_pixels: int | None,
+) -> tuple[Image.Image, dict[str, int]]:
+    resized_height, resized_width = _smart_resize(
+        image.height,
+        image.width,
+        factor=QWEN_TOKEN_STRIDE,
+        min_pixels=int(min_pixels or QWEN_DEFAULT_MIN_PIXELS),
+        max_pixels=int(max_pixels or QWEN_DEFAULT_MAX_PIXELS),
+    )
+    resized = image.resize((resized_width, resized_height), resample=Image.Resampling.BICUBIC)
+    meta = {
+        "resized_height": int(resized_height),
+        "resized_width": int(resized_width),
+        "vit_grid_h": max(1, int(resized_height // QWEN_PATCH_SIZE)),
+        "vit_grid_w": max(1, int(resized_width // QWEN_PATCH_SIZE)),
+        "llm_grid_h": max(1, int(resized_height // QWEN_TOKEN_STRIDE)),
+        "llm_grid_w": max(1, int(resized_width // QWEN_TOKEN_STRIDE)),
+    }
+    return resized, meta
+
+
+def _scale_qwen_processed_size(size: tuple[int, int], scale: float) -> tuple[int, int]:
+    width, height = size
+    scaled_width = max(QWEN_TOKEN_STRIDE, math.ceil((width * scale) / QWEN_TOKEN_STRIDE) * QWEN_TOKEN_STRIDE)
+    scaled_height = max(QWEN_TOKEN_STRIDE, math.ceil((height * scale) / QWEN_TOKEN_STRIDE) * QWEN_TOKEN_STRIDE)
+    return int(scaled_width), int(scaled_height)
+
+
+def _vit_patch_shift_spec(transform: str) -> dict[str, Any] | None:
+    parts = transform.split("_")
+    if len(parts) != 5 or parts[0] != "shift" or parts[3:] != ["vit", "patch"]:
+        return None
+    _, direction, magnitude_name, _, _ = parts
+    if direction not in {"up", "down", "left", "right"}:
+        return None
+    if magnitude_name == "half":
+        fraction = 0.5
+    elif magnitude_name == "one":
+        fraction = 1.0
+    else:
+        return None
+    shift_px = max(1, int(round(QWEN_PATCH_SIZE * fraction)))
+    dx = 0
+    dy = 0
+    if direction == "up":
+        dy = -shift_px
+    elif direction == "down":
+        dy = shift_px
+    elif direction == "left":
+        dx = -shift_px
+    elif direction == "right":
+        dx = shift_px
+    return {
+        "direction": direction,
+        "magnitude_name": magnitude_name,
+        "vit_patch_fraction": fraction,
+        "processed_shift_pixels": shift_px,
+        "dx": dx,
+        "dy": dy,
+    }
+
+
+def _wrap_border_verified(original: Image.Image, transformed: Image.Image, *, dx: int, dy: int) -> bool:
+    source = np.asarray(original.convert("RGB"))
+    shifted = np.asarray(transformed.convert("RGB"))
+    if source.shape != shifted.shape:
+        return False
+    if dx > 0:
+        return bool(np.array_equal(shifted[:, :dx, :], source[:, -dx:, :]))
+    if dx < 0:
+        k = abs(dx)
+        return bool(np.array_equal(shifted[:, -k:, :], source[:, :k, :]))
+    if dy > 0:
+        return bool(np.array_equal(shifted[:dy, :, :], source[-dy:, :, :]))
+    if dy < 0:
+        k = abs(dy)
+        return bool(np.array_equal(shifted[-k:, :, :], source[:k, :, :]))
+    return True
+
+
 def apply_image_transform_to_content(
     content: list[dict[str, Any]],
     *,
@@ -330,11 +432,75 @@ def apply_image_transform_to_content(
     elif transform == "rotate180":
         output_image = source_image.transpose(Image.Transpose.ROTATE_180)
     elif transform == "zoom_1p5_uncropped":
-        width, height = source_image.size
-        output_image = source_image.resize(
-            (max(1, round(width * 1.5)), max(1, round(height * 1.5))),
-            resample=Image.Resampling.BICUBIC,
+        if _env_truthy("REPLAY_IMAGE_TRANSFORM_QWEN_PROCESSED_ZOOM"):
+            processed_image, process_info = _resize_to_qwen_processed_size(
+                source_image,
+                min_pixels=image_item.get("min_pixels"),
+                max_pixels=image_item.get("max_pixels"),
+            )
+            zoom_size = _scale_qwen_processed_size(processed_image.size, 1.5)
+            output_image = processed_image.resize(zoom_size, resample=Image.Resampling.BICUBIC)
+            record["qwen_processor_presized_zoom"] = True
+            record["processed_image_size_before_zoom"] = list(processed_image.size)
+            record["zoom"] = {
+                "scale": 1.5,
+                "basis": "qwen_processed_size",
+                "processed_resized_height": process_info["resized_height"],
+                "processed_resized_width": process_info["resized_width"],
+                "processed_vit_grid_h": process_info["vit_grid_h"],
+                "processed_vit_grid_w": process_info["vit_grid_w"],
+                "processed_llm_grid_h": process_info["llm_grid_h"],
+                "processed_llm_grid_w": process_info["llm_grid_w"],
+                "expected_zoomed_width": zoom_size[0],
+                "expected_zoomed_height": zoom_size[1],
+                "expected_zoomed_vit_grid_h": max(1, int(zoom_size[1] // QWEN_PATCH_SIZE)),
+                "expected_zoomed_vit_grid_w": max(1, int(zoom_size[0] // QWEN_PATCH_SIZE)),
+                "expected_zoomed_llm_grid_h": max(1, int(zoom_size[1] // QWEN_TOKEN_STRIDE)),
+                "expected_zoomed_llm_grid_w": max(1, int(zoom_size[0] // QWEN_TOKEN_STRIDE)),
+                "qwen_patch_size": QWEN_PATCH_SIZE,
+                "qwen_spatial_merge_size": QWEN_SPATIAL_MERGE_SIZE,
+                "qwen_token_stride": QWEN_TOKEN_STRIDE,
+            }
+        else:
+            width, height = source_image.size
+            output_image = source_image.resize(
+                (max(1, round(width * 1.5)), max(1, round(height * 1.5))),
+                resample=Image.Resampling.BICUBIC,
+            )
+    elif transform in VIT_PATCH_IMAGE_TRANSFORMS:
+        shift_spec = _vit_patch_shift_spec(transform)
+        if shift_spec is None:
+            raise ValueError(f"Unsupported ViT-patch shift transform: {transform}")
+        processed_image, process_info = _resize_to_qwen_processed_size(
+            source_image,
+            min_pixels=image_item.get("min_pixels"),
+            max_pixels=image_item.get("max_pixels"),
         )
+        dx = int(shift_spec["dx"])
+        dy = int(shift_spec["dy"])
+        output_image = _shift_image_wrap(processed_image, dx=dx, dy=dy)
+        record["qwen_processor_presized"] = True
+        record["processed_image_size_before_shift"] = list(processed_image.size)
+        record["shift"] = {
+            "dx": dx,
+            "dy": dy,
+            "pad_mode": "wrap",
+            "pixel_shift_kind": "processed_vit_patch",
+            "vit_patch_fraction": shift_spec["vit_patch_fraction"],
+            "processed_shift_pixels": shift_spec["processed_shift_pixels"],
+            "direction": shift_spec["direction"],
+            "magnitude_name": shift_spec["magnitude_name"],
+            "processed_resized_height": process_info["resized_height"],
+            "processed_resized_width": process_info["resized_width"],
+            "processed_vit_grid_h": process_info["vit_grid_h"],
+            "processed_vit_grid_w": process_info["vit_grid_w"],
+            "processed_llm_grid_h": process_info["llm_grid_h"],
+            "processed_llm_grid_w": process_info["llm_grid_w"],
+            "qwen_patch_size": QWEN_PATCH_SIZE,
+            "qwen_spatial_merge_size": QWEN_SPATIAL_MERGE_SIZE,
+            "qwen_token_stride": QWEN_TOKEN_STRIDE,
+            "border_wrap_verified": _wrap_border_verified(processed_image, output_image, dx=dx, dy=dy),
+        }
     elif transform.startswith("shift_") and transform.endswith("_real_half_patch_wrap"):
         parts = transform.split("_")
         if len(parts) != 6:

@@ -9,6 +9,7 @@ import json
 import time
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import StoppingCriteria
 
@@ -544,6 +545,217 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             "tail": token_ids[-128:],
         }
 
+    @staticmethod
+    def _trace_env_truthy(name: str, default: str = "0") -> bool:
+        return str(os.environ.get(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _trace_safe_token(text: Any) -> str:
+        out = []
+        for ch in str(text):
+            if ch.isalnum() or ch in {"-", "_", "."}:
+                out.append(ch)
+            else:
+                out.append("_")
+        return "".join(out).strip("_") or "sample"
+
+    @staticmethod
+    def _processor_image_slices(processor_inputs: Any) -> list[dict[str, Any]]:
+        grid = processor_inputs.get("image_grid_thw") if hasattr(processor_inputs, "get") else None
+        pixel_values = processor_inputs.get("pixel_values") if hasattr(processor_inputs, "get") else None
+        if grid is None or pixel_values is None:
+            return []
+        try:
+            grid_list = grid.detach().cpu().tolist() if hasattr(grid, "detach") else grid.tolist()
+        except Exception:
+            return []
+        out = []
+        start = 0
+        for idx, row in enumerate(grid_list):
+            if len(row) != 3:
+                continue
+            t, h, w = [int(x) for x in row]
+            count = int(t * h * w)
+            out.append(
+                {
+                    "image_position": idx + 1,
+                    "image_grid_thw": [t, h, w],
+                    "pixel_values_start": start,
+                    "pixel_values_end": start + count,
+                    "pixel_values_count": count,
+                }
+            )
+            start += count
+        return out
+
+    @staticmethod
+    def _load_rgb_image_from_ref(image_ref: str):
+        from PIL import Image
+
+        raw = str(image_ref or "").strip()
+        if raw.startswith("file://"):
+            raw = raw[len("file://") :]
+        with Image.open(raw) as image:
+            return image.convert("RGB")
+
+    @staticmethod
+    def _shift_pil_wrap(image, *, dx: int, dy: int):
+        from PIL import Image
+
+        source = np.asarray(image.convert("RGB"))
+        shifted = np.roll(source, shift=dy, axis=0)
+        shifted = np.roll(shifted, shift=dx, axis=1)
+        return Image.fromarray(shifted.astype(np.uint8), mode="RGB")
+
+    def _expected_vit_patch_images(self, transform_record: dict[str, Any]) -> tuple[Any, Any] | None:
+        from PIL import Image
+
+        shift = transform_record.get("shift")
+        if not isinstance(shift, dict) or shift.get("pixel_shift_kind") != "processed_vit_patch":
+            return None
+        original_ref = str(transform_record.get("original_image_ref", "")).strip()
+        if not original_ref:
+            return None
+        processed_size = transform_record.get("processed_image_size_before_shift") or transform_record.get("transformed_image_size")
+        if not isinstance(processed_size, list) or len(processed_size) != 2:
+            return None
+        original = self._load_rgb_image_from_ref(original_ref)
+        resized = original.resize(
+            (int(processed_size[0]), int(processed_size[1])),
+            resample=Image.Resampling.BICUBIC,
+        )
+        shifted = self._shift_pil_wrap(
+            resized,
+            dx=int(shift.get("dx", 0) or 0),
+            dy=int(shift.get("dy", 0) or 0),
+        )
+        return resized, shifted
+
+    def _target_pixel_values(
+        self,
+        processor_inputs: Any,
+        image_position: int,
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        pixel_values = processor_inputs.get("pixel_values") if hasattr(processor_inputs, "get") else None
+        slices = self._processor_image_slices(processor_inputs)
+        target = next((item for item in slices if item["image_position"] == image_position), None)
+        if pixel_values is None or target is None:
+            return None, target
+        return pixel_values[target["pixel_values_start"] : target["pixel_values_end"]], target
+
+    def _record_processor_image_transform_validation(
+        self,
+        *,
+        text,
+        images,
+        videos,
+        processor_inputs,
+        dataset: str | None,
+        transform_record: dict[str, Any] | None,
+    ) -> None:
+        if not transform_record or not self._trace_env_truthy("REPLAY_PROCESSOR_TRACE_VALIDATE"):
+            return
+        image_position = int(transform_record.get("target_image_position", 2) or 2)
+        target_index = image_position - 1
+        target_actual, target_slice = self._target_pixel_values(processor_inputs, image_position)
+        payload: dict[str, Any] = {
+            "phase": "processor_image_transform_validation",
+            "dataset": str(dataset) if dataset is not None else None,
+            "image_transform": transform_record.get("transform"),
+            "sample_index": transform_record.get("sample_index"),
+            "target_image_position": image_position,
+            "target_pixel_values_slice": target_slice,
+            "transform_record": transform_record,
+        }
+        if images is None or target_index < 0 or target_index >= len(images):
+            payload["ok"] = False
+            payload["error"] = "target image position is outside extracted image list"
+            self._write_replay_dump(payload, detail="summary")
+            return
+        expected_pair = self._expected_vit_patch_images(transform_record)
+        if expected_pair is None:
+            self._write_replay_dump({**payload, "ok": True, "comparison": "not_applicable"}, detail="summary")
+            return
+        reference_image, expected_shifted_image = expected_pair
+        try:
+            expected_images = list(images)
+            expected_images[target_index] = expected_shifted_image
+            expected_inputs = self.processor(
+                text=text,
+                images=expected_images,
+                videos=videos,
+                padding=True,
+                return_tensors="pt",
+            )
+            expected_target, expected_slice = self._target_pixel_values(expected_inputs, image_position)
+            reference_images = list(images)
+            reference_images[target_index] = reference_image
+            reference_inputs = self.processor(
+                text=text,
+                images=reference_images,
+                videos=videos,
+                padding=True,
+                return_tensors="pt",
+            )
+            reference_target, reference_slice = self._target_pixel_values(reference_inputs, image_position)
+        except Exception as err:
+            payload["ok"] = False
+            payload["error_type"] = type(err).__name__
+            payload["error"] = self._clip_text(str(err))
+            self._write_replay_dump(payload, detail="summary")
+            return
+
+        if target_actual is None or expected_target is None:
+            payload["ok"] = False
+            payload["error"] = "missing target pixel_values slice"
+            self._write_replay_dump(payload, detail="summary")
+            return
+        actual_cpu = target_actual.detach().cpu()
+        expected_cpu = expected_target.detach().cpu()
+        reference_cpu = reference_target.detach().cpu() if reference_target is not None else None
+        same_shape = tuple(actual_cpu.shape) == tuple(expected_cpu.shape)
+        if same_shape:
+            diff = (actual_cpu.float() - expected_cpu.float()).abs()
+            max_abs_diff = float(diff.max().item()) if diff.numel() else 0.0
+            mean_abs_diff = float(diff.mean().item()) if diff.numel() else 0.0
+        else:
+            max_abs_diff = None
+            mean_abs_diff = None
+        npz_path = ""
+        if self._trace_env_truthy("REPLAY_PROCESSOR_TRACE_SAVE_NPZ"):
+            out_dir = os.environ.get("REPLAY_PROCESSOR_TRACE_NPZ_DIR", self._replay_dump_dir or "").strip()
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                name = "_".join(
+                    [
+                        "processor_patch",
+                        self._trace_safe_token(dataset or "dataset"),
+                        self._trace_safe_token(transform_record.get("sample_index", "sample")),
+                        self._trace_safe_token(transform_record.get("transform", "transform")),
+                    ]
+                )
+                npz_path = os.path.join(out_dir, f"{name}.npz")
+                np.savez_compressed(
+                    npz_path,
+                    actual_target_pixel_values=actual_cpu.numpy(),
+                    expected_shifted_target_pixel_values=expected_cpu.numpy(),
+                    reference_unshifted_target_pixel_values=reference_cpu.numpy() if reference_cpu is not None else np.array([]),
+                )
+        payload.update(
+            {
+                "ok": bool(same_shape and max_abs_diff is not None and max_abs_diff <= 1e-5),
+                "actual_shape": list(actual_cpu.shape),
+                "expected_shape": list(expected_cpu.shape),
+                "reference_shape": list(reference_cpu.shape) if reference_cpu is not None else None,
+                "expected_target_pixel_values_slice": expected_slice,
+                "reference_target_pixel_values_slice": reference_slice,
+                "max_abs_diff_actual_vs_expected_shifted": max_abs_diff,
+                "mean_abs_diff_actual_vs_expected_shifted": mean_abs_diff,
+                "npz_path": npz_path,
+            }
+        )
+        self._write_replay_dump(payload, detail="summary")
+
     def _record_processor_trace(
         self,
         *,
@@ -583,12 +795,14 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         prompt_mask = attention_mask[0].tolist()
         image_spans = self._find_image_token_spans(prompt_ids)
         target_span = image_spans[1] if len(image_spans) >= 2 else None
+        image_slices = self._processor_image_slices(processor_inputs)
         self._last_trace_state = {
             "dataset": str(dataset) if dataset is not None else None,
             "prompt_token_count": len(prompt_ids),
             "prompt_token_ids": prompt_ids,
             "image_token_spans": image_spans,
             "target_image_span": target_span,
+            "processor_image_slices": image_slices,
             "replayed_content": replayed_content,
         }
         token_payload = {
@@ -599,6 +813,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             "attention_mask": self._summarize_token_ids(prompt_mask, detail="full"),
             "image_token_spans": image_spans,
             "target_image_span": target_span,
+            "processor_image_slices": image_slices,
         }
         self._stage_debug("processor_inputs", token_payload, detail="full")
         self._write_replay_dump(
@@ -615,6 +830,15 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 },
             },
             detail="full",
+        )
+        transform_record = getattr(self, "_last_image_transform_record", None)
+        self._record_processor_image_transform_validation(
+            text=text,
+            images=images,
+            videos=videos,
+            processor_inputs=processor_inputs,
+            dataset=dataset,
+            transform_record=transform_record if isinstance(transform_record, dict) else None,
         )
 
     def _record_generation_loss_mask(self, generated_text: str, dataset: str | None) -> None:
@@ -1131,6 +1355,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             1,
             int(os.environ.get("REPLAY_IMAGE_TRANSFORM_TARGET_POSITION", "2")),
         )
+        self._last_image_transform_record: dict[str, Any] | None = None
         print(
             f"[Qwen2VLChatReplay] image_transform={self.image_transform_name} "
             f"target_position={self.image_transform_target_position} "
@@ -1248,6 +1473,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
         dataset: str | None = None,
     ) -> list[dict[str, str]]:
         if self.image_transform_name == "baseline":
+            self._last_image_transform_record = None
             return content
         replay_meta = self._extract_replay_meta(inputs)
         transformed, transform_record = apply_image_transform_to_content(
@@ -1258,6 +1484,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             dataset_name=str(dataset) if dataset is not None else "unknown_dataset",
             image_position=self.image_transform_target_position,
         )
+        self._last_image_transform_record = transform_record
         self._stage_debug(
             "image_transform",
             {
