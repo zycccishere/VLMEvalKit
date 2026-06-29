@@ -611,7 +611,11 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         from PIL import Image
 
         shift = transform_record.get("shift")
-        if not isinstance(shift, dict) or shift.get("pixel_shift_kind") != "processed_vit_patch":
+        if not isinstance(shift, dict):
+            return None
+        if not shift.get("processed_space") and shift.get("pixel_shift_kind") != "processed_vit_patch":
+            return None
+        if shift.get("pad_mode") != "wrap":
             return None
         original_ref = str(transform_record.get("original_image_ref", "")).strip()
         if not original_ref:
@@ -1483,6 +1487,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             cache_dir=self.image_transform_cache_dir or os.path.join(os.getcwd(), ".replay_transform_cache"),
             dataset_name=str(dataset) if dataset is not None else "unknown_dataset",
             image_position=self.image_transform_target_position,
+            model_family="qwen2_5_vl",
         )
         self._last_image_transform_record = transform_record
         self._stage_debug(

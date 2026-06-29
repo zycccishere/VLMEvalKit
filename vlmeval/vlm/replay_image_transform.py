@@ -14,15 +14,50 @@ from PIL import Image, ImageDraw
 
 
 BASELINE_IMAGE_TRANSFORM = "baseline"
+SHIFT_DIRECTIONS = ("up", "down", "left", "right")
 VIT_PATCH_IMAGE_TRANSFORMS = {
-    "shift_down_half_vit_patch",
-    "shift_down_one_vit_patch",
-    "shift_up_half_vit_patch",
-    "shift_up_one_vit_patch",
-    "shift_right_half_vit_patch",
-    "shift_right_one_vit_patch",
-    "shift_left_half_vit_patch",
-    "shift_left_one_vit_patch",
+    f"shift_{direction}_{magnitude}_vit_patch"
+    for direction in SHIFT_DIRECTIONS
+    for magnitude in ("half", "one")
+}
+TOKEN_UNIT_IMAGE_TRANSFORMS = {
+    f"shift_{direction}_{magnitude}_vit_token"
+    for direction in SHIFT_DIRECTIONS
+    for magnitude in ("half", "one")
+} | {
+    f"shift_{direction}_one_llm_token"
+    for direction in SHIFT_DIRECTIONS
+}
+IMAGE_TRANSFORM_ALIASES = {
+    f"shift_{direction}_vit_token": f"shift_{direction}_one_vit_token"
+    for direction in SHIFT_DIRECTIONS
+}
+IMAGE_TRANSFORM_ALIASES.update(
+    {
+        f"shift_{direction}_llm_token": f"shift_{direction}_one_llm_token"
+        for direction in SHIFT_DIRECTIONS
+    }
+)
+PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS = VIT_PATCH_IMAGE_TRANSFORMS | TOKEN_UNIT_IMAGE_TRANSFORMS
+
+IMAGE_TRANSFORM_PROFILES = {
+    "qwen2_5_vl": {
+        "model_family": "qwen2_5_vl",
+        "record_prefix": "qwen",
+        "resize_mode": "qwen_smart",
+        "vit_patch_size": 14,
+        "spatial_merge_size": 2,
+        "llm_token_stride": 28,
+    },
+    "gemma3": {
+        "model_family": "gemma3",
+        "record_prefix": "gemma3",
+        "resize_mode": "fixed_square",
+        "image_size": 896,
+        "vit_patch_size": 14,
+        "spatial_merge_size": 4,
+        "llm_token_stride": 56,
+    },
 }
 
 SUPPORTED_IMAGE_TRANSFORMS = {
@@ -62,7 +97,7 @@ SUPPORTED_IMAGE_TRANSFORMS = {
     "shift_down_real_half_patch_wrap",
     "shift_left_real_half_patch_wrap",
     "shift_right_real_half_patch_wrap",
-    *VIT_PATCH_IMAGE_TRANSFORMS,
+    *PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS,
     "zoom_1p5_uncropped",
 }
 
@@ -81,11 +116,28 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 def canonicalize_image_transform(name: str | None, *, strict: bool | None = None) -> str:
     raw = str(name or BASELINE_IMAGE_TRANSFORM).strip().lower()
+    raw = IMAGE_TRANSFORM_ALIASES.get(raw, raw)
     if raw not in SUPPORTED_IMAGE_TRANSFORMS:
         if strict is True or (strict is None and _env_truthy("REPLAY_IMAGE_TRANSFORM_STRICT")):
             raise ValueError(f"Unsupported image transform: {raw}")
         return BASELINE_IMAGE_TRANSFORM
     return raw
+
+
+def resolve_image_transform_profile(model_family: str | None = None) -> dict[str, Any]:
+    raw = str(model_family or os.environ.get("REPLAY_IMAGE_TRANSFORM_MODEL_FAMILY", "qwen2_5_vl")).strip().lower()
+    raw = raw.replace("-", "_").replace(".", "_")
+    if "gemma3" in raw or "gemma_3" in raw:
+        key = "gemma3"
+    elif "qwen" in raw:
+        key = "qwen2_5_vl"
+    else:
+        key = raw
+    if key not in IMAGE_TRANSFORM_PROFILES:
+        if _env_truthy("REPLAY_IMAGE_TRANSFORM_STRICT"):
+            raise ValueError(f"Unsupported image transform model family: {model_family}")
+        key = "qwen2_5_vl"
+    return dict(IMAGE_TRANSFORM_PROFILES[key])
 
 
 def image_transform_active(name: str | None) -> bool:
@@ -163,6 +215,16 @@ def _find_image_item_index(content: list[dict[str, Any]], image_position: int) -
             if current == image_position:
                 return item_index, item
     raise ValueError(f"Replay content only has {current} image item(s); cannot target image position {image_position}.")
+
+
+def _image_ref_key(image_item: dict[str, Any]) -> str:
+    if image_item.get("image"):
+        return "image"
+    if image_item.get("value"):
+        return "value"
+    if image_item.get("url"):
+        return "url"
+    return "image"
 
 
 def _shift_image(image: Image.Image, dx: int, dy: int, fill_color: tuple[int, int, int]) -> Image.Image:
@@ -319,6 +381,31 @@ def _resize_to_qwen_processed_size(
     return resized, meta
 
 
+def _resize_to_profile_processed_size(
+    image: Image.Image,
+    *,
+    profile: dict[str, Any],
+    min_pixels: int | None,
+    max_pixels: int | None,
+) -> tuple[Image.Image, dict[str, int]]:
+    if profile.get("resize_mode") == "fixed_square":
+        size = int(profile["image_size"])
+        resized = image.resize((size, size), resample=Image.Resampling.BICUBIC)
+        vit_patch_size = int(profile["vit_patch_size"])
+        llm_token_stride = int(profile["llm_token_stride"])
+        return resized, {
+            "resized_height": size,
+            "resized_width": size,
+            "vit_grid_h": max(1, size // vit_patch_size),
+            "vit_grid_w": max(1, size // vit_patch_size),
+            "llm_grid_h": max(1, size // llm_token_stride),
+            "llm_grid_w": max(1, size // llm_token_stride),
+        }
+    if profile.get("model_family") == "qwen2_5_vl":
+        return _resize_to_qwen_processed_size(image, min_pixels=min_pixels, max_pixels=max_pixels)
+    raise ValueError(f"Unsupported processed-size profile: {profile.get('model_family')}")
+
+
 def _scale_qwen_processed_size(size: tuple[int, int], scale: float) -> tuple[int, int]:
     width, height = size
     scaled_width = max(QWEN_TOKEN_STRIDE, math.ceil((width * scale) / QWEN_TOKEN_STRIDE) * QWEN_TOKEN_STRIDE)
@@ -326,20 +413,33 @@ def _scale_qwen_processed_size(size: tuple[int, int], scale: float) -> tuple[int
     return int(scaled_width), int(scaled_height)
 
 
-def _vit_patch_shift_spec(transform: str) -> dict[str, Any] | None:
+def _processed_token_shift_spec(transform: str, *, profile: dict[str, Any]) -> dict[str, Any] | None:
     parts = transform.split("_")
-    if len(parts) != 5 or parts[0] != "shift" or parts[3:] != ["vit", "patch"]:
+    if len(parts) != 5 or parts[0] != "shift":
         return None
-    _, direction, magnitude_name, _, _ = parts
+    _, direction, magnitude_name, unit_name, token_name = parts
     if direction not in {"up", "down", "left", "right"}:
         return None
-    if magnitude_name == "half":
+    legacy_vit_patch_name = unit_name == "vit" and token_name == "patch"
+    vit_token_name = unit_name == "vit" and token_name == "token"
+    llm_token_name = unit_name == "llm" and token_name == "token"
+    if not (legacy_vit_patch_name or vit_token_name or llm_token_name):
+        return None
+    if magnitude_name == "half" and not llm_token_name:
         fraction = 0.5
     elif magnitude_name == "one":
         fraction = 1.0
     else:
         return None
-    shift_px = max(1, int(round(QWEN_PATCH_SIZE * fraction)))
+    if llm_token_name:
+        base_pixels = int(profile["llm_token_stride"])
+        semantic_unit = "llm_visual_token"
+        pixel_shift_kind = "processed_llm_token"
+    else:
+        base_pixels = int(profile["vit_patch_size"])
+        semantic_unit = "vit_patch"
+        pixel_shift_kind = "processed_vit_patch" if legacy_vit_patch_name else "processed_vit_token"
+    shift_px = max(1, int(round(base_pixels * fraction)))
     dx = 0
     dy = 0
     if direction == "up":
@@ -353,7 +453,13 @@ def _vit_patch_shift_spec(transform: str) -> dict[str, Any] | None:
     return {
         "direction": direction,
         "magnitude_name": magnitude_name,
-        "vit_patch_fraction": fraction,
+        "semantic_unit": semantic_unit,
+        "transform_unit_name": f"{unit_name}_{token_name}",
+        "legacy_vit_patch_name": legacy_vit_patch_name,
+        "pixel_shift_kind": pixel_shift_kind,
+        "base_pixels": base_pixels,
+        "fraction": fraction,
+        "vit_patch_fraction": fraction if semantic_unit == "vit_patch" else None,
         "processed_shift_pixels": shift_px,
         "dx": dx,
         "dy": dy,
@@ -386,16 +492,19 @@ def apply_image_transform_to_content(
     cache_dir: str | Path,
     dataset_name: str,
     image_position: int = 2,
+    model_family: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     transform = canonicalize_image_transform(transform_name)
     out = [dict(item) if isinstance(item, dict) else item for item in content]
     if transform == BASELINE_IMAGE_TRANSFORM:
         return out, {"transform": transform, "applied": False}
+    profile = resolve_image_transform_profile(model_family)
 
     item_index, image_item = _find_image_item_index(out, image_position=image_position)
-    original_ref = str(image_item.get("image", "")).strip()
+    image_key = _image_ref_key(image_item)
+    original_ref = str(image_item.get(image_key, "")).strip()
     if not original_ref:
-        raise ValueError(f"Image position {image_position} does not have a usable `image` ref.")
+        raise ValueError(f"Image position {image_position} does not have a usable image ref.")
 
     sample_meta = dict(sample_meta or {})
     sample_index = sample_meta.get("sample_index", "unknown")
@@ -409,6 +518,7 @@ def apply_image_transform_to_content(
         "sample_index": str(sample_index),
         "target_image_position": image_position,
         "content_item_index": item_index,
+        "image_ref_key": image_key,
         "original_image_ref": original_ref,
     }
 
@@ -467,40 +577,65 @@ def apply_image_transform_to_content(
                 (max(1, round(width * 1.5)), max(1, round(height * 1.5))),
                 resample=Image.Resampling.BICUBIC,
             )
-    elif transform in VIT_PATCH_IMAGE_TRANSFORMS:
-        shift_spec = _vit_patch_shift_spec(transform)
+    elif transform in PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS:
+        shift_spec = _processed_token_shift_spec(transform, profile=profile)
         if shift_spec is None:
-            raise ValueError(f"Unsupported ViT-patch shift transform: {transform}")
-        processed_image, process_info = _resize_to_qwen_processed_size(
+            raise ValueError(f"Unsupported processed token shift transform: {transform}")
+        processed_image, process_info = _resize_to_profile_processed_size(
             source_image,
+            profile=profile,
             min_pixels=image_item.get("min_pixels"),
             max_pixels=image_item.get("max_pixels"),
         )
         dx = int(shift_spec["dx"])
         dy = int(shift_spec["dy"])
         output_image = _shift_image_wrap(processed_image, dx=dx, dy=dy)
-        record["qwen_processor_presized"] = True
+        record[f"{profile['record_prefix']}_processor_presized"] = True
+        if profile["model_family"] == "qwen2_5_vl":
+            record["qwen_processor_presized"] = True
+        if profile["model_family"] == "gemma3":
+            record["gemma3_processor_presized"] = True
         record["processed_image_size_before_shift"] = list(processed_image.size)
         record["shift"] = {
             "dx": dx,
             "dy": dy,
             "pad_mode": "wrap",
-            "pixel_shift_kind": "processed_vit_patch",
-            "vit_patch_fraction": shift_spec["vit_patch_fraction"],
+            "pixel_shift_kind": shift_spec["pixel_shift_kind"],
+            "processed_space": True,
+            "semantic_unit": shift_spec["semantic_unit"],
+            "transform_unit_name": shift_spec["transform_unit_name"],
+            "legacy_vit_patch_name": shift_spec["legacy_vit_patch_name"],
+            "base_pixels": shift_spec["base_pixels"],
+            "fraction": shift_spec["fraction"],
             "processed_shift_pixels": shift_spec["processed_shift_pixels"],
             "direction": shift_spec["direction"],
             "magnitude_name": shift_spec["magnitude_name"],
+            "model_family": profile["model_family"],
             "processed_resized_height": process_info["resized_height"],
             "processed_resized_width": process_info["resized_width"],
             "processed_vit_grid_h": process_info["vit_grid_h"],
             "processed_vit_grid_w": process_info["vit_grid_w"],
             "processed_llm_grid_h": process_info["llm_grid_h"],
             "processed_llm_grid_w": process_info["llm_grid_w"],
+            "vit_patch_size": profile["vit_patch_size"],
+            "spatial_merge_size": profile["spatial_merge_size"],
+            "llm_visual_token_stride": profile["llm_token_stride"],
             "qwen_patch_size": QWEN_PATCH_SIZE,
             "qwen_spatial_merge_size": QWEN_SPATIAL_MERGE_SIZE,
             "qwen_token_stride": QWEN_TOKEN_STRIDE,
             "border_wrap_verified": _wrap_border_verified(processed_image, output_image, dx=dx, dy=dy),
         }
+        if shift_spec["vit_patch_fraction"] is not None:
+            record["shift"]["vit_patch_fraction"] = shift_spec["vit_patch_fraction"]
+        if profile["model_family"] == "gemma3":
+            record["shift"].update(
+                {
+                    "gemma3_image_size": profile["image_size"],
+                    "gemma3_patch_size": profile["vit_patch_size"],
+                    "gemma3_pool_stride": profile["spatial_merge_size"],
+                    "gemma3_llm_token_stride": profile["llm_token_stride"],
+                }
+            )
     elif transform.startswith("shift_") and transform.endswith("_real_half_patch_wrap"):
         parts = transform.split("_")
         if len(parts) != 6:
@@ -639,8 +774,10 @@ def apply_image_transform_to_content(
 
     if transform != "baseline":
         output_ref = _save_image(output_image, cache_dir, f"{sample_key}.png")
+        if image_key in {"value", "url"} and output_ref.startswith("file://"):
+            output_ref = _strip_file_scheme(output_ref)
 
-    out[item_index]["image"] = output_ref
+    out[item_index][image_key] = output_ref
     record["transformed_image_ref"] = output_ref
     record["transformed_image_size"] = list(output_image.size)
     return out, record
