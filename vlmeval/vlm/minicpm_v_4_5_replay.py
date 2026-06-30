@@ -4,6 +4,7 @@ import os
 import random
 import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -22,6 +23,10 @@ from .replay_policy import (
     is_noop_replay_mode,
     maybe_debug_print_replay,
     read_replay_config_from_env,
+)
+from .replay_image_transform import (
+    apply_image_transform_to_content,
+    canonicalize_image_transform,
 )
 from ..smp import *
 
@@ -454,11 +459,12 @@ class MiniCPM_V_4_5(BaseModel):
 
     def _message_to_content(self, message, dataset=None):
         content = []
+        images = []
         for item in message:
             if item["type"] == "text":
                 content.append(item["value"])
             elif item["type"] == "image":
-                image = Image.open(item["value"]).convert("RGB")
+                image = Image.open(self._strip_file_scheme(item["value"])).convert("RGB")
                 if not self.use_upsize(dataset):
                     content.append(image)
                 else:
@@ -471,15 +477,24 @@ class MiniCPM_V_4_5(BaseModel):
                         new_img_width = random.randint(img_width, max_img_width)
                         new_img_height = int(new_img_width / img_width * img_height)
                         content.append(image.resize((new_img_width, new_img_height)))
+                if content and isinstance(content[-1], Image.Image):
+                    images.append(content[-1])
+        self._maybe_dump_minicpm_payload(
+            phase="minicpm_hf_payload",
+            dataset=dataset,
+            message=message,
+            images=images,
+        )
         return content
 
     def _message_to_vllm_content(self, message, dataset=None):
         content = []
+        images = []
         for item in message:
             if item["type"] == "text":
                 content.append({"type": "text", "text": str(item["value"])})
             elif item["type"] == "image":
-                image = Image.open(item["value"]).convert("RGB")
+                image = Image.open(self._strip_file_scheme(item["value"])).convert("RGB")
                 if self.use_upsize(dataset):
                     img_width, img_height = image.width, image.height
                     if (img_width * img_height) < (1344 * 1344):
@@ -488,7 +503,14 @@ class MiniCPM_V_4_5(BaseModel):
                         new_img_width = random.randint(img_width, max_img_width)
                         new_img_height = int(new_img_width / img_width * img_height)
                         image = image.resize((new_img_width, new_img_height))
+                images.append(image)
                 content.append({"type": "image_pil", "image_pil": image})
+        self._maybe_dump_minicpm_payload(
+            phase="minicpm_vllm_payload",
+            dataset=dataset,
+            message=message,
+            images=images,
+        )
         return content
 
     def _build_default_generate_kwargs(self, dataset=None):
@@ -575,6 +597,40 @@ class MiniCPM_V_4_5(BaseModel):
         if getattr(output, "outputs", None):
             return output.outputs[0].text
         return ""
+
+    @staticmethod
+    def _strip_file_scheme(image_ref):
+        raw = str(image_ref or "").strip()
+        if raw.startswith("file://"):
+            return raw[len("file://") :]
+        return raw
+
+    def _maybe_dump_minicpm_payload(self, *, phase, dataset, message, images):
+        dump = getattr(self, "_write_replay_dump", None)
+        if not callable(dump):
+            return
+        active_ids = getattr(self, "_minicpm_trace_active_message_ids", set())
+        message_id = id(message)
+        if message_id not in active_ids:
+            return
+        transform_record = getattr(self, "_minicpm_transform_records_by_message_id", {}).get(
+            message_id,
+            getattr(self, "_last_image_transform_record", None),
+        )
+        dump(
+            {
+                "phase": phase,
+                "dataset": str(dataset) if dataset is not None else None,
+                "payload_image_count": len(images),
+                "payload_image_sizes": [list(image.size) for image in images],
+                "message_replayed": self._serialize_message_for_debug(message),
+                "transform_record": transform_record if isinstance(transform_record, dict) else None,
+            },
+            detail="summary",
+            force=True,
+        )
+        active_ids.discard(message_id)
+        getattr(self, "_minicpm_transform_records_by_message_id", {}).pop(message_id, None)
 
     def _restore_vllm_full_output(self, text, chat_template_kwargs=None):
         raw_text = str(text)
@@ -748,6 +804,124 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             f"[MiniCPM_V_4_5_Replay] template_on_last_replay_text={self.template_on_last_replay_text}",
             flush=True,
         )
+        self.image_transform_name = canonicalize_image_transform(os.environ.get("REPLAY_IMAGE_TRANSFORM", "baseline"))
+        self.image_transform_cache_dir = os.environ.get("REPLAY_IMAGE_TRANSFORM_CACHE_DIR", "").strip()
+        self.image_transform_effective_cache_dir = self.image_transform_cache_dir or os.path.join(
+            os.getcwd(),
+            ".replay_transform_cache",
+        )
+        self.image_transform_target_position = max(
+            1,
+            _env_int("REPLAY_IMAGE_TRANSFORM_TARGET_POSITION", 2),
+        )
+        self._last_image_transform_record: dict[str, Any] | None = None
+        self._minicpm_transform_records_by_message_id: dict[int, dict[str, Any]] = {}
+        self._minicpm_trace_active_message_ids: set[int] = set()
+        trace_level = os.environ.get("REPLAY_TRACE_LEVEL", os.environ.get("REPLAY_STAGE_DEBUG", "off")).strip().lower()
+        if trace_level in {"1", "true", "yes", "on"}:
+            trace_level = "summary"
+        if trace_level not in {"off", "summary", "full"}:
+            trace_level = "off"
+        self._minicpm_trace_level = trace_level
+        self._minicpm_trace_max_samples = max(0, _env_int("REPLAY_TRACE_SAMPLES", 3))
+        self._minicpm_trace_seen_samples = 0
+        self._minicpm_trace_active = False
+        self._minicpm_dump_dir = os.environ.get("REPLAY_TRACE_DIR", os.environ.get("REPLAY_DUMP_DIR", "")).strip()
+        self._minicpm_dump_file = None
+        self._minicpm_dump_max_chars = _env_int("REPLAY_TRACE_MAX_CHARS", _env_int("REPLAY_DUMP_MAX_CHARS", 0))
+        if self._minicpm_dump_dir:
+            os.makedirs(self._minicpm_dump_dir, exist_ok=True)
+            pid = os.getpid()
+            self._minicpm_dump_file = os.path.join(
+                self._minicpm_dump_dir,
+                f"{self.__class__.__name__}.pid{pid}.jsonl",
+            )
+            print(f"[minicpm-replay-dump] enabled. Writing to {self._minicpm_dump_file}", flush=True)
+        print(
+            f"[MiniCPM_V_4_5_Replay] image_transform={self.image_transform_name} "
+            f"target_position={self.image_transform_target_position} "
+            f"cache_dir={self.image_transform_effective_cache_dir}",
+            flush=True,
+        )
+
+    def _begin_trace_sample(self):
+        if self._minicpm_trace_level in {"summary", "full"} and (
+            self._minicpm_trace_seen_samples < self._minicpm_trace_max_samples
+        ):
+            self._minicpm_trace_seen_samples += 1
+            self._minicpm_trace_active = True
+        else:
+            self._minicpm_trace_active = False
+        return self._minicpm_trace_active
+
+    def _trace_allows(self, detail="summary", *, force=False):
+        if not self._minicpm_dump_file:
+            return False
+        if not force and not self._minicpm_trace_active:
+            return False
+        if self._minicpm_trace_level == "full":
+            return True
+        return detail != "full"
+
+    def _clip_trace_text(self, value):
+        text = str(value)
+        if self._minicpm_dump_max_chars > 0 and len(text) > self._minicpm_dump_max_chars:
+            return text[: self._minicpm_dump_max_chars] + f"\n...[TRUNCATED {len(text) - self._minicpm_dump_max_chars} chars]"
+        return text
+
+    def _write_replay_dump(self, record, detail="summary", *, force=False):
+        if not self._trace_allows(detail, force=force):
+            return
+        serializable = json.loads(json.dumps(record, default=str, ensure_ascii=False))
+        serializable.setdefault("pid", os.getpid())
+        serializable.setdefault("cuda_visible_devices", os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+        serializable.setdefault("rank", os.environ.get("RANK", os.environ.get("LOCAL_RANK", "")))
+        for key in ("prompt", "raw_output", "full_output"):
+            if key in serializable:
+                serializable[key] = self._clip_trace_text(serializable[key])
+        try:
+            with open(self._minicpm_dump_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(serializable, ensure_ascii=False) + "\n")
+        except Exception as err:
+            print(f"[minicpm-replay-dump] write failed: {err}", flush=True)
+
+    def _extract_replay_meta(self, inputs):
+        for item in inputs:
+            if isinstance(item, dict) and isinstance(item.get("replay_meta"), dict):
+                return dict(item["replay_meta"])
+        return {}
+
+    def _apply_image_transform_pipeline(self, message, *, inputs, dataset=None, trace_active=False):
+        if self.image_transform_name == "baseline":
+            self._last_image_transform_record = {"transform": "baseline", "applied": False}
+            if trace_active:
+                self._minicpm_trace_active_message_ids.add(id(message))
+            return message
+        replay_meta = self._extract_replay_meta(inputs)
+        transformed, transform_record = apply_image_transform_to_content(
+            message,
+            transform_name=self.image_transform_name,
+            sample_meta=replay_meta,
+            cache_dir=self.image_transform_effective_cache_dir,
+            dataset_name=str(dataset) if dataset is not None else "unknown_dataset",
+            image_position=self.image_transform_target_position,
+            model_family="minicpm45",
+        )
+        self._last_image_transform_record = transform_record
+        if trace_active:
+            self._minicpm_transform_records_by_message_id[id(transformed)] = transform_record
+            self._minicpm_trace_active_message_ids.add(id(transformed))
+            self._write_replay_dump(
+                {
+                    "phase": "image_transform",
+                    "dataset": str(dataset) if dataset is not None else None,
+                    "image_transform": self.image_transform_name,
+                    "replay_meta": replay_meta,
+                    "record": transform_record,
+                },
+                detail="summary",
+            )
+        return transformed
 
     def _apply_prompt_template_to_message(self, message, dataset=None):
         template_text = self.prompt_template_cfg.get("template", "{problem}")
@@ -825,7 +999,14 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
         )
 
     def generate_inner(self, message, dataset=None):
+        trace_active = self._begin_trace_sample()
         replayed = self._apply_replay_pipeline(message, dataset=dataset)
+        replayed = self._apply_image_transform_pipeline(
+            replayed,
+            inputs=message,
+            dataset=dataset,
+            trace_active=trace_active,
+        )
         maybe_debug_print_replay(
             enabled=self.replay_cfg.get("debug", False),
             mode=canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text")),
@@ -839,7 +1020,14 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
         replayed_messages = []
         replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
         for message in messages:
+            trace_active = self._begin_trace_sample()
             replayed = self._apply_replay_pipeline(message, dataset=dataset)
+            replayed = self._apply_image_transform_pipeline(
+                replayed,
+                inputs=message,
+                dataset=dataset,
+                trace_active=trace_active,
+            )
             maybe_debug_print_replay(
                 enabled=self.replay_cfg.get("debug", False),
                 mode=replay_mode,
