@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require non-empty target-box token mappings and finite target mass metrics for every layer.",
     )
+    parser.add_argument(
+        "--require-scalar-raw",
+        action="store_true",
+        help="In scalar mode, require compact per-query scalar NPZ dumps and validate summary metrics from them.",
+    )
     return parser
 
 
@@ -137,6 +142,12 @@ def metric_matches(observed: Any, expected: float, atol: float) -> bool:
     return bool(np.isfinite(observed_float) and np.isfinite(expected) and abs(observed_float - expected) <= atol)
 
 
+def scalar_mean_matches(observed: Any, values: np.ndarray, atol: float) -> bool:
+    if values.size == 0:
+        return False
+    return metric_matches(observed, float(np.asarray(values, dtype=np.float64).mean()), atol)
+
+
 def validate(
     output_dir: Path,
     *,
@@ -144,6 +155,7 @@ def validate(
     row_sum_atol: float,
     metric_atol: float,
     require_target_box: bool,
+    require_scalar_raw: bool,
 ) -> dict[str, Any]:
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     checks: list[dict[str, Any]] = []
@@ -229,6 +241,117 @@ def validate(
                 )
             for layer in payload["layers"]:
                 layer_name = f"{case['case_id']} {transform} L{layer['layer']}"
+                dump_mode = str(layer.get("dump_mode", "full"))
+                if dump_mode == "scalar":
+                    query_count = int(layer.get("query_count", 0) or 0)
+                    image1_key_count = int(layer.get("image1_key_count", 0) or 0)
+                    image2_key_count = int(layer.get("image2_key_count", 0) or 0)
+                    text_key_count = int(layer.get("text_key_count", 0) or 0)
+                    scalar_detail = {
+                        "query_count": query_count,
+                        "image1_key_count": image1_key_count,
+                        "text_key_count": text_key_count,
+                        "image2_key_count": image2_key_count,
+                        "mean_image1_mass_raw": layer.get("mean_image1_mass_raw"),
+                        "mean_text_mass_raw": layer.get("mean_text_mass_raw"),
+                        "mean_image2_mass_raw": layer.get("mean_image2_mass_raw"),
+                        "mass_total_mean": layer.get("mass_total_mean"),
+                        "mass_total_max": layer.get("mass_total_max"),
+                        "scalar_npz_path": layer.get("scalar_npz_path", ""),
+                    }
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} scalar_counts",
+                        query_count == image2_tokens
+                        and image1_key_count == image1_tokens
+                        and image2_key_count == image2_tokens
+                        and text_key_count >= 0,
+                        scalar_detail,
+                    )
+                    scalar_finite = (
+                        is_finite_number(layer.get("mean_image1_mass_raw"))
+                        and is_finite_number(layer.get("mean_text_mass_raw"))
+                        and is_finite_number(layer.get("mean_image2_mass_raw"))
+                        and is_finite_number(layer.get("mass_total_mean"))
+                        and is_finite_number(layer.get("mass_total_max"))
+                    )
+                    add_check(checks, failures, f"{layer_name} scalar_finite", scalar_finite, scalar_detail)
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} scalar_mass_leq_one",
+                        float(layer.get("mass_total_max", 9.0)) <= 1.0 + row_sum_atol,
+                        scalar_detail,
+                    )
+                    scalar_npz_rel = str(layer.get("scalar_npz_path", "") or "")
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} scalar_raw_present",
+                        bool(scalar_npz_rel) or not require_scalar_raw,
+                        scalar_detail,
+                    )
+                    if scalar_npz_rel:
+                        scalar_npz_path = output_dir / scalar_npz_rel
+                        scalar_data = np.load(scalar_npz_path)
+                        image1_mass = np.asarray(scalar_data["image1_mass_raw"], dtype=np.float32)
+                        text_mass = np.asarray(scalar_data["text_mass_raw"], dtype=np.float32)
+                        image2_mass = np.asarray(scalar_data["image2_mass_raw"], dtype=np.float32)
+                        query_rows = np.asarray(scalar_data["query_rows"], dtype=np.int32)
+                        query_cols = np.asarray(scalar_data["query_cols"], dtype=np.int32)
+                        raw_total = image1_mass + text_mass + image2_mass
+                        raw_detail = {
+                            **scalar_detail,
+                            "image1_mass_shape": list(image1_mass.shape),
+                            "text_mass_shape": list(text_mass.shape),
+                            "image2_mass_shape": list(image2_mass.shape),
+                            "query_rows_shape": list(query_rows.shape),
+                            "query_cols_shape": list(query_cols.shape),
+                            "raw_total_max": float(raw_total.max()) if raw_total.size else None,
+                        }
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} scalar_raw_shapes",
+                            image1_mass.shape == (image2_tokens,)
+                            and text_mass.shape == (image2_tokens,)
+                            and image2_mass.shape == (image2_tokens,)
+                            and query_rows.shape == (image2_tokens,)
+                            and query_cols.shape == (image2_tokens,),
+                            raw_detail,
+                        )
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} scalar_raw_finite",
+                            bool(
+                                np.isfinite(image1_mass).all()
+                                and np.isfinite(text_mass).all()
+                                and np.isfinite(image2_mass).all()
+                            ),
+                            raw_detail,
+                        )
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} scalar_raw_metrics_match",
+                            scalar_mean_matches(layer.get("mean_image1_mass_raw"), image1_mass, metric_atol)
+                            and scalar_mean_matches(layer.get("mean_text_mass_raw"), text_mass, metric_atol)
+                            and scalar_mean_matches(layer.get("mean_image2_mass_raw"), image2_mass, metric_atol)
+                            and metric_matches(layer.get("mass_total_max"), float(raw_total.max()), metric_atol),
+                            raw_detail,
+                        )
+                    if require_target_box:
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} target_box_requires_full_dump",
+                            False,
+                            "scalar mode does not preserve I2xI1 matrices needed for target-box metrics",
+                        )
+                    continue
+
                 npz_path = output_dir / layer["npz_path"]
                 data = np.load(npz_path)
                 matrix_norm = np.asarray(data["matrix_norm"], dtype=np.float32)
@@ -410,6 +533,7 @@ def main() -> int:
         row_sum_atol=args.row_sum_atol,
         metric_atol=args.metric_atol,
         require_target_box=args.require_target_box,
+        require_scalar_raw=args.require_scalar_raw,
     )
     (output_dir / "smoke_validation.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",

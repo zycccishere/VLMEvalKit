@@ -14,6 +14,8 @@ METRIC_COLUMNS = [
     "mean_image1_mass_raw",
     "mean_text_mass_raw",
     "mean_image2_mass_raw",
+    "mass_total_mean",
+    "mass_total_max",
     "position_band_mass",
     "content_band_mass",
     "expected_position_distance",
@@ -77,7 +79,22 @@ def flatten_rows(input_dir: Path, summary: dict[str, Any]) -> list[dict[str, Any
                     "policy": case.get("policy"),
                     "transform": transform,
                     "layer": int(layer_payload["layer"]),
-                    "npz_path": str(input_dir / layer_payload["npz_path"]),
+                    "dump_mode": layer_payload.get("dump_mode", summary.get("dump_mode", "full")),
+                    "npz_path": (
+                        str(input_dir / layer_payload["npz_path"])
+                        if layer_payload.get("npz_path")
+                        else ""
+                    ),
+                    "scalar_npz_path": (
+                        str(input_dir / layer_payload["scalar_npz_path"])
+                        if layer_payload.get("scalar_npz_path")
+                        else ""
+                    ),
+                    "query_count": int(layer_payload.get("query_count", 0) or 0),
+                    "image1_key_count": int(layer_payload.get("image1_key_count", 0) or 0),
+                    "text_key_count": int(layer_payload.get("text_key_count", 0) or 0),
+                    "image2_key_count": int(layer_payload.get("image2_key_count", 0) or 0),
+                    "scalar_query_chunk_size": int(layer_payload.get("scalar_query_chunk_size", 0) or 0),
                     "processed_shift_pixels": finite_float(shift.get("processed_shift_pixels", 0.0)),
                     "dx": finite_float(shift.get("dx", 0.0)),
                     "dy": finite_float(shift.get("dy", 0.0)),

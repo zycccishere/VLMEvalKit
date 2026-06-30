@@ -30,6 +30,7 @@ from qwen25vl_image2_probe import (  # noqa: E402
     build_replayed_content,
     eager_attention_forward,
     find_image_spans,
+    find_mid_text_positions,
     load_model_and_processor,
     parse_attention_layers,
     repeat_kv,
@@ -89,6 +90,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--band-radius", type=int, default=1)
     parser.add_argument("--qwen-min-pixels", type=int, default=QWEN_DEFAULT_MIN_PIXELS)
     parser.add_argument("--qwen-max-pixels", type=int, default=QWEN_DEFAULT_MAX_PIXELS)
+    parser.add_argument(
+        "--dump-mode",
+        default="full",
+        choices=["full", "scalar"],
+        help=(
+            "full preserves the historical matrix npz dump; scalar only records aggregated "
+            "I2->I1/text/I2 mass to keep large runs memory- and disk-light."
+        ),
+    )
+    parser.add_argument(
+        "--scalar-raw-dump-limit",
+        type=int,
+        default=0,
+        help=(
+            "In scalar mode, save compact per-query mass arrays for the first N local cases. "
+            "Use this only for smoke validation."
+        ),
+    )
+    parser.add_argument(
+        "--scalar-query-chunk-size",
+        type=int,
+        default=256,
+        help=(
+            "In scalar mode, compute selected I2-query attention in chunks to reduce peak VRAM. "
+            "Use <=0 to process all I2 queries at once."
+        ),
+    )
     return parser
 
 
@@ -408,8 +436,16 @@ def unique_transforms(case: dict[str, Any], requested: list[str]) -> list[str]:
 
 
 class QwenTransformPairFlowTracer:
-    def __init__(self, attn_modules: dict[int, Any]):
+    def __init__(
+        self,
+        attn_modules: dict[int, Any],
+        *,
+        store_blocks: bool = True,
+        scalar_query_chunk_size: int = 256,
+    ):
         self.attn_modules = attn_modules
+        self.store_blocks = bool(store_blocks)
+        self.scalar_query_chunk_size = int(scalar_query_chunk_size)
         self.original_forward: dict[int, Any] = {}
         self.records: list[dict[str, Any]] = []
         self.query_positions: list[int] = []
@@ -481,47 +517,123 @@ class QwenTransformPairFlowTracer:
                 key_states_for_scores = repeat_kv(key_states, module.num_key_value_groups)
 
                 if q_len > 1 and tracer.query_positions:
-                    query_index_tensor = torch.as_tensor(
-                        tracer.query_positions,
-                        device=query_states.device,
-                        dtype=torch.long,
-                    )
-                    query_slice = torch.index_select(query_states, dim=2, index=query_index_tensor)
-                    scores = torch.matmul(query_slice, key_states_for_scores.transpose(2, 3)) * module.scaling
-                    if attention_mask is not None:
-                        selected_mask = attention_mask[:, :, tracer.query_positions, : key_states_for_scores.shape[-2]]
-                        scores = scores + selected_mask
-                    key_position_tensor = torch.arange(
-                        key_states_for_scores.shape[-2],
-                        device=query_states.device,
-                        dtype=torch.long,
-                    )
-                    causal_block = key_position_tensor.view(1, 1, 1, -1) > query_index_tensor.view(1, 1, -1, 1)
-                    scores = scores.masked_fill(causal_block, torch.finfo(scores.dtype).min)
-                    attn_sel = F.softmax(scores, dim=-1, dtype=torch.float32)
-                    mean_attn = attn_sel.mean(dim=1).squeeze(0)
-                    tracer.records.append(
-                        {
-                            "layer": int(_layer_idx),
-                            "image1_block": mean_attn[:, tracer.image1_positions].detach().cpu().numpy(),
-                            "image2_block": (
-                                mean_attn[:, tracer.image2_positions].detach().cpu().numpy()
-                                if tracer.image2_positions
-                                else np.zeros((len(tracer.query_positions), 0), dtype=np.float32)
-                            ),
-                            "image1_mass_raw": mean_attn[:, tracer.image1_positions].sum(dim=-1).detach().cpu().numpy(),
-                            "text_mass_raw": (
-                                mean_attn[:, tracer.text_positions].sum(dim=-1).detach().cpu().numpy()
-                                if tracer.text_positions
-                                else np.zeros((len(tracer.query_positions),), dtype=np.float32)
-                            ),
-                            "image2_mass_raw": (
-                                mean_attn[:, tracer.image2_positions].sum(dim=-1).detach().cpu().numpy()
-                                if tracer.image2_positions
-                                else np.zeros((len(tracer.query_positions),), dtype=np.float32)
-                            ),
+                    def summarize_query_chunk(query_positions: list[int]) -> dict[str, Any]:
+                        query_index_tensor = torch.as_tensor(
+                            query_positions,
+                            device=query_states.device,
+                            dtype=torch.long,
+                        )
+                        query_slice = torch.index_select(query_states, dim=2, index=query_index_tensor)
+                        scores = torch.matmul(query_slice, key_states_for_scores.transpose(2, 3)) * module.scaling
+                        if attention_mask is not None:
+                            selected_mask = torch.index_select(
+                                attention_mask[:, :, :, : key_states_for_scores.shape[-2]],
+                                dim=2,
+                                index=query_index_tensor,
+                            )
+                            scores = scores + selected_mask
+                        key_position_tensor = torch.arange(
+                            key_states_for_scores.shape[-2],
+                            device=query_states.device,
+                            dtype=torch.long,
+                        )
+                        causal_block = key_position_tensor.view(1, 1, 1, -1) > query_index_tensor.view(1, 1, -1, 1)
+                        scores = scores.masked_fill(causal_block, torch.finfo(scores.dtype).min)
+                        attn_sel = F.softmax(scores, dim=-1, dtype=torch.float32)
+                        mean_attn = attn_sel.mean(dim=1).squeeze(0)
+
+                        image1_index = torch.as_tensor(
+                            tracer.image1_positions,
+                            device=mean_attn.device,
+                            dtype=torch.long,
+                        )
+                        image1_block = torch.index_select(mean_attn, dim=1, index=image1_index)
+                        image1_mass_raw = image1_block.sum(dim=-1)
+
+                        if tracer.text_positions:
+                            text_index = torch.as_tensor(
+                                tracer.text_positions,
+                                device=mean_attn.device,
+                                dtype=torch.long,
+                            )
+                            text_mass_raw = torch.index_select(mean_attn, dim=1, index=text_index).sum(dim=-1)
+                        else:
+                            text_mass_raw = torch.zeros(
+                                (len(query_positions),),
+                                device=mean_attn.device,
+                                dtype=mean_attn.dtype,
+                            )
+
+                        if tracer.image2_positions:
+                            image2_index = torch.as_tensor(
+                                tracer.image2_positions,
+                                device=mean_attn.device,
+                                dtype=torch.long,
+                            )
+                            image2_block = torch.index_select(mean_attn, dim=1, index=image2_index)
+                            image2_mass_raw = image2_block.sum(dim=-1)
+                        else:
+                            image2_block = None
+                            image2_mass_raw = torch.zeros(
+                                (len(query_positions),),
+                                device=mean_attn.device,
+                                dtype=mean_attn.dtype,
+                            )
+
+                        chunk_payload: dict[str, Any] = {
+                            "image1_mass_raw": image1_mass_raw.detach().cpu().numpy(),
+                            "text_mass_raw": text_mass_raw.detach().cpu().numpy(),
+                            "image2_mass_raw": image2_mass_raw.detach().cpu().numpy(),
                         }
-                    )
+                        if tracer.store_blocks:
+                            chunk_payload["image1_block"] = image1_block.detach().cpu().numpy()
+                            chunk_payload["image2_block"] = (
+                                image2_block.detach().cpu().numpy()
+                                if image2_block is not None
+                                else np.zeros((len(query_positions), 0), dtype=np.float32)
+                            )
+                        return chunk_payload
+
+                    if tracer.store_blocks or tracer.scalar_query_chunk_size <= 0:
+                        query_chunks = [tracer.query_positions]
+                    else:
+                        chunk_size = max(1, int(tracer.scalar_query_chunk_size))
+                        query_chunks = [
+                            tracer.query_positions[start : start + chunk_size]
+                            for start in range(0, len(tracer.query_positions), chunk_size)
+                        ]
+                    chunk_payloads = [summarize_query_chunk(chunk) for chunk in query_chunks if chunk]
+
+                    payload = {
+                        "layer": int(_layer_idx),
+                        "query_count": int(len(tracer.query_positions)),
+                        "image1_key_count": int(len(tracer.image1_positions)),
+                        "text_key_count": int(len(tracer.text_positions)),
+                        "image2_key_count": int(len(tracer.image2_positions)),
+                        "scalar_query_chunk_size": int(tracer.scalar_query_chunk_size),
+                        "image1_mass_raw": np.concatenate(
+                            [chunk["image1_mass_raw"] for chunk in chunk_payloads],
+                            axis=0,
+                        ),
+                        "text_mass_raw": np.concatenate(
+                            [chunk["text_mass_raw"] for chunk in chunk_payloads],
+                            axis=0,
+                        ),
+                        "image2_mass_raw": np.concatenate(
+                            [chunk["image2_mass_raw"] for chunk in chunk_payloads],
+                            axis=0,
+                        ),
+                    }
+                    if tracer.store_blocks:
+                        payload["image1_block"] = np.concatenate(
+                            [chunk["image1_block"] for chunk in chunk_payloads],
+                            axis=0,
+                        )
+                        payload["image2_block"] = np.concatenate(
+                            [chunk["image2_block"] for chunk in chunk_payloads],
+                            axis=0,
+                        )
+                    tracer.records.append(payload)
 
                 attention_interface = eager_attention_forward
                 if module.config._attn_implementation != "eager":
@@ -572,7 +684,11 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_dir = output_dir / "npz"
-    npz_dir.mkdir(parents=True, exist_ok=True)
+    if args.dump_mode == "full":
+        npz_dir.mkdir(parents=True, exist_ok=True)
+    scalar_npz_dir = output_dir / "scalar_npz"
+    if args.dump_mode == "scalar" and args.scalar_raw_dump_limit > 0:
+        scalar_npz_dir.mkdir(parents=True, exist_ok=True)
 
     processor, model = load_model_and_processor(args.model_path, args.device)
     input_device = resolve_input_device(model, args.device)
@@ -582,7 +698,9 @@ def main() -> int:
 
     selected_layers = parse_attention_layers(args.attn_layers, len(model.model.language_model.layers))
     tracer = QwenTransformPairFlowTracer(
-        {layer_idx: model.model.language_model.layers[layer_idx].self_attn for layer_idx in selected_layers}
+        {layer_idx: model.model.language_model.layers[layer_idx].self_attn for layer_idx in selected_layers},
+        store_blocks=args.dump_mode == "full",
+        scalar_query_chunk_size=args.scalar_query_chunk_size,
     )
     tracer.patch()
 
@@ -640,11 +758,13 @@ def main() -> int:
                     )
                 image1_positions = list(range(image_spans[0].start, image_spans[0].end + 1))
                 image2_positions = list(range(image_spans[1].start, image_spans[1].end + 1))
-                text_positions = [
-                    pos
-                    for pos, token_id in enumerate(input_ids)
-                    if pos not in set(image1_positions + image2_positions) and token_id not in special_token_ids
-                ]
+                text_positions = find_mid_text_positions(input_ids, image_spans, special_token_ids)
+                if not text_positions:
+                    text_positions = [
+                        pos
+                        for pos in range(image_spans[0].end + 1, image_spans[1].start)
+                        if input_ids[pos] not in special_token_ids
+                    ]
 
                 grid_metas = extract_image_grid_meta(model_inputs["image_grid_thw"], spatial_merge_size=spatial_merge_size)
                 if len(grid_metas) != 2:
@@ -700,58 +820,127 @@ def main() -> int:
                 layer_summaries: list[dict[str, Any]] = []
                 for record in tracer.records:
                     layer = int(record["layer"])
-                    raw_block = np.asarray(record["image1_block"], dtype=np.float32)
-                    image2_block = np.asarray(record["image2_block"], dtype=np.float32)
-                    norm_block = normalize_rows(raw_block)
                     image1_mass_raw = np.asarray(record["image1_mass_raw"], dtype=np.float32)
                     text_mass_raw = np.asarray(record["text_mass_raw"], dtype=np.float32)
                     image2_mass_raw = np.asarray(record["image2_mass_raw"], dtype=np.float32)
-                    profile = distance_profile(norm_block, cheb_dist)
-                    content_profile = distance_profile(norm_block, content_cheb_dist)
-                    self_summary = i2_self_flow_summary(image2_block, query_rows, query_cols, args.band_radius)
-                    target_summary = target_mass_summary(
-                        matrix_norm=norm_block,
-                        image_size=base_image_size,
-                        key_grid_meta=grid_metas[0],
-                        query_grid_meta=grid_metas[1],
-                        transform_record=transform_record,
-                        target_box_xyxy=case.get("target_box_xyxy"),
-                        distractor_box_xyxy=case.get("distractor_box_xyxy"),
+                    mass_total = (
+                        np.asarray(image1_mass_raw, dtype=np.float64)
+                        + np.asarray(text_mass_raw, dtype=np.float64)
+                        + np.asarray(image2_mass_raw, dtype=np.float64)
                     )
-                    npz_rel = Path("npz") / f"{case['id']}__{transform}__layer{layer}.npz"
-                    np.savez_compressed(
-                        output_dir / npz_rel,
-                        matrix_raw=safe_float16(raw_block),
-                        matrix_norm=safe_float16(norm_block),
-                        image2_block_raw=safe_float16(image2_block),
-                        image1_mass_raw=safe_float16(image1_mass_raw),
-                        text_mass_raw=safe_float16(text_mass_raw),
-                        image2_mass_raw=safe_float16(image2_mass_raw),
-                        query_rows=query_rows.astype(np.int16),
-                        query_cols=query_cols.astype(np.int16),
-                        key_rows=key_rows.astype(np.int16),
-                        key_cols=key_cols.astype(np.int16),
-                    )
-                    layer_summaries.append(
-                        {
-                            "layer": layer,
-                            "npz_path": str(npz_rel),
-                            "position_band_mass": local_correspondence_band_mass(norm_block, cheb_dist, args.band_radius),
-                            "local_correspondence_band_mass": local_correspondence_band_mass(norm_block, cheb_dist, args.band_radius),
-                            "content_band_mass": local_correspondence_band_mass(norm_block, content_cheb_dist, args.band_radius),
-                            "expected_position_distance": expected_distance_from_diagonal(norm_block, euclid_dist),
-                            "expected_content_distance": expected_distance_from_diagonal(norm_block, content_euclid_dist),
-                            "expected_distance_from_diagonal": expected_distance_from_diagonal(norm_block, euclid_dist),
-                            "row_entropy": row_entropy(norm_block),
-                            "mean_image1_mass_raw": float(np.asarray(image1_mass_raw, dtype=np.float64).mean()),
-                            "mean_text_mass_raw": float(np.asarray(text_mass_raw, dtype=np.float64).mean()),
-                            "mean_image2_mass_raw": float(np.asarray(image2_mass_raw, dtype=np.float64).mean()),
-                            **self_summary,
-                            **target_summary,
-                            "distance_profile": profile,
-                            "content_distance_profile": content_profile,
-                        }
-                    )
+
+                    if args.dump_mode == "full":
+                        raw_block = np.asarray(record["image1_block"], dtype=np.float32)
+                        image2_block = np.asarray(record["image2_block"], dtype=np.float32)
+                        norm_block = normalize_rows(raw_block)
+                        profile = distance_profile(norm_block, cheb_dist)
+                        content_profile = distance_profile(norm_block, content_cheb_dist)
+                        self_summary = i2_self_flow_summary(image2_block, query_rows, query_cols, args.band_radius)
+                        target_summary = target_mass_summary(
+                            matrix_norm=norm_block,
+                            image_size=base_image_size,
+                            key_grid_meta=grid_metas[0],
+                            query_grid_meta=grid_metas[1],
+                            transform_record=transform_record,
+                            target_box_xyxy=case.get("target_box_xyxy"),
+                            distractor_box_xyxy=case.get("distractor_box_xyxy"),
+                        )
+                        npz_rel = Path("npz") / f"{case['id']}__{transform}__layer{layer}.npz"
+                        np.savez_compressed(
+                            output_dir / npz_rel,
+                            matrix_raw=safe_float16(raw_block),
+                            matrix_norm=safe_float16(norm_block),
+                            image2_block_raw=safe_float16(image2_block),
+                            image1_mass_raw=safe_float16(image1_mass_raw),
+                            text_mass_raw=safe_float16(text_mass_raw),
+                            image2_mass_raw=safe_float16(image2_mass_raw),
+                            query_rows=query_rows.astype(np.int16),
+                            query_cols=query_cols.astype(np.int16),
+                            key_rows=key_rows.astype(np.int16),
+                            key_cols=key_cols.astype(np.int16),
+                        )
+                        layer_summaries.append(
+                            {
+                                "layer": layer,
+                                "dump_mode": "full",
+                                "npz_path": str(npz_rel),
+                                "query_count": int(record.get("query_count", len(image2_positions))),
+                                "image1_key_count": int(record.get("image1_key_count", len(image1_positions))),
+                                "text_key_count": int(record.get("text_key_count", len(text_positions))),
+                                "image2_key_count": int(record.get("image2_key_count", len(image2_positions))),
+                                "scalar_query_chunk_size": int(record.get("scalar_query_chunk_size", 0)),
+                                "position_band_mass": local_correspondence_band_mass(norm_block, cheb_dist, args.band_radius),
+                                "local_correspondence_band_mass": local_correspondence_band_mass(norm_block, cheb_dist, args.band_radius),
+                                "content_band_mass": local_correspondence_band_mass(norm_block, content_cheb_dist, args.band_radius),
+                                "expected_position_distance": expected_distance_from_diagonal(norm_block, euclid_dist),
+                                "expected_content_distance": expected_distance_from_diagonal(norm_block, content_euclid_dist),
+                                "expected_distance_from_diagonal": expected_distance_from_diagonal(norm_block, euclid_dist),
+                                "row_entropy": row_entropy(norm_block),
+                                "mean_image1_mass_raw": float(np.asarray(image1_mass_raw, dtype=np.float64).mean()),
+                                "mean_text_mass_raw": float(np.asarray(text_mass_raw, dtype=np.float64).mean()),
+                                "mean_image2_mass_raw": float(np.asarray(image2_mass_raw, dtype=np.float64).mean()),
+                                "mass_total_mean": float(mass_total.mean()) if mass_total.size else float("nan"),
+                                "mass_total_max": float(mass_total.max()) if mass_total.size else float("nan"),
+                                **self_summary,
+                                **target_summary,
+                                "distance_profile": profile,
+                                "content_distance_profile": content_profile,
+                            }
+                        )
+                    else:
+                        scalar_npz_rel = ""
+                        if args.scalar_raw_dump_limit > 0 and case_idx < args.scalar_raw_dump_limit:
+                            scalar_npz_rel_path = Path("scalar_npz") / f"{case['id']}__{transform}__layer{layer}.npz"
+                            np.savez_compressed(
+                                output_dir / scalar_npz_rel_path,
+                                image1_mass_raw=safe_float16(image1_mass_raw),
+                                text_mass_raw=safe_float16(text_mass_raw),
+                                image2_mass_raw=safe_float16(image2_mass_raw),
+                                query_rows=query_rows.astype(np.int16),
+                                query_cols=query_cols.astype(np.int16),
+                            )
+                            scalar_npz_rel = str(scalar_npz_rel_path)
+                        layer_summaries.append(
+                            {
+                                "layer": layer,
+                                "dump_mode": "scalar",
+                                "npz_path": "",
+                                "scalar_npz_path": scalar_npz_rel,
+                                "query_count": int(record.get("query_count", len(image2_positions))),
+                                "image1_key_count": int(record.get("image1_key_count", len(image1_positions))),
+                                "text_key_count": int(record.get("text_key_count", len(text_positions))),
+                                "image2_key_count": int(record.get("image2_key_count", len(image2_positions))),
+                                "scalar_query_chunk_size": int(record.get("scalar_query_chunk_size", 0)),
+                                "position_band_mass": float("nan"),
+                                "local_correspondence_band_mass": float("nan"),
+                                "content_band_mass": float("nan"),
+                                "expected_position_distance": float("nan"),
+                                "expected_content_distance": float("nan"),
+                                "expected_distance_from_diagonal": float("nan"),
+                                "row_entropy": float("nan"),
+                                "mean_image1_mass_raw": float(np.asarray(image1_mass_raw, dtype=np.float64).mean()),
+                                "mean_text_mass_raw": float(np.asarray(text_mass_raw, dtype=np.float64).mean()),
+                                "mean_image2_mass_raw": float(np.asarray(image2_mass_raw, dtype=np.float64).mean()),
+                                "mass_total_mean": float(mass_total.mean()) if mass_total.size else float("nan"),
+                                "mass_total_max": float(mass_total.max()) if mass_total.size else float("nan"),
+                                "i2_total_self_mass_raw": float(np.asarray(image2_mass_raw, dtype=np.float64).mean()),
+                                "i2_past_self_mass_raw": float("nan"),
+                                "i2_diag_self_mass_raw": float("nan"),
+                                "i2_local_self_mass_raw": float("nan"),
+                                "i2_local_self_ratio": float("nan"),
+                                "target_key_token_indices": [],
+                                "target_query_token_indices": [],
+                                "content_shifted_target_query_token_indices": [],
+                                "distractor_key_token_indices": [],
+                                "target_mass_norm_all_queries": float("nan"),
+                                "target_mass_norm_target_queries": float("nan"),
+                                "target_mass_norm_content_shifted_target_queries": float("nan"),
+                                "distractor_mass_norm_all_queries": float("nan"),
+                                "target_minus_distractor_mass": float("nan"),
+                                "distance_profile": [],
+                                "content_distance_profile": [],
+                            }
+                        )
                 layer_results[transform] = sorted(layer_summaries, key=lambda item: item["layer"])
                 tracer.reset()
 
@@ -799,6 +988,9 @@ def main() -> int:
         "attn_layers": args.attn_layers,
         "selected_layers": selected_layers,
         "transforms": args.transforms,
+        "dump_mode": args.dump_mode,
+        "scalar_raw_dump_limit": int(args.scalar_raw_dump_limit),
+        "scalar_query_chunk_size": int(args.scalar_query_chunk_size),
         "band_radius": args.band_radius,
         "qwen_min_pixels": args.qwen_min_pixels,
         "qwen_max_pixels": args.qwen_max_pixels,

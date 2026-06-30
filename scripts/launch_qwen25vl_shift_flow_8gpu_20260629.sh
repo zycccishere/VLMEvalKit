@@ -9,6 +9,9 @@ ATTN_LAYERS=${ATTN_LAYERS:-last4}
 MODE=${MODE:-image_text_image}
 POLICY=${POLICY:-identity}
 TRANSFORMS=${TRANSFORMS:-shift_right_half_vit_token shift_right_one_vit_token shift_right_one_llm_token}
+DUMP_MODE=${DUMP_MODE:-full}
+SCALAR_RAW_DUMP_LIMIT=${SCALAR_RAW_DUMP_LIMIT:-0}
+SCALAR_QUERY_CHUNK_SIZE=${SCALAR_QUERY_CHUNK_SIZE:-256}
 
 mkdir -p "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/shards"
 
@@ -58,6 +61,9 @@ for rank in "${!GPU_LIST[@]}"; do
       --mode "${MODE}" \
       --policy "${POLICY}" \
       --attn-layers "${ATTN_LAYERS}" \
+      --dump-mode "${DUMP_MODE}" \
+      --scalar-raw-dump-limit "${SCALAR_RAW_DUMP_LIMIT}" \
+      --scalar-query-chunk-size "${SCALAR_QUERY_CHUNK_SIZE}" \
       --transforms ${TRANSFORMS}
   ) > "${OUTPUT_DIR}/logs/rank_${rank}.log" 2>&1 &
   pid=$!
