@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MANIFEST=${1:?manifest json path}
+OUTPUT_DIR=${2:?output dir}
+MODEL_FAMILY=${MODEL_FAMILY:?set MODEL_FAMILY to gemma3, minicpm-v-4_5, or minicpm-o-4_5}
+MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the HF checkpoint path}
+GPUS=${GPUS:-0,1,2,3,4,5,6,7}
+ATTN_LAYERS=${ATTN_LAYERS:-last}
+MODE=${MODE:-image_text_image}
+POLICY=${POLICY:-identity}
+TRANSFORMS=${TRANSFORMS:-shift_right_half_vit_token shift_right_one_vit_token shift_right_one_llm_token}
+SCALAR_RAW_DUMP_LIMIT=${SCALAR_RAW_DUMP_LIMIT:-0}
+SCALAR_QUERY_CHUNK_SIZE=${SCALAR_QUERY_CHUNK_SIZE:-256}
+MINICPM_MAX_SLICE_NUMS=${MINICPM_MAX_SLICE_NUMS:-1}
+
+mkdir -p "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/shards"
+
+python - "${MANIFEST}" "${OUTPUT_DIR}/shards" "${GPUS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+shard_dir = Path(sys.argv[2])
+gpus = [item for item in sys.argv[3].split(",") if item]
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+if not isinstance(data, list):
+    raise SystemExit(f"manifest must be a JSON list: {manifest_path}")
+manifest_base = manifest_path.resolve().parent
+shards = [[] for _ in gpus]
+for idx, item in enumerate(data):
+    copied = dict(item)
+    if copied.get("image"):
+        image_path = Path(str(copied["image"]))
+        if not image_path.is_absolute():
+            copied["image"] = str((manifest_base / image_path).resolve())
+    shards[idx % len(gpus)].append(copied)
+for rank, items in enumerate(shards):
+    path = shard_dir / f"shard_{rank}.json"
+    path.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"{rank}\t{gpus[rank]}\t{path}\t{len(items)}")
+PY
+
+IFS=',' read -r -a GPU_LIST <<< "${GPUS}"
+PIDS=()
+RANK_DIRS=()
+for rank in "${!GPU_LIST[@]}"; do
+  gpu="${GPU_LIST[$rank]}"
+  shard="${OUTPUT_DIR}/shards/shard_${rank}.json"
+  rank_dir="${OUTPUT_DIR}/rank_${rank}"
+  mkdir -p "${rank_dir}"
+  RANK_DIRS+=("${rank_dir}")
+  (
+    export CUDA_VISIBLE_DEVICES="${gpu}"
+    export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+    python scripts/hf_shift_flow_probe_20260701.py \
+      --model-family "${MODEL_FAMILY}" \
+      --model-path "${MODEL_PATH}" \
+      --manifest "${shard}" \
+      --output-dir "${rank_dir}" \
+      --device cuda:0 \
+      --mode "${MODE}" \
+      --policy "${POLICY}" \
+      --attn-layers "${ATTN_LAYERS}" \
+      --scalar-raw-dump-limit "${SCALAR_RAW_DUMP_LIMIT}" \
+      --scalar-query-chunk-size "${SCALAR_QUERY_CHUNK_SIZE}" \
+      --minicpm-max-slice-nums "${MINICPM_MAX_SLICE_NUMS}" \
+      --transforms ${TRANSFORMS}
+  ) > "${OUTPUT_DIR}/logs/rank_${rank}.log" 2>&1 &
+  pid=$!
+  PIDS+=("${pid}")
+  echo "${pid}" > "${OUTPUT_DIR}/logs/rank_${rank}.pid"
+  echo "launched rank=${rank} gpu=${gpu} pid=${pid} shard=${shard}"
+done
+
+status=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "${pid}"; then
+    status=1
+  fi
+done
+
+if [[ "${status}" != "0" ]]; then
+  echo "One or more ranks failed. See ${OUTPUT_DIR}/logs" >&2
+  exit "${status}"
+fi
+
+python scripts/analyze_qwen25vl_shift_flow_20260629.py \
+  --output-dir "${OUTPUT_DIR}/analysis" \
+  --input-dirs "${RANK_DIRS[@]}"
+
+echo "done: ${OUTPUT_DIR}"
