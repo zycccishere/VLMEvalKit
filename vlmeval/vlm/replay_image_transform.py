@@ -58,6 +58,15 @@ IMAGE_TRANSFORM_PROFILES = {
         "spatial_merge_size": 4,
         "llm_token_stride": 56,
     },
+    "minicpm45": {
+        "model_family": "minicpm45",
+        "record_prefix": "minicpm45",
+        "resize_mode": "minicpm_smart",
+        "scale_resolution": 448,
+        "vit_patch_size": 14,
+        "spatial_merge_size": 4,
+        "llm_token_stride": 56,
+    },
 }
 
 SUPPORTED_IMAGE_TRANSFORMS = {
@@ -129,6 +138,8 @@ def resolve_image_transform_profile(model_family: str | None = None) -> dict[str
     raw = raw.replace("-", "_").replace(".", "_")
     if "gemma3" in raw or "gemma_3" in raw:
         key = "gemma3"
+    elif "minicpm" in raw:
+        key = "minicpm45"
     elif "qwen" in raw:
         key = "qwen2_5_vl"
     else:
@@ -401,6 +412,26 @@ def _resize_to_profile_processed_size(
             "llm_grid_h": max(1, size // llm_token_stride),
             "llm_grid_w": max(1, size // llm_token_stride),
         }
+    if profile.get("resize_mode") == "minicpm_smart":
+        scale_resolution = int(profile.get("scale_resolution", 448))
+        vit_patch_size = int(profile["vit_patch_size"])
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ValueError("MiniCPM smart resize requires positive image dimensions.")
+        ratio = float(width) / float(height)
+        resized_height = int(scale_resolution / math.sqrt(ratio))
+        resized_width = int(resized_height * ratio)
+        resized_width = max(round(resized_width / vit_patch_size) * vit_patch_size, vit_patch_size)
+        resized_height = max(round(resized_height / vit_patch_size) * vit_patch_size, vit_patch_size)
+        resized = image.resize((resized_width, resized_height), resample=Image.Resampling.BICUBIC)
+        return resized, {
+            "resized_height": int(resized_height),
+            "resized_width": int(resized_width),
+            "vit_grid_h": max(1, int(resized_height // vit_patch_size)),
+            "vit_grid_w": max(1, int(resized_width // vit_patch_size)),
+            "llm_grid_h": 8,
+            "llm_grid_w": 8,
+        }
     if profile.get("model_family") == "qwen2_5_vl":
         return _resize_to_qwen_processed_size(image, min_pixels=min_pixels, max_pixels=max_pixels)
     raise ValueError(f"Unsupported processed-size profile: {profile.get('model_family')}")
@@ -587,6 +618,21 @@ def apply_image_transform_to_content(
             min_pixels=image_item.get("min_pixels"),
             max_pixels=image_item.get("max_pixels"),
         )
+        if profile["model_family"] == "minicpm45":
+            direction = str(shift_spec["direction"])
+            if direction in {"left", "right"}:
+                dynamic_stride = max(1, int(round(process_info["resized_width"] / max(process_info["llm_grid_w"], 1))))
+            else:
+                dynamic_stride = max(1, int(round(process_info["resized_height"] / max(process_info["llm_grid_h"], 1))))
+            shift_spec = dict(shift_spec)
+            shift_spec["llm_visual_token_stride_override"] = int(dynamic_stride)
+            if shift_spec["semantic_unit"] == "llm_visual_token":
+                sign = -1 if direction in {"left", "up"} else 1
+                shift_spec["base_pixels"] = int(dynamic_stride)
+                shift_spec["processed_shift_pixels"] = int(dynamic_stride)
+                shift_spec["dx"] = int(sign * dynamic_stride) if direction in {"left", "right"} else 0
+                shift_spec["dy"] = int(sign * dynamic_stride) if direction in {"up", "down"} else 0
+                shift_spec["minicpm_dynamic_llm_stride"] = True
         dx = int(shift_spec["dx"])
         dy = int(shift_spec["dy"])
         output_image = _shift_image_wrap(processed_image, dx=dx, dy=dy)
@@ -595,6 +641,8 @@ def apply_image_transform_to_content(
             record["qwen_processor_presized"] = True
         if profile["model_family"] == "gemma3":
             record["gemma3_processor_presized"] = True
+        if profile["model_family"] == "minicpm45":
+            record["minicpm45_processor_presized"] = True
         record["processed_image_size_before_shift"] = list(processed_image.size)
         record["shift"] = {
             "dx": dx,
@@ -619,7 +667,7 @@ def apply_image_transform_to_content(
             "processed_llm_grid_w": process_info["llm_grid_w"],
             "vit_patch_size": profile["vit_patch_size"],
             "spatial_merge_size": profile["spatial_merge_size"],
-            "llm_visual_token_stride": profile["llm_token_stride"],
+            "llm_visual_token_stride": shift_spec.get("llm_visual_token_stride_override", profile["llm_token_stride"]),
             "qwen_patch_size": QWEN_PATCH_SIZE,
             "qwen_spatial_merge_size": QWEN_SPATIAL_MERGE_SIZE,
             "qwen_token_stride": QWEN_TOKEN_STRIDE,
@@ -634,6 +682,16 @@ def apply_image_transform_to_content(
                     "gemma3_patch_size": profile["vit_patch_size"],
                     "gemma3_pool_stride": profile["spatial_merge_size"],
                     "gemma3_llm_token_stride": profile["llm_token_stride"],
+                }
+            )
+        if profile["model_family"] == "minicpm45":
+            record["shift"].update(
+                {
+                    "minicpm45_scale_resolution": profile.get("scale_resolution", 448),
+                    "minicpm45_patch_size": profile["vit_patch_size"],
+                    "minicpm45_pool_stride": profile["spatial_merge_size"],
+                    "minicpm45_llm_token_stride": profile["llm_token_stride"],
+                    "minicpm45_dynamic_llm_stride": bool(shift_spec.get("minicpm_dynamic_llm_stride", False)),
                 }
             )
     elif transform.startswith("shift_") and transform.endswith("_real_half_patch_wrap"):
