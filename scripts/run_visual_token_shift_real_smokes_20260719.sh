@@ -4,10 +4,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-export MODEL_ROOT="${MODEL_ROOT:-/user/zyc1781/models}"
-export TOKEN_ROLL_PYTHON="${TOKEN_ROLL_PYTHON:-/root/.venvs/lmms-engine/bin/python}"
-export TOKEN_ROLL_PYDEPS="${TOKEN_ROLL_PYDEPS:-/root/.venvs/vlmevalkit-token-roll-pydeps}"
-export MINICPM_TOKEN_ROLL_PYDEPS="${MINICPM_TOKEN_ROLL_PYDEPS:-/root/.venvs/minicpmo-token-roll-pydeps}"
+TOKEN_ROLL_USER_ROOT="${TOKEN_ROLL_USER_ROOT:-$(dirname "${REPO_ROOT}")}"
+TOKEN_ROLL_RUNTIME_ROOT="${TOKEN_ROLL_RUNTIME_ROOT:-${TOKEN_ROLL_USER_ROOT}/.venvs}"
+export MODEL_ROOT="${MODEL_ROOT:-${TOKEN_ROLL_USER_ROOT}/models}"
+export TOKEN_ROLL_PYTHON="${TOKEN_ROLL_PYTHON:-${TOKEN_ROLL_RUNTIME_ROOT}/lmms-engine/bin/python}"
+export TOKEN_ROLL_PYDEPS="${TOKEN_ROLL_PYDEPS:-${TOKEN_ROLL_RUNTIME_ROOT}/vlmevalkit-token-roll-pydeps}"
+export MINICPM_TOKEN_ROLL_PYDEPS="${MINICPM_TOKEN_ROLL_PYDEPS:-${TOKEN_ROLL_RUNTIME_ROOT}/minicpmo-token-roll-pydeps}"
 export PYTHONPATH="${REPO_ROOT}:${TOKEN_ROLL_PYDEPS}${PYTHONPATH:+:${PYTHONPATH}}"
 export OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/runs/visual_token_shift_real_smoke_20260719_$(date +%Y%m%d_%H%M%S)}"
 

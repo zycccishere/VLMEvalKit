@@ -162,6 +162,8 @@ def load_yaml(path: Path) -> dict[str, Any]:
 
 def format_value(value: Any, repo_root: str) -> Any:
     if isinstance(value, str):
+        token_roll_user_root = str(Path(repo_root).resolve().parent)
+        token_roll_runtime_root = str(Path(token_roll_user_root) / ".venvs")
         mapping = {
             "repo_root": repo_root,
             "model_root": os.environ.get("MODEL_ROOT", "/models"),
@@ -169,15 +171,15 @@ def format_value(value: Any, repo_root: str) -> Any:
             "lmu_data": require_env("LMUData"),
             "token_roll_python": os.environ.get(
                 "TOKEN_ROLL_PYTHON",
-                "/root/.venvs/lmms-engine/bin/python",
+                str(Path(token_roll_runtime_root) / "lmms-engine/bin/python"),
             ),
             "token_roll_pydeps": os.environ.get(
                 "TOKEN_ROLL_PYDEPS",
-                "/root/.venvs/vlmevalkit-token-roll-pydeps",
+                str(Path(token_roll_runtime_root) / "vlmevalkit-token-roll-pydeps"),
             ),
             "minicpm_token_roll_pydeps": os.environ.get(
                 "MINICPM_TOKEN_ROLL_PYDEPS",
-                "/root/.venvs/minicpmo-token-roll-pydeps",
+                str(Path(token_roll_runtime_root) / "minicpmo-token-roll-pydeps"),
             ),
         }
         try:
