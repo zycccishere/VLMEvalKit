@@ -1,3 +1,4 @@
+import contextlib
 import json
 import math
 import os
@@ -27,6 +28,10 @@ from .replay_policy import (
 from .replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
+)
+from .replay_visual_token_shift import (
+    VisualTokenShiftController,
+    visual_token_shift_enabled,
 )
 from ..smp import *
 
@@ -66,6 +71,7 @@ class MiniCPM_V_4_5(BaseModel):
         print(f"load from path {self.model_path}")
         self.kwargs = dict(kwargs)
         self.use_vllm = self.kwargs.pop("use_vllm", _env_truthy("MINICPM45_USE_VLLM", False))
+        self.hf_vision_only = bool(self.kwargs.pop("_hf_vision_only", False))
         self.vllm_tensor_parallel_size = self.kwargs.pop("tensor_parallel_size", None)
         self.vllm_max_model_len = _env_int("MINICPM45_VLLM_MAX_MODEL_LEN", 32768)
         self.vllm_max_num_seqs = _env_int(
@@ -120,7 +126,32 @@ class MiniCPM_V_4_5(BaseModel):
                 flush=True,
             )
         else:
-            self.model = AutoModel.from_pretrained(self.model_path, trust_remote_code=True)
+            hf_load_kwargs = {}
+            if self.hf_vision_only:
+                # Image-only token probes do not use MiniCPM-o's audio or TTS
+                # modules. Keeping them disabled also isolates the visual graph.
+                hf_load_kwargs.update(init_audio=False, init_tts=False)
+            self.model = AutoModel.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                **hf_load_kwargs,
+            )
+            if self.hf_vision_only:
+                image_only_ok = (
+                    self.model.config.init_vision is True
+                    and self.model.config.init_audio is False
+                    and self.model.config.init_tts is False
+                    and hasattr(self.model, "vpm")
+                    and hasattr(self.model, "resampler")
+                    and not hasattr(self.model, "apm")
+                    and not hasattr(self.model, "tts")
+                )
+                if not image_only_ok:
+                    raise RuntimeError(
+                        "MiniCPM HF image-only load did not preserve the expected "
+                        "vision=1 audio=0 tts=0 module topology"
+                    )
+                print("[MiniCPM_V_4_5] HF image-only load: vision=1 audio=0 tts=0", flush=True)
             self.model = self.model.to(dtype=torch.bfloat16)
             self.model.eval().cuda()
         torch.cuda.empty_cache()
@@ -791,7 +822,25 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
     """Replay-enabled MiniCPM-V 4.5 with minimal message-level preprocessing."""
 
     def __init__(self, *args, **kwargs):
+        token_shift_requested = visual_token_shift_enabled()
+        if token_shift_requested:
+            # HF preserves each original image and slice boundary through
+            # get_vision_embedding; the generic vLLM route does not expose it.
+            kwargs["use_vllm"] = False
+            kwargs["_hf_vision_only"] = True
         super().__init__(*args, **kwargs)
+        self.visual_token_shift = VisualTokenShiftController(
+            model_family="minicpm45",
+            model_name=self.model_path,
+        )
+        if self.visual_token_shift.enabled:
+            self.processor = self.visual_token_shift.wrap_minicpm_processor(self.processor)
+            self.visual_token_shift.install_minicpm_hf_hook(self.model)
+            print(
+                f"[MiniCPM_V_4_5_Replay] visual_token_shift={self.visual_token_shift.mode} "
+                f"target_image_position={self.visual_token_shift.target_image_position} backend=hf",
+                flush=True,
+            )
         self.replay_cfg = read_replay_config_from_env()
         self.prompt_template_cfg = read_prompt_template_config_from_env()
         self.template_on_last_replay_text = os.environ.get(
@@ -998,6 +1047,23 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             image_copy_mode=self.replay_cfg.get("image_copy_mode", "reuse_path"),
         )
 
+    def _visual_token_shift_context(self, *, original, replayed, dataset):
+        controller = getattr(self, "visual_token_shift", None)
+        if controller is None or not controller.enabled:
+            return contextlib.nullcontext()
+        topology = controller.validate_and_bind_iqiq_topology(
+            original=original,
+            replayed=replayed,
+            replay_mode=self.replay_cfg["mode"],
+            repeat_times=self.replay_cfg["repeat_times"],
+            image_transform_name=self.image_transform_name,
+        )
+        return controller.sample(
+            dataset=dataset,
+            sample_meta=self._extract_replay_meta(original),
+            topology=topology,
+        )
+
     def generate_inner(self, message, dataset=None):
         trace_active = self._begin_trace_sample()
         replayed = self._apply_replay_pipeline(message, dataset=dataset)
@@ -1014,7 +1080,8 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             after=replayed,
             tag=self.__class__.__name__,
         )
-        return super().generate_inner(replayed, dataset=dataset)
+        with self._visual_token_shift_context(original=message, replayed=replayed, dataset=dataset):
+            return super().generate_inner(replayed, dataset=dataset)
 
     def generate_batch_inner(self, messages, dataset=None):
         replayed_messages = []
@@ -1039,4 +1106,8 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
         if self.use_vllm:
             return self._generate_batch_inner_vllm(replayed_messages, dataset=dataset)
         generate_one = super().generate_inner
-        return [generate_one(message, dataset=dataset) for message in replayed_messages]
+        results = []
+        for original, replayed in zip(messages, replayed_messages):
+            with self._visual_token_shift_context(original=original, replayed=replayed, dataset=dataset):
+                results.append(generate_one(replayed, dataset=dataset))
+        return results

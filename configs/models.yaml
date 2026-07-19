@@ -1,4 +1,37 @@
 env_profiles:
+  hf_token_roll:
+    python: '{token_roll_python}'
+    pythonpath:
+    - '{repo_root}'
+    - '{token_roll_pydeps}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      MINICPM45_USE_VLLM: '0'
+  hf_token_roll_minicpm:
+    python: '{token_roll_python}'
+    pythonpath:
+    - '{repo_root}'
+    - '{minicpm_token_roll_pydeps}'
+    - '{token_roll_pydeps}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      MINICPM45_USE_VLLM: '0'
   main_vlmeval:
     python: '{conda_root}/envs/vlmevalkit/bin/python'
     pythonpath:
@@ -65,6 +98,53 @@ env_profiles:
       VLMEVAL_LAZY_INIT: '1'
       GEMMA3_USE_VLLM: '1'
 models:
+  qwen25vl_3b_token_roll:
+    display_name: Qwen2.5-VL-3B visual-token roll
+    registry_name: Qwen2.5-VL-3B-Instruct-Replay
+    env_profile: hf_token_roll
+    model_path: '{model_root}/Qwen2.5-VL-3B-Instruct'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.8
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: '1'
+      MODEL_PATH_QWEN25_3B: '{model_root}/Qwen2.5-VL-3B-Instruct'
+  qwen25vl_32b_token_roll:
+    display_name: Qwen2.5-VL-32B visual-token roll
+    registry_name: Qwen2VLChatReplay
+    env_profile: hf_token_roll
+    model_path: '{model_root}/Qwen2.5-VL-32B-Instruct'
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 6.0
+    task_env:
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: '1'
+      MODEL_PATH_QWEN25_32B: '{model_root}/Qwen2.5-VL-32B-Instruct'
+  minicpm_o_45_token_roll:
+    display_name: MiniCPM-o-4.5 visual-token roll
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: hf_token_roll_minicpm
+    model_path: '{model_root}/MiniCPM-o-4_5'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 1
+      max_num_seqs: 1
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 2.4
+    task_env:
+      VLMEVAL_USE_MINICPM45_MINIMAL_CONFIG: '1'
+      MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
+      MINICPM45_MAX_NEW_TOKENS: '16384'
+      MINICPM45_USE_VLLM: '0'
   qwen25vl_3b:
     display_name: Qwen2.5-VL-3B
     registry_name: Qwen2.5-VL-3B-Instruct-Replay

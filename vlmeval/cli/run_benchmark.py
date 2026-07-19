@@ -134,6 +134,7 @@ def task_matches_manifest(task: "Task", rows: list[dict[str, str]]) -> bool:
         "policy_key": task.policy_key,
         "mode": task.mode,
         "transform": task.transform,
+        "visual_token_shift": task.visual_token_shift,
         "dataset": task.dataset,
     }
     supported = set(aliases.keys())
@@ -166,6 +167,18 @@ def format_value(value: Any, repo_root: str) -> Any:
             "model_root": os.environ.get("MODEL_ROOT", "/models"),
             "conda_root": os.environ.get("CONDA_ROOT", os.environ.get("HOME", "") + "/miniconda3"),
             "lmu_data": require_env("LMUData"),
+            "token_roll_python": os.environ.get(
+                "TOKEN_ROLL_PYTHON",
+                "/root/.venvs/lmms-engine/bin/python",
+            ),
+            "token_roll_pydeps": os.environ.get(
+                "TOKEN_ROLL_PYDEPS",
+                "/root/.venvs/vlmevalkit-token-roll-pydeps",
+            ),
+            "minicpm_token_roll_pydeps": os.environ.get(
+                "MINICPM_TOKEN_ROLL_PYDEPS",
+                "/root/.venvs/minicpmo-token-roll-pydeps",
+            ),
         }
         try:
             return value.format(**mapping)
@@ -271,12 +284,17 @@ class Task:
     policy_key: str
     mode: str
     transform: str
+    visual_token_shift: str
     dataset: str
     weight: float
 
     @property
     def tag(self) -> str:
-        return f"{self.model_key}__{self.policy_key}__{self.mode}__{self.transform}__{self.dataset}"
+        parts = [self.model_key, self.policy_key, self.mode, self.transform]
+        if self.visual_token_shift != "none":
+            parts.append(self.visual_token_shift)
+        parts.append(self.dataset)
+        return "__".join(parts)
 
 
 class BenchmarkRunner:
@@ -304,6 +322,7 @@ class BenchmarkRunner:
             canonical_dataset_name(str(dataset)): path for dataset, path in raw_allowlists.items()
         }
         self.explicit_transform_axis = "image_transforms" in matrix
+        self.explicit_visual_token_shift_axis = "visual_token_shifts" in matrix
         self.worker_monitor_cfg = matrix.get("worker_monitor", {})
         self.worker_monitor_enabled = truthy(self.worker_monitor_cfg.get("enable", True))
         interval_raw = os.environ.get("WORKER_MONITOR_INTERVAL_SECONDS", self.worker_monitor_cfg.get("interval_seconds", 600))
@@ -345,18 +364,25 @@ class BenchmarkRunner:
         policy_filters = split_names(self.args.policies)
         mode_filters = split_names(self.args.modes)
         transform_filters = split_names(self.args.transforms)
+        visual_token_shift_filters = split_names(self.args.visual_token_shifts)
         dataset_filters = canonical_dataset_names(split_names(self.args.datasets))
         model_filters = split_names(self.args.models)
 
         policy_order = list(matrix["policies"].keys())
         mode_order = list(matrix["replay_modes"])
         transform_order = list(matrix.get("image_transforms", ["baseline"]))
+        visual_token_shift_order = list(matrix.get("visual_token_shifts", ["none"]))
         dataset_order = canonical_dataset_names([str(name) for name in matrix["datasets"]])
         model_order = list(matrix["models"])
 
         self.policy_order = [name for name in policy_order if not policy_filters or name in policy_filters]
         self.mode_order = [name for name in mode_order if not mode_filters or name in mode_filters]
         self.transform_order = [name for name in transform_order if not transform_filters or name in transform_filters]
+        self.visual_token_shift_order = [
+            name
+            for name in visual_token_shift_order
+            if not visual_token_shift_filters or name in visual_token_shift_filters
+        ]
         self.dataset_order = [name for name in dataset_order if not dataset_filters or name in dataset_filters]
         self.model_order = [name for name in model_order if not model_filters or name in model_filters]
 
@@ -390,19 +416,21 @@ class BenchmarkRunner:
             for policy_key in self.policy_order:
                 for mode in self.mode_order:
                     for transform in self.transform_order:
-                        for dataset in self.dataset_order:
-                            self.tasks.append(
-                                Task(
-                                    index=index,
-                                    model_key=model_key,
-                                    policy_key=policy_key,
-                                    mode=mode,
-                                    transform=transform,
-                                    dataset=dataset,
-                                    weight=model.node_time_weight,
+                        for visual_token_shift in self.visual_token_shift_order:
+                            for dataset in self.dataset_order:
+                                self.tasks.append(
+                                    Task(
+                                        index=index,
+                                        model_key=model_key,
+                                        policy_key=policy_key,
+                                        mode=mode,
+                                        transform=transform,
+                                        visual_token_shift=visual_token_shift,
+                                        dataset=dataset,
+                                        weight=model.node_time_weight,
+                                    )
                                 )
-                            )
-                            index += 1
+                                index += 1
         if self.task_manifest_path is not None:
             self.task_manifest_rows = load_task_manifest_rows(self.task_manifest_path)
             self.tasks = [task for task in self.tasks if task_matches_manifest(task, self.task_manifest_rows)]
@@ -492,6 +520,7 @@ class BenchmarkRunner:
                     "policy_order": self.policy_order,
                     "mode_order": self.mode_order,
                     "transform_order": self.transform_order,
+                    "visual_token_shift_order": self.visual_token_shift_order,
                     "dataset_order": self.dataset_order,
                 },
                 ensure_ascii=False,
@@ -799,9 +828,13 @@ class BenchmarkRunner:
         env.setdefault("QWEN2VL_VLLM_STOP_TOKEN_IDS", "151645,151643")
 
     def infer_batch_size_for_task(self, model: ModelSpec, task: Task) -> int:
+        if task.visual_token_shift != "none":
+            return 1
         return model.infer_batch_size
 
     def max_num_seqs_for_task(self, model: ModelSpec, task: Task) -> int:
+        if task.visual_token_shift != "none":
+            return 1
         return model.max_num_seqs
 
     def build_env(self, model: ModelSpec, task: Task, gpu_ids: list[str]) -> dict[str, str]:
@@ -838,6 +871,16 @@ class BenchmarkRunner:
         env["REPLAY_IMAGE_TRANSFORM"] = task.transform
         env["REPLAY_IMAGE_TRANSFORM_CACHE_DIR"] = str(self.task_root(task) / "_transform_cache" / task.dataset)
         env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = "2"
+        env["REPLAY_VISUAL_TOKEN_SHIFT"] = task.visual_token_shift
+        env["REPLAY_VISUAL_TOKEN_SHIFT_TARGET_POSITION"] = "2"
+        env["REPLAY_VISUAL_TOKEN_SHIFT_STRICT"] = "1"
+        env["REPLAY_VISUAL_TOKEN_SHIFT_DUMP_SAMPLES"] = str(self.trace_cfg.get("samples", 1))
+        env["REPLAY_VISUAL_TOKEN_SHIFT_RAW_DUMP"] = str(
+            int(truthy(self.trace_cfg.get("visual_token_raw_dump", False)))
+        )
+        env["REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR"] = str(self.task_root(task) / "_visual_token_shift")
+        if task.visual_token_shift != "none":
+            env["MINICPM45_USE_VLLM"] = "0"
         env["REPLAY_PROMPT_TEMPLATE_NAME"] = policy.replay_prompt_template_name
         env["REPLAY_TIMES"] = str(self.replay_cfg.get("replay_times", 1))
         env["REPLAY_DEBUG"] = "0"
@@ -945,9 +988,12 @@ class BenchmarkRunner:
 
     def task_root(self, task: Task) -> Path:
         dataset_key = task.dataset.replace("/", "_")
+        root = self.results_root / task.policy_key / task.mode
         if self.explicit_transform_axis:
-            return self.results_root / task.policy_key / task.mode / task.transform / task.model_key / dataset_key
-        return self.results_root / task.policy_key / task.mode / task.model_key / dataset_key
+            root = root / task.transform
+        if self.explicit_visual_token_shift_axis:
+            root = root / task.visual_token_shift
+        return root / task.model_key / dataset_key
 
     def model_output_root(self, task: Task, model: ModelSpec) -> Path:
         return self.task_root(task) / model.registry_name
@@ -1187,6 +1233,7 @@ except Exception:
                 "policy_key": task.policy_key,
                 "mode": task.mode,
                 "transform": task.transform,
+                "visual_token_shift": task.visual_token_shift,
                 "dataset": task.dataset,
             },
             "model": {
@@ -1533,6 +1580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policies", type=str, default="")
     parser.add_argument("--modes", type=str, default="")
     parser.add_argument("--transforms", type=str, default="")
+    parser.add_argument("--visual-token-shifts", type=str, default="")
     parser.add_argument("--datasets", type=str, default="")
     parser.add_argument("--task-manifest", type=Path, default=None)
     parser.add_argument(

@@ -26,15 +26,26 @@ from ..replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
 )
+from ..replay_visual_token_shift import (
+    VisualTokenShiftController,
+    visual_token_shift_enabled,
+)
 from .replay_prompt_template import (
     apply_prompt_template_to_content,
     read_prompt_template_config_from_env,
     strip_prompt_template_from_content_for_direct_answer,
 )
 from ...smp import get_gpu_memory, listinstr
-from ...dataset import DATASET_MODALITY
 
 VLLM_MAX_IMAGE_INPUT_NUM = 24
+
+
+def _dataset_modality(dataset: str | None) -> str:
+    if dataset is None:
+        return "IMAGE"
+    from ...dataset import DATASET_MODALITY
+
+    return DATASET_MODALITY(dataset)
 
 
 def ensure_image_url(image: str) -> str:
@@ -1220,7 +1231,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             },
         )
 
-        if DATASET_MODALITY(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
+        if _dataset_modality(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
             assert len(videos) == 1
             videos_nd = [videos[0].detach().cpu().numpy().transpose(0, 2, 3, 1)]
 
@@ -1305,7 +1316,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         if self.use_vllm:
             self._begin_stage_debug_sample()
             if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], list):
-                if DATASET_MODALITY(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
+                if _dataset_modality(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
                     return [self.generate_inner_vllm(msg, dataset=dataset) for msg in messages]
                 sampling_params = self._build_vllm_sampling_params()
                 reqs = [self._build_vllm_request(msg, dataset=dataset) for msg in messages]
@@ -1324,7 +1335,23 @@ class Qwen2VLChatReplay(Qwen2VLChat):
     """Replay-enabled Qwen2VLChat with minimal intrusion."""
 
     def __init__(self, *args, **kwargs):
+        token_shift_requested = visual_token_shift_enabled()
+        if token_shift_requested:
+            # Exact I2 boundaries are available in the HF visual forward. vLLM
+            # may batch multimodal items across requests and lose that boundary.
+            kwargs["use_vllm"] = False
         super().__init__(*args, **kwargs)
+        self.visual_token_shift = VisualTokenShiftController(
+            model_family="qwen2_5_vl",
+            model_name=self.model_path,
+        )
+        if self.visual_token_shift.enabled:
+            self.visual_token_shift.install_qwen_hf_hook(self.model)
+            print(
+                f"[Qwen2VLChatReplay] visual_token_shift={self.visual_token_shift.mode} "
+                f"target_image_position={self.visual_token_shift.target_image_position} backend=hf",
+                flush=True,
+            )
         self.replay_cfg = read_replay_config_from_env()
         self.prompt_template_cfg = read_prompt_template_config_from_env()
         self.template_on_last_replay_text = os.environ.get("REPLAY_TEMPLATE_ON_LAST_REPLAY_TEXT", "0").strip().lower() in {
@@ -1514,7 +1541,17 @@ class Qwen2VLChatReplay(Qwen2VLChat):
     def _prepare_content(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
         content = super()._prepare_content(inputs, dataset=dataset)
         replayed = self._apply_template_replay_pipeline(content, dataset=dataset)
-        return self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
+        transformed = self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
+        controller = getattr(self, "visual_token_shift", None)
+        if controller is not None and controller.enabled:
+            controller.validate_and_bind_iqiq_topology(
+                original=content,
+                replayed=transformed,
+                replay_mode=self.replay_cfg["mode"],
+                repeat_times=self.replay_cfg["repeat_times"],
+                image_transform_name=self.image_transform_name,
+            )
+        return transformed
 
     def _prepare_content_vllm(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
         content = super()._prepare_content_vllm(inputs, dataset=dataset)
@@ -1623,6 +1660,22 @@ class Qwen2VLChatReplay(Qwen2VLChat):
                     flush=True,
                 )
                 raise
+
+    def generate_inner_transformers(self, message, dataset=None):
+        controller = getattr(self, "visual_token_shift", None)
+        if controller is None or not controller.enabled:
+            return super().generate_inner_transformers(message, dataset=dataset)
+        sample_meta = self._extract_replay_meta(message)
+        with controller.sample(dataset=dataset, sample_meta=sample_meta):
+            return super().generate_inner_transformers(message, dataset=dataset)
+
+    def generate_batch_inner(self, messages, dataset=None):
+        controller = getattr(self, "visual_token_shift", None)
+        if controller is not None and controller.enabled and not self.use_vllm:
+            if isinstance(messages, list) and messages and isinstance(messages[0], list):
+                return [self.generate_inner_transformers(message, dataset=dataset) for message in messages]
+            return [self.generate_inner_transformers(messages, dataset=dataset)]
+        return super().generate_batch_inner(messages, dataset=dataset)
 
 
 class Qwen2VLChatAguvis(Qwen2VLChat):
