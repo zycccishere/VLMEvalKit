@@ -17,6 +17,10 @@ export VLMEVAL_API_MINIMAL_IMPORT=1
 export VLMEVAL_VLM_MINIMAL_IMPORT=1
 export VLMEVAL_LAZY_INIT=1
 
+if [[ "${TOKEN_ROLL_KEEP_PROXY:-0}" != "1" ]]; then
+  unset http_proxy https_proxy all_proxy
+fi
+
 MODE="${1:-infer}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -40,7 +44,8 @@ check_runtime() {
   }
   "${CONTROL_PYTHON}" scripts/verify_visual_token_shift_runtime_20260719.py \
     --model-root "${MODEL_ROOT}" \
-    --minicpm-transformers-pydeps "${MINICPM_TOKEN_ROLL_PYDEPS}"
+    --minicpm-transformers-pydeps "${MINICPM_TOKEN_ROLL_PYDEPS}" \
+    "$@"
 }
 
 run_matrix() {
@@ -52,7 +57,7 @@ run_matrix() {
 
 case "${MODE}" in
   check)
-    check_runtime
+    check_runtime --require-openai-auth
     run_matrix "${INFER_CONFIG}" --plan-only "$@"
     ;;
   infer)
@@ -60,11 +65,11 @@ case "${MODE}" in
     run_matrix "${INFER_CONFIG}" "$@"
     ;;
   eval)
-    check_runtime
+    check_runtime --require-openai-auth
     run_matrix "${EVAL_CONFIG}" "$@"
     ;;
   all)
-    check_runtime
+    check_runtime --require-openai-auth
     run_matrix "${INFER_CONFIG}" "$@"
     run_matrix "${EVAL_CONFIG}" "$@"
     ;;

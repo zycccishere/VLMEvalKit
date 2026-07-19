@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 from safetensors import safe_open
 
@@ -62,10 +64,49 @@ def verify_snapshot(root: Path) -> dict:
     }
 
 
+def verify_openai_auth(required: bool) -> dict:
+    key = (
+        os.environ.get("OPENAI_API_KEY_JUDGE", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    base = (
+        os.environ.get("OPENAI_API_BASE_JUDGE", "").strip()
+        or os.environ.get("OPENAI_API_BASE", "").strip()
+        or "https://api.openai.com"
+    ).rstrip("/")
+    result = {
+        "required": required,
+        "credentials_present": bool(key),
+        "authenticated": None,
+        "http_status": None,
+        "ok": not required,
+    }
+    if not required:
+        return result
+    if not key:
+        result["ok"] = False
+        return result
+    url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result["http_status"] = response.status
+            result["authenticated"] = response.status == 200
+    except urllib.error.HTTPError as exc:
+        result["http_status"] = exc.code
+        result["authenticated"] = False
+    except Exception as exc:
+        result["authenticated"] = False
+        result["error_type"] = type(exc).__name__
+    result["ok"] = result["authenticated"] is True
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument("--minicpm-transformers-pydeps", type=Path, required=True)
+    parser.add_argument("--require-openai-auth", action="store_true")
     args = parser.parse_args()
 
     os.environ.setdefault("VLMEVAL_API_MINIMAL_IMPORT", "1")
@@ -86,6 +127,7 @@ def main() -> None:
         "tabulate",
         "imageio",
         "openai",
+        "dotenv",
         "vlmeval.dataset",
         "vlmeval.config_qwen_minimal",
         "vlmeval.config_minicpm45_minimal",
@@ -133,12 +175,14 @@ def main() -> None:
             remote_code_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     snapshots = {name: verify_snapshot(args.model_root / name) for name in MODEL_DIRS}
+    openai_auth = verify_openai_auth(args.require_openai_auth)
     payload = {
         "all_passed": (
             all(s["ok"] for s in snapshots.values())
             and all(module_status.values())
             and qwen_runtime_ok
             and minicpm_runtime_ok
+            and openai_auth["ok"]
         ),
         "modules": module_status,
         "versions": {
@@ -148,6 +192,7 @@ def main() -> None:
         "qwen_runtime_ok": qwen_runtime_ok,
         "minicpm_versions": minicpm_versions,
         "minicpm_runtime_ok": minicpm_runtime_ok,
+        "openai_auth": openai_auth,
         "minicpm_remote_code_sha256": remote_code_hashes,
         "snapshots": snapshots,
     }
