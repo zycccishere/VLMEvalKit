@@ -17,11 +17,13 @@ from vlmeval.vlm.replay_image_transform import canonicalize_image_transform
 
 
 def make_source_image(path: Path) -> None:
-    image = Image.new("RGB", (448, 448), color=(255, 255, 255))
+    image = Image.new("RGB", (516, 307), color=(255, 255, 255))
     draw = ImageDraw.Draw(image)
-    draw.rectangle([0, 0, 80, 447], fill=(255, 0, 0))
-    draw.rectangle([368, 0, 447, 447], fill=(0, 0, 255))
-    draw.rectangle([180, 180, 268, 268], fill=(0, 255, 0))
+    draw.rectangle([0, 0, 515, 80], fill=(255, 255, 0))
+    draw.rectangle([0, 226, 515, 306], fill=(255, 0, 255))
+    draw.rectangle([0, 0, 80, 306], fill=(255, 0, 0))
+    draw.rectangle([435, 0, 515, 306], fill=(0, 0, 255))
+    draw.rectangle([220, 110, 296, 196], fill=(0, 255, 0))
     image.save(path)
 
 
@@ -112,11 +114,49 @@ def run_case(transform: str, source_path: Path, out_dir: Path) -> dict:
         checks["record_item_index_is_i2"] = wrapper._last_image_transform_record.get("content_item_index") == 2
     if expected_transform == "blank":
         checks["blank_is_white"] = transformed_image.getpixel((224, 224)) == (255, 255, 255)
-    if expected_transform == "shift_right_one_llm_token":
+    if expected_transform in {"shift_right_half_vit_token", "shift_right_one_vit_token"}:
         shift = wrapper._last_image_transform_record.get("shift", {})
-        checks["shift_dx_is_56"] = shift.get("dx") == 56
-        checks["shift_unit_is_llm_visual_token"] = shift.get("semantic_unit") == "llm_visual_token"
-        checks["wrapped_left_edge_is_old_right_edge"] = transformed_image.getpixel((0, 20)) == (0, 0, 255)
+        expected_dx = 7 if expected_transform == "shift_right_half_vit_token" else 14
+        checks["vit_shift_dx"] = shift.get("dx") == expected_dx
+        checks["vit_shift_unit"] = shift.get("semantic_unit") == "vit_patch"
+        checks["vit_patch_size_is_14"] = shift.get("vit_patch_size") == 14
+        checks["processed_vit_grid_is_25x41"] = (
+            shift.get("processed_vit_grid_h") == 25 and shift.get("processed_vit_grid_w") == 41
+        )
+    if expected_transform in {
+        "shift_right_one_llm_token",
+        "shift_left_one_llm_token",
+        "shift_down_one_llm_token",
+        "shift_up_one_llm_token",
+    }:
+        shift = wrapper._last_image_transform_record.get("shift", {})
+        expected_delta = {
+            "shift_right_one_llm_token": (56, 0),
+            "shift_left_one_llm_token": (-56, 0),
+            "shift_down_one_llm_token": (0, 56),
+            "shift_up_one_llm_token": (0, -56),
+        }[expected_transform]
+        checks["shift_delta_is_56"] = (shift.get("dx"), shift.get("dy")) == expected_delta
+        checks["shift_unit_is_nominal_query_pitch"] = (
+            shift.get("semantic_unit") == "resampler_query_equal_area_nominal_scale"
+        )
+        checks["no_fake_llm_grid"] = (
+            shift.get("processed_llm_grid_h") is None
+            and shift.get("processed_llm_grid_w") is None
+            and shift.get("llm_visual_token_stride") is None
+        )
+        checks["global_resampler_contract"] = (
+            shift.get("minicpm45_llm_spatial_layout") == "global_resampler_queries"
+            and shift.get("minicpm45_llm_token_has_local_footprint") is False
+            and shift.get("minicpm45_nominal_query_pitch") == 56
+        )
+        wrap_probe = {
+            "shift_right_one_llm_token": ((0, 150), (0, 0, 255)),
+            "shift_left_one_llm_token": ((573, 150), (255, 0, 0)),
+            "shift_down_one_llm_token": ((280, 0), (255, 0, 255)),
+            "shift_up_one_llm_token": ((280, 349), (255, 255, 0)),
+        }[expected_transform]
+        checks["wrapped_edge_matches_opposite_source_edge"] = transformed_image.getpixel(wrap_probe[0]) == wrap_probe[1]
 
     result = {
         "transform": expected_transform,
@@ -141,7 +181,16 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     source_path = args.output_dir / "source.png"
     make_source_image(source_path)
-    transforms = ["baseline", "blank", "shift_right_one_llm_token"]
+    transforms = [
+        "baseline",
+        "blank",
+        "shift_right_half_vit_token",
+        "shift_right_one_vit_token",
+        "shift_right_one_llm_token",
+        "shift_left_one_llm_token",
+        "shift_down_one_llm_token",
+        "shift_up_one_llm_token",
+    ]
     results = [run_case(transform, source_path, args.output_dir) for transform in transforms]
     summary = {
         "output_dir": str(args.output_dir),

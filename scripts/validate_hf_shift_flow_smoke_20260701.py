@@ -25,7 +25,11 @@ EXPECTED_BY_FAMILY = {
         "transforms": {
             "shift_right_half_vit_token": {"dx": 7, "base_pixels": 14, "semantic_unit": "vit_patch"},
             "shift_right_one_vit_token": {"dx": 14, "base_pixels": 14, "semantic_unit": "vit_patch"},
-            "shift_right_one_llm_token": {"dx": 56, "base_pixels": 56, "semantic_unit": "llm_visual_token"},
+            "shift_right_one_llm_token": {
+                "dx": 56,
+                "base_pixels": 56,
+                "semantic_unit": "resampler_query_equal_area_nominal_scale",
+            },
         },
     },
     "minicpm-o-4_5": {
@@ -34,7 +38,11 @@ EXPECTED_BY_FAMILY = {
         "transforms": {
             "shift_right_half_vit_token": {"dx": 7, "base_pixels": 14, "semantic_unit": "vit_patch"},
             "shift_right_one_vit_token": {"dx": 14, "base_pixels": 14, "semantic_unit": "vit_patch"},
-            "shift_right_one_llm_token": {"dx": 56, "base_pixels": 56, "semantic_unit": "llm_visual_token"},
+            "shift_right_one_llm_token": {
+                "dx": 56,
+                "base_pixels": 56,
+                "semantic_unit": "resampler_query_equal_area_nominal_scale",
+            },
         },
     },
 }
@@ -156,8 +164,24 @@ def validate(
                     f"{case['case_id']} {transform} minicpm_processor_shapes",
                     span_meta.get("image_bound_lengths") == [expected["image_tokens"], expected["image_tokens"]]
                     and int(span_meta.get("pixel_value_count", -1)) == 2
-                    and int(span_meta.get("tgt_size_count", -1)) == 2,
+                    and int(span_meta.get("tgt_size_count", -1)) == 2
+                    and span_meta.get("tgt_sizes_values") is not None
+                    and int(span_meta.get("minicpm_patch_size", -1)) == 14
+                    and int(span_meta.get("minicpm_query_num", -1)) == expected["image_tokens"]
+                    and (span_meta.get("minicpm_resampler_query_shape") or [0])[0] == expected["image_tokens"],
                     span_meta,
+                )
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} minicpm_global_resampler_layout",
+                    payload["image1_grid"].get("layout") == "global_resampler_queries"
+                    and payload["image2_grid"].get("layout") == "global_resampler_queries"
+                    and payload["image1_grid"].get("llm_grid_h") is None
+                    and payload["image1_grid"].get("llm_grid_w") is None
+                    and payload["image1_grid"].get("local_spatial_footprint") is False
+                    and span_meta.get("minicpm_llm_token_has_local_footprint") is False,
+                    {"image1_grid": payload["image1_grid"], "span_meta": span_meta},
                 )
                 add_check(
                     checks,
@@ -181,9 +205,6 @@ def validate(
                 exp_shift = expected["transforms"][transform]
                 exp_dx = int(exp_shift["dx"])
                 exp_base_pixels = int(exp_shift["base_pixels"])
-                if family.startswith("minicpm") and transform == "shift_right_one_llm_token":
-                    exp_dx = int(round(float(shift.get("processed_resized_width", 0.0)) / float(shift.get("processed_llm_grid_w", 8) or 8)))
-                    exp_base_pixels = exp_dx
                 shift_detail = {
                     key: shift.get(key)
                     for key in [
@@ -211,17 +232,33 @@ def validate(
                     shift_detail,
                 )
                 meta = payload.get("content_shift_meta") or {}
-                add_check(
-                    checks,
-                    failures,
-                    f"{case['case_id']} {transform} dx_tokens",
-                    abs(
-                        float(meta.get("dx_tokens", -999.0))
-                        - float(exp_dx) / float(shift.get("llm_visual_token_stride", expected["stride"]))
+                if family.startswith("minicpm"):
+                    add_check(
+                        checks,
+                        failures,
+                        f"{case['case_id']} {transform} nominal_query_pitch_units",
+                        meta.get("dx_tokens") is None
+                        and meta.get("llm_visual_token_stride") is None
+                        and meta.get("spatial_token_mapping_valid") is False
+                        and abs(
+                            float(meta.get("dx_nominal_query_pitch_units", -999.0))
+                            - float(exp_dx) / float(expected["stride"])
+                        )
+                        < 1e-8,
+                        meta,
                     )
-                    < 1e-8,
-                    meta,
-                )
+                else:
+                    add_check(
+                        checks,
+                        failures,
+                        f"{case['case_id']} {transform} dx_tokens",
+                        abs(
+                            float(meta.get("dx_tokens", -999.0))
+                            - float(exp_dx) / float(shift.get("llm_visual_token_stride", expected["stride"]))
+                        )
+                        < 1e-8,
+                        meta,
+                    )
             for layer in payload.get("layers", []):
                 layer_name = f"{case['case_id']} {transform} L{layer['layer']}"
                 scalar_detail = {

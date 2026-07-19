@@ -268,6 +268,35 @@ def tensor_shape_tree(value: Any, *, max_depth: int = 4) -> Any:
     return type(value).__name__
 
 
+def tensor_value_tree(value: Any, *, max_depth: int = 4) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if max_depth <= 0:
+        return type(value).__name__
+    if isinstance(value, (list, tuple)):
+        return [tensor_value_tree(item, max_depth=max_depth - 1) for item in list(value)[:4]]
+    return value
+
+
+def describe_llm_visual_slots(model_family: str, token_count: int) -> dict[str, Any]:
+    if model_family.startswith("minicpm"):
+        return {
+            "token_count": int(token_count),
+            "layout": "global_resampler_queries",
+            "llm_grid_h": None,
+            "llm_grid_w": None,
+            "local_spatial_footprint": False,
+        }
+    side = int(round(math.sqrt(token_count)))
+    return {
+        "token_count": int(token_count),
+        "layout": "spatial_grid",
+        "llm_grid_h": side,
+        "llm_grid_w": side,
+        "local_spatial_footprint": True,
+    }
+
+
 def first_batch_item_count(value: Any) -> int | None:
     if isinstance(value, (list, tuple)) and len(value) == 1:
         first = value[0]
@@ -687,6 +716,8 @@ class MiniCPM45Adapter:
         ]
         input_ids = inputs["input_ids"][0].detach().cpu().tolist()
         text_positions, q1_meta = find_minicpm_q1_positions(input_ids, spans, self.special_token_ids, self.tokenizer)
+        resampler = getattr(self.model, "resampler", None)
+        resampler_query = getattr(resampler, "query", None)
         meta = {
             "span_source": "minicpm_image_bound",
             "image_bound_count": len(spans),
@@ -706,7 +737,13 @@ class MiniCPM45Adapter:
             "pixel_values_shape": tensor_shape_tree(inputs.get("pixel_values")),
             "pixel_value_count": first_batch_item_count(inputs.get("pixel_values")),
             "tgt_sizes_shape": tensor_shape_tree(inputs.get("tgt_sizes")),
+            "tgt_sizes_values": tensor_value_tree(inputs.get("tgt_sizes")),
             "tgt_size_count": first_batch_item_count(inputs.get("tgt_sizes")),
+            "minicpm_resampler_query_shape": list(resampler_query.shape)
+            if torch.is_tensor(resampler_query)
+            else None,
+            "minicpm_llm_spatial_layout": "global_resampler_queries",
+            "minicpm_llm_token_has_local_footprint": False,
             **q1_meta,
         }
         return spans, text_positions, meta
@@ -930,30 +967,35 @@ def main() -> int:
                 if not tracer.records:
                     raise RuntimeError(f"No flow records captured for {case['id']} transform={transform}.")
 
+                shift_meta = transform_record.get("shift") or {}
+                if args.model_family.startswith("minicpm"):
+                    nominal_pitch = float(shift_meta.get("minicpm45_nominal_query_pitch", 56.0))
+                    content_shift_meta = {
+                        "dx_tokens": None,
+                        "dy_tokens": None,
+                        "llm_visual_token_stride": None,
+                        "dx_nominal_query_pitch_units": float(shift_meta.get("dx", 0.0)) / nominal_pitch,
+                        "dy_nominal_query_pitch_units": float(shift_meta.get("dy", 0.0)) / nominal_pitch,
+                        "nominal_query_pitch": nominal_pitch,
+                        "spatial_token_mapping_valid": False,
+                    }
+                else:
+                    llm_stride = float(shift_meta.get("llm_visual_token_stride", 56.0))
+                    content_shift_meta = {
+                        "dx_tokens": float(shift_meta.get("dx", 0.0)) / llm_stride,
+                        "dy_tokens": float(shift_meta.get("dy", 0.0)) / llm_stride,
+                        "llm_visual_token_stride": llm_stride,
+                        "spatial_token_mapping_valid": True,
+                    }
+
                 transform_records[transform] = {
                     "prompt_text": prepared["prompt_text"],
                     "transform_record": transform_record,
-                    "content_shift_meta": {
-                        "dx_tokens": float((transform_record.get("shift") or {}).get("dx", 0.0))
-                        / float((transform_record.get("shift") or {}).get("llm_visual_token_stride", 56.0)),
-                        "dy_tokens": float((transform_record.get("shift") or {}).get("dy", 0.0))
-                        / float((transform_record.get("shift") or {}).get("llm_visual_token_stride", 56.0)),
-                        "llm_visual_token_stride": float(
-                            (transform_record.get("shift") or {}).get("llm_visual_token_stride", 56.0)
-                        ),
-                    },
+                    "content_shift_meta": content_shift_meta,
                     "seconds": float(time.perf_counter() - sample_start),
                     "span_meta": span_meta,
-                    "image1_grid": {
-                        "token_count": len(image1_positions),
-                        "llm_grid_h": int(round(math.sqrt(len(image1_positions)))),
-                        "llm_grid_w": int(round(math.sqrt(len(image1_positions)))),
-                    },
-                    "image2_grid": {
-                        "token_count": len(image2_positions),
-                        "llm_grid_h": int(round(math.sqrt(len(image2_positions)))),
-                        "llm_grid_w": int(round(math.sqrt(len(image2_positions)))),
-                    },
+                    "image1_grid": describe_llm_visual_slots(args.model_family, len(image1_positions)),
+                    "image2_grid": describe_llm_visual_slots(args.model_family, len(image2_positions)),
                 }
 
                 layer_summaries: list[dict[str, Any]] = []

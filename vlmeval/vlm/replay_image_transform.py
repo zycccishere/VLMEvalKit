@@ -64,8 +64,14 @@ IMAGE_TRANSFORM_PROFILES = {
         "resize_mode": "minicpm_smart",
         "scale_resolution": 448,
         "vit_patch_size": 14,
-        "spatial_merge_size": 4,
+        # MiniCPM uses 64 global Perceiver-resampler queries, not a 4x4
+        # local patch merge. 56 px is only the equal-area nominal pitch:
+        # sqrt(448 * 448 / 64), not a literal LLM-token footprint.
+        "spatial_merge_size": None,
         "llm_token_stride": 56,
+        "resampler_query_count": 64,
+        "llm_spatial_layout": "global_resampler_queries",
+        "llm_shift_reference": "equal_area_nominal_query_pitch",
     },
 }
 
@@ -429,8 +435,10 @@ def _resize_to_profile_processed_size(
             "resized_width": int(resized_width),
             "vit_grid_h": max(1, int(resized_height // vit_patch_size)),
             "vit_grid_w": max(1, int(resized_width // vit_patch_size)),
-            "llm_grid_h": 8,
-            "llm_grid_w": 8,
+            "llm_grid_h": None,
+            "llm_grid_w": None,
+            "resampler_query_count": int(profile.get("resampler_query_count", 64)),
+            "llm_spatial_layout": str(profile.get("llm_spatial_layout", "global_resampler_queries")),
         }
     if profile.get("model_family") == "qwen2_5_vl":
         return _resize_to_qwen_processed_size(image, min_pixels=min_pixels, max_pixels=max_pixels)
@@ -464,8 +472,12 @@ def _processed_token_shift_spec(transform: str, *, profile: dict[str, Any]) -> d
         return None
     if llm_token_name:
         base_pixels = int(profile["llm_token_stride"])
-        semantic_unit = "llm_visual_token"
-        pixel_shift_kind = "processed_llm_token"
+        if profile.get("model_family") == "minicpm45":
+            semantic_unit = "resampler_query_equal_area_nominal_scale"
+            pixel_shift_kind = "processed_nominal_query_pitch"
+        else:
+            semantic_unit = "llm_visual_token"
+            pixel_shift_kind = "processed_llm_token"
     else:
         base_pixels = int(profile["vit_patch_size"])
         semantic_unit = "vit_patch"
@@ -618,21 +630,6 @@ def apply_image_transform_to_content(
             min_pixels=image_item.get("min_pixels"),
             max_pixels=image_item.get("max_pixels"),
         )
-        if profile["model_family"] == "minicpm45":
-            direction = str(shift_spec["direction"])
-            if direction in {"left", "right"}:
-                dynamic_stride = max(1, int(round(process_info["resized_width"] / max(process_info["llm_grid_w"], 1))))
-            else:
-                dynamic_stride = max(1, int(round(process_info["resized_height"] / max(process_info["llm_grid_h"], 1))))
-            shift_spec = dict(shift_spec)
-            shift_spec["llm_visual_token_stride_override"] = int(dynamic_stride)
-            if shift_spec["semantic_unit"] == "llm_visual_token":
-                sign = -1 if direction in {"left", "up"} else 1
-                shift_spec["base_pixels"] = int(dynamic_stride)
-                shift_spec["processed_shift_pixels"] = int(dynamic_stride)
-                shift_spec["dx"] = int(sign * dynamic_stride) if direction in {"left", "right"} else 0
-                shift_spec["dy"] = int(sign * dynamic_stride) if direction in {"up", "down"} else 0
-                shift_spec["minicpm_dynamic_llm_stride"] = True
         dx = int(shift_spec["dx"])
         dy = int(shift_spec["dy"])
         output_image = _shift_image_wrap(processed_image, dx=dx, dy=dy)
@@ -667,7 +664,9 @@ def apply_image_transform_to_content(
             "processed_llm_grid_w": process_info["llm_grid_w"],
             "vit_patch_size": profile["vit_patch_size"],
             "spatial_merge_size": profile["spatial_merge_size"],
-            "llm_visual_token_stride": shift_spec.get("llm_visual_token_stride_override", profile["llm_token_stride"]),
+            "llm_visual_token_stride": (
+                profile["llm_token_stride"] if profile["model_family"] != "minicpm45" else None
+            ),
             "qwen_patch_size": QWEN_PATCH_SIZE,
             "qwen_spatial_merge_size": QWEN_SPATIAL_MERGE_SIZE,
             "qwen_token_stride": QWEN_TOKEN_STRIDE,
@@ -689,9 +688,11 @@ def apply_image_transform_to_content(
                 {
                     "minicpm45_scale_resolution": profile.get("scale_resolution", 448),
                     "minicpm45_patch_size": profile["vit_patch_size"],
-                    "minicpm45_pool_stride": profile["spatial_merge_size"],
-                    "minicpm45_llm_token_stride": profile["llm_token_stride"],
-                    "minicpm45_dynamic_llm_stride": bool(shift_spec.get("minicpm_dynamic_llm_stride", False)),
+                    "minicpm45_resampler_query_count": profile.get("resampler_query_count", 64),
+                    "minicpm45_llm_spatial_layout": profile.get("llm_spatial_layout"),
+                    "minicpm45_nominal_query_pitch": profile["llm_token_stride"],
+                    "minicpm45_shift_reference": profile.get("llm_shift_reference"),
+                    "minicpm45_llm_token_has_local_footprint": False,
                 }
             )
     elif transform.startswith("shift_") and transform.endswith("_real_half_patch_wrap"):
