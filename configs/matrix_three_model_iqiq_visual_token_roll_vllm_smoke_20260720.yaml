@@ -1,0 +1,50 @@
+name: three_model_iqiq_visual_token_roll_vllm_smoke_20260720
+repo_root: "{repo_root}"
+results_root: runs/three_model_iqiq_visual_token_roll_vllm_smoke_20260720
+node_gpu_ids: "0,1,2,3"
+scheduler: gpu_pool
+infer_batch_size_override: 2
+max_num_seqs_override: 2
+datasets:
+  - MathVision
+dataset_index_allowlists:
+  MathVision: "{repo_root}/configs/index_allowlists/token_roll_mathvision_first3_20260720.txt"
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text_image_text
+visual_token_shifts:
+  - none
+  - noop_vllm
+  - roll_right_1
+models:
+  - qwen25vl_32b_token_roll
+  - qwen25vl_3b_token_roll
+  - minicpm_o_45_token_roll
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  strict_batch: 1
+  stage_debug: 1
+  stage_debug_samples: 2
+  prompt_audit: 1
+  prompt_audit_print: 0
+trace:
+  level: full
+  samples: 1
+  visual_token_raw_dump: 1
+  dump_max_chars: 12000
+  prompt_audit_print: 0
+answer_format:
+  enable: 0
+evaluation:
+  launch_mode: skip
+  nproc: 1
+worker_monitor:
+  enable: true
+  interval_seconds: 30
+resume_infer_default: false

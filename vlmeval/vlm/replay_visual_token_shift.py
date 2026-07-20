@@ -13,10 +13,12 @@ import torch
 
 
 NO_VISUAL_TOKEN_SHIFT = "none"
+VLLM_NOOP_VISUAL_TOKEN_SHIFT = "noop_vllm"
 ROLL_RIGHT_ONE = "roll_right_1"
 ROLL_LEFT_ONE = "roll_left_1"
 SUPPORTED_VISUAL_TOKEN_SHIFTS = {
     NO_VISUAL_TOKEN_SHIFT,
+    VLLM_NOOP_VISUAL_TOKEN_SHIFT,
     ROLL_RIGHT_ONE,
     ROLL_LEFT_ONE,
 }
@@ -24,6 +26,8 @@ VISUAL_TOKEN_SHIFT_ALIASES = {
     "": NO_VISUAL_TOKEN_SHIFT,
     "baseline": NO_VISUAL_TOKEN_SHIFT,
     "off": NO_VISUAL_TOKEN_SHIFT,
+    "noop": VLLM_NOOP_VISUAL_TOKEN_SHIFT,
+    "vllm_noop": VLLM_NOOP_VISUAL_TOKEN_SHIFT,
     "right": ROLL_RIGHT_ONE,
     "right_1": ROLL_RIGHT_ONE,
     "roll_right": ROLL_RIGHT_ONE,
@@ -59,6 +63,92 @@ def visual_token_shift_enabled(name: str | None = None) -> bool:
     if name is None:
         name = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT", NO_VISUAL_TOKEN_SHIFT)
     return canonicalize_visual_token_shift(name) != NO_VISUAL_TOKEN_SHIFT
+
+
+def _vllm_recording_arm_path(*, model_family: str) -> Path:
+    run_id = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", "").strip()
+    dump_dir_raw = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR", "").strip()
+    if not run_id or not dump_dir_raw:
+        raise RuntimeError("vLLM visual-token shift recording arm is not configured")
+    run_token = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
+    return Path(dump_dir_raw) / f"recording_armed.{model_family}.{run_token}.json"
+
+
+def arm_vllm_visual_token_shift_recording(*, model_family: str) -> Path:
+    """Arm evidence recording after vLLM profiling and model initialization finish."""
+    path = _vllm_recording_arm_path(model_family=model_family)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "phase": "real_request_recording_armed",
+        "timestamp": time.time(),
+        "run_id": os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", ""),
+        "model_family": model_family,
+        "inference_fingerprint": os.environ.get("REPLAY_INFERENCE_FINGERPRINT", ""),
+        "pid": os.getpid(),
+    }
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def vllm_visual_token_shift_recording_is_armed(*, model_family: str) -> bool:
+    return _vllm_recording_arm_path(model_family=model_family).is_file()
+
+
+def require_vllm_visual_token_shift_worker_handshake(
+    *,
+    model_family: str,
+    timeout_seconds: float = 30.0,
+) -> list[dict[str, Any]]:
+    """Require every expected TP worker to instantiate the replay model class."""
+    if not visual_token_shift_enabled():
+        return []
+    run_id = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", "").strip()
+    dump_dir_raw = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR", "").strip()
+    target_family = os.environ.get("REPLAY_VLLM_TARGET_FAMILY", "").strip()
+    if not run_id or not dump_dir_raw:
+        raise RuntimeError("vLLM visual-token shift worker handshake is not configured")
+    if target_family != model_family:
+        raise RuntimeError(
+            f"vLLM visual-token shift target mismatch: {target_family!r} != {model_family!r}"
+        )
+    tp_size = max(
+        1,
+        int(
+            os.environ.get(
+                "VLLM_TP_SIZE",
+                os.environ.get("MINICPM45_VLLM_TP_SIZE", "1"),
+            )
+        ),
+    )
+    expected_ranks = set(range(tp_size))
+    dump_dir = Path(dump_dir_raw)
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        records = []
+        for path in dump_dir.glob(f"worker_handshake.{model_family}.pid*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if (
+                payload.get("phase") == "worker_model_initialized"
+                and payload.get("run_id") == run_id
+                and payload.get("model_family") == model_family
+                and payload.get("target_family") == target_family
+            ):
+                records.append(payload)
+        observed_ranks = {int(record["rank"]) for record in records}
+        if expected_ranks.issubset(observed_ranks):
+            return records
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "vLLM replay worker class was not instantiated on every TP rank: "
+                f"expected={sorted(expected_ranks)} observed={sorted(observed_ranks)} "
+                f"run_id={run_id}"
+            )
+        time.sleep(0.1)
 
 
 def shift_for_mode(mode: str) -> int:
@@ -145,8 +235,8 @@ def roll_visual_token_blocks(blocks: torch.Tensor, *, shift: int) -> tuple[torch
         raise ValueError(f"visual token blocks must be [block, token, hidden], got {type(blocks)} {getattr(blocks, 'shape', None)}")
     if blocks.shape[1] < 2:
         raise ValueError(f"visual token series must contain at least two tokens, got {blocks.shape[1]}")
-    if shift not in {-1, 1}:
-        raise ValueError(f"only one-token circular shifts are supported, got shift={shift}")
+    if shift not in {-1, 0, 1}:
+        raise ValueError(f"only no-op or one-token circular shifts are supported, got shift={shift}")
 
     shifted = torch.roll(blocks, shifts=shift, dims=1)
     token_count = int(blocks.shape[1])
@@ -169,6 +259,266 @@ def roll_visual_token_blocks(blocks: torch.Tensor, *, shift: int) -> tuple[torch
 def _tensor_sha256(tensor: torch.Tensor) -> str:
     raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(raw).hexdigest()
+
+
+def _stable_runtime_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_runtime_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_runtime_value(item) for item in value]
+    if isinstance(value, torch.Tensor):
+        return {
+            "type": "torch.Tensor",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "sha256": _tensor_sha256(value),
+        }
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        return {
+            "type": "numpy.ndarray",
+            "shape": list(array.shape),
+            "dtype": str(array.dtype),
+            "sha256": hashlib.sha256(array.view(np.uint8).tobytes()).hexdigest(),
+        }
+    if hasattr(value, "mode") and hasattr(value, "size") and hasattr(value, "tobytes"):
+        raw = value.tobytes()
+        return {
+            "type": type(value).__name__,
+            "mode": str(value.mode),
+            "size": list(value.size),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return {"type": type(value).__name__, "value": str(value)}
+
+
+def write_vllm_runtime_contract(
+    *,
+    model_family: str,
+    dataset: str | None,
+    requests: list[Any],
+    sampling_params: Any,
+) -> None:
+    if not _env_truthy("REPLAY_VLLM_RUNTIME_CONTRACT", "0"):
+        return
+    dump_dir_raw = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR", "").strip()
+    run_id = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", "").strip()
+    if not dump_dir_raw or not run_id:
+        raise RuntimeError("vLLM runtime contract requires dump directory and run id")
+    sampling_fields = (
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop_token_ids",
+        "seed",
+    )
+    contract_level = os.environ.get("REPLAY_VLLM_RUNTIME_CONTRACT_LEVEL", "full").strip().lower()
+    if contract_level not in {"count", "full"}:
+        raise RuntimeError(f"unsupported vLLM runtime contract level: {contract_level!r}")
+    request_hashes = []
+    if contract_level == "full":
+        serialized_requests = [_stable_runtime_value(request) for request in requests]
+        request_hashes = [
+            hashlib.sha256(
+                json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            for request in serialized_requests
+        ]
+    payload = {
+        "phase": "vllm_runtime_contract",
+        "timestamp": time.time(),
+        "run_id": run_id,
+        "mode": canonicalize_visual_token_shift(
+            os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT", "none")
+        ),
+        "model_family": model_family,
+        "dataset": str(dataset) if dataset is not None else None,
+        "request_count": len(requests),
+        "request_hashes": request_hashes,
+        "request_identity_level": contract_level,
+        "effective_infer_batch_size": int(
+            os.environ.get("VLMEVAL_EFFECTIVE_INFER_BATCH_SIZE", len(requests))
+        ),
+        "effective_max_num_seqs": int(os.environ.get("VLLM_MAX_NUM_SEQS", "1")),
+        "sampling_contract": {
+            field: _stable_runtime_value(getattr(sampling_params, field, None))
+            for field in sampling_fields
+        },
+        "inference_fingerprint": os.environ.get("REPLAY_INFERENCE_FINGERPRINT", ""),
+    }
+    dump_dir = Path(dump_dir_raw)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    path = dump_dir / f"vllm_runtime_contract.pid{os.getpid()}.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def roll_vllm_iqiq_image_embeddings(
+    multimodal_embeddings: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    *,
+    shift: int,
+    validate_values: bool = False,
+    require_pair_equality: bool = False,
+) -> tuple[
+    list[torch.Tensor] | tuple[torch.Tensor, ...],
+    dict[str, Any],
+    list[dict[str, torch.Tensor]],
+]:
+    """Roll every request-local I2 in flattened ``[I1, I2, ...]`` order.
+
+    vLLM gathers multimodal items in request order before scattering them into
+    the language-model input. Chunked prefill is disabled by the wrappers, so
+    an IQIQ request contributes exactly two complete image tensors here.
+    """
+    if not isinstance(multimodal_embeddings, (list, tuple)):
+        raise TypeError(
+            "visual-token shift requires per-item vLLM embeddings as a list or tuple, "
+            f"got {type(multimodal_embeddings)}"
+        )
+    if not multimodal_embeddings or len(multimodal_embeddings) % 2 != 0:
+        raise ValueError(
+            "visual-token shift requires a non-empty even sequence [I1, I2] per request, "
+            f"got {len(multimodal_embeddings)} item(s)"
+        )
+    if shift not in {-1, 0, 1}:
+        raise ValueError(f"only no-op or one-token circular shifts are supported, got shift={shift}")
+
+    shifted_items = list(multimodal_embeddings)
+    pair_records: list[dict[str, Any]] = []
+    raw_pairs: list[dict[str, torch.Tensor]] = []
+    deferred_pair_equalities: list[tuple[int, torch.Tensor]] = []
+    for pair_index in range(len(shifted_items) // 2):
+        i1_index = 2 * pair_index
+        i2_index = i1_index + 1
+        i1 = shifted_items[i1_index]
+        i2 = shifted_items[i2_index]
+        if not isinstance(i1, torch.Tensor) or not isinstance(i2, torch.Tensor):
+            raise TypeError(f"vLLM image pair {pair_index} does not contain tensors")
+        if i1.ndim != 2 or i2.ndim != 2:
+            raise ValueError(
+                f"vLLM image pair {pair_index} must be [token, hidden], "
+                f"got {tuple(i1.shape)} and {tuple(i2.shape)}"
+            )
+        if i1.shape != i2.shape:
+            raise ValueError(
+                f"vLLM IQIQ pair {pair_index} has different I1/I2 shapes: "
+                f"{tuple(i1.shape)} vs {tuple(i2.shape)}"
+            )
+        if i2.shape[0] < 2:
+            raise ValueError(
+                f"vLLM IQIQ pair {pair_index} needs at least two visual tokens, got {i2.shape[0]}"
+            )
+        if i1.dtype != i2.dtype or i1.device != i2.device:
+            raise ValueError(
+                f"vLLM IQIQ pair {pair_index} dtype/device mismatch: "
+                f"{i1.dtype}/{i1.device} vs {i2.dtype}/{i2.device}"
+            )
+
+        i1_before = i1.detach().clone() if validate_values else None
+        i2_before = i2.detach().clone() if validate_values else None
+        same_storage = i1.data_ptr() == i2.data_ptr()
+        pair_equal: bool | None = True if same_storage else None
+        if validate_values and not same_storage:
+            pair_equal = bool(torch.equal(i1, i2))
+        elif require_pair_equality and not same_storage:
+            deferred_pair_equalities.append((pair_index, torch.eq(i1, i2).all()))
+        if pair_equal is False:
+            raise ValueError(
+                f"vLLM IQIQ pair {pair_index} is not an exact duplicate before token roll"
+            )
+
+        shifted_i2 = torch.roll(i2, shifts=shift, dims=0)
+        shifted_items[i2_index] = shifted_i2
+        source_indices = [
+            int((output_index - shift) % i2.shape[0])
+            for output_index in range(i2.shape[0])
+        ]
+        pair_record = {
+            "pair_index": pair_index,
+            "i1_item_index": i1_index,
+            "i2_item_index": i2_index,
+            "shape": list(i2.shape),
+            "dtype": str(i2.dtype),
+            "device": str(i2.device),
+            "shift": shift,
+            "token_axis": 0,
+            "source_index_for_output": source_indices,
+            "i1_i2_same_storage_before": same_storage,
+            "i1_i2_equal_exact": pair_equal if (validate_values or require_pair_equality) else None,
+            "i2_out_of_place": shifted_i2.data_ptr() != i2.data_ptr(),
+        }
+        if validate_values:
+            assert i1_before is not None and i2_before is not None
+            expected = i2_before[source_indices]
+            pair_record.update(
+                {
+                    "i1_unchanged_exact": bool(torch.equal(i1, i1_before)),
+                    "i2_source_unchanged_exact": bool(torch.equal(i2, i2_before)),
+                    "i2_roll_exact": bool(torch.equal(shifted_i2, expected)),
+                    "max_abs_error": float(
+                        (shifted_i2.float() - expected.float()).abs().max().item()
+                    ),
+                }
+            )
+            if not all(
+                pair_record[key]
+                for key in (
+                    "i1_unchanged_exact",
+                    "i2_source_unchanged_exact",
+                    "i2_roll_exact",
+                )
+            ):
+                raise RuntimeError(f"vLLM visual-token shift invariant failed: {pair_record}")
+            raw_pairs.append(
+                {
+                    "i1_before": i1_before,
+                    "i1_after": i1.detach().clone(),
+                    "i2_before": i2_before,
+                    "i2_after": shifted_i2.detach().clone(),
+                    "source_index_for_output": torch.tensor(
+                        source_indices,
+                        dtype=torch.long,
+                        device=i2.device,
+                    ),
+                }
+            )
+        pair_records.append(pair_record)
+
+    if deferred_pair_equalities:
+        equality_values = torch.stack(
+            [value for _, value in deferred_pair_equalities]
+        ).detach().cpu().tolist()
+        failed_pairs = []
+        for (pair_index, _), equal in zip(deferred_pair_equalities, equality_values):
+            exact = bool(equal)
+            pair_records[pair_index]["i1_i2_equal_exact"] = exact
+            if not exact:
+                failed_pairs.append(pair_index)
+        if failed_pairs:
+            raise ValueError(
+                "vLLM IQIQ pair(s) are not exact duplicates before token roll: "
+                f"{failed_pairs}"
+            )
+
+    shifted: list[torch.Tensor] | tuple[torch.Tensor, ...]
+    shifted = tuple(shifted_items) if isinstance(multimodal_embeddings, tuple) else shifted_items
+    return shifted, {
+        "item_count": len(shifted_items),
+        "request_pair_count": len(pair_records),
+        "container_type": type(multimodal_embeddings).__name__,
+        "pair_records": pair_records,
+        "value_validation_enabled": validate_values,
+        "pair_equality_required": require_pair_equality,
+    }, raw_pairs
 
 
 class _MiniCPMProcessorCaptureProxy:

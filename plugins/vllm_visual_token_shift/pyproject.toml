@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlmeval-vllm-visual-token-shift-plugin"
+version = "0.1.0"
+description = "vLLM model-registration hook for VLMEvalKit IQIQ visual-token shifts"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+vlmeval_visual_token_shift = "vlmeval.vlm.replay_vllm_visual_token_plugin:register"
+
+[tool.setuptools]
+py-modules = []

@@ -287,6 +287,7 @@ QWEN25VL_LOGICVISTA_SAMPLING_KEYS = [
     "QWEN2VL_VLLM_TOP_K",
     "QWEN2VL_VLLM_MAX_TOKENS",
     "QWEN2VL_VLLM_STOP_TOKEN_IDS",
+    "QWEN2VL_VLLM_SEED",
 ]
 
 
@@ -325,6 +326,7 @@ def apply_dataset_runtime_policy(args, model_name: str, dataset_name: str):
         os.environ.setdefault("QWEN2VL_VLLM_TOP_K", "0")
         os.environ.setdefault("QWEN2VL_VLLM_MAX_TOKENS", "2048")
         os.environ.setdefault("QWEN2VL_VLLM_STOP_TOKEN_IDS", "151645,151643")
+        os.environ.setdefault("QWEN2VL_VLLM_SEED", "1234")
         args.batch_size = batch_size
         print(
             "[RUNTIME_POLICY] LogicVista+Qwen2.5-VL -> "

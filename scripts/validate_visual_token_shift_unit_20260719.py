@@ -20,7 +20,9 @@ SHIFT_MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SHIFT_MODULE)
 VisualTokenShiftController = SHIFT_MODULE.VisualTokenShiftController
 roll_visual_token_blocks = SHIFT_MODULE.roll_visual_token_blocks
+roll_vllm_iqiq_image_embeddings = SHIFT_MODULE.roll_vllm_iqiq_image_embeddings
 validate_iqiq_topology = SHIFT_MODULE.validate_iqiq_topology
+write_vllm_runtime_contract = SHIFT_MODULE.write_vllm_runtime_contract
 
 
 class FakeQwenVisual(torch.nn.Module):
@@ -81,6 +83,74 @@ def main() -> None:
         "pure_right_exact": right_record["exact_roll_verified"] and right_record["max_abs_error"] == 0.0,
         "pure_left_exact": left_record["exact_roll_verified"] and left_record["max_abs_error"] == 0.0,
     }
+    cached_pair0 = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+    pair1 = torch.tensor([[10.0], [20.0], [30.0]])
+    vllm_input = [cached_pair0, cached_pair0, pair1.clone(), pair1.clone()]
+    vllm_shifted, vllm_audit, vllm_raw = roll_vllm_iqiq_image_embeddings(
+        vllm_input,
+        shift=1,
+        validate_values=True,
+    )
+    vllm_noop, vllm_noop_audit, _ = roll_vllm_iqiq_image_embeddings(
+        vllm_input,
+        shift=0,
+        validate_values=True,
+    )
+    checks.update(
+        {
+            "vllm_batch_pair_count_two": vllm_audit["request_pair_count"] == 2,
+            "vllm_batch_i1_pair0_unchanged": torch.equal(vllm_shifted[0], cached_pair0),
+            "vllm_batch_i2_pair0_1234_to_4123": vllm_shifted[1].flatten().tolist()
+            == [4.0, 1.0, 2.0, 3.0],
+            "vllm_batch_i2_pair1_right_roll": vllm_shifted[3].flatten().tolist()
+            == [30.0, 10.0, 20.0],
+            "vllm_cache_alias_not_mutated": vllm_input[0].flatten().tolist()
+            == [1.0, 2.0, 3.0, 4.0]
+            and vllm_input[1].flatten().tolist() == [1.0, 2.0, 3.0, 4.0],
+            "vllm_shift_out_of_place": vllm_shifted[1].data_ptr() != vllm_input[1].data_ptr(),
+            "vllm_raw_has_both_pairs": len(vllm_raw) == 2,
+            "vllm_noop_values_exact": all(
+                torch.equal(before, after)
+                for before, after in zip(vllm_input, vllm_noop)
+            ),
+            "vllm_noop_uses_same_audit_path": all(
+                pair_record["shift"] == 0 and pair_record["i2_roll_exact"]
+                for pair_record in vllm_noop_audit["pair_records"]
+            ),
+        }
+    )
+    try:
+        roll_vllm_iqiq_image_embeddings(vllm_input[:3], shift=1)
+    except ValueError:
+        checks["vllm_odd_item_count_fails_closed"] = True
+    else:
+        checks["vllm_odd_item_count_fails_closed"] = False
+    unequal = [cached_pair0, cached_pair0 + 1]
+    try:
+        roll_vllm_iqiq_image_embeddings(unequal, shift=1, validate_values=True)
+    except ValueError:
+        checks["vllm_nonduplicate_pair_fails_closed"] = True
+    else:
+        checks["vllm_nonduplicate_pair_fails_closed"] = False
+    _, deferred_audit, _ = roll_vllm_iqiq_image_embeddings(
+        [cached_pair0.clone(), cached_pair0.clone(), pair1.clone(), pair1.clone()],
+        shift=1,
+        require_pair_equality=True,
+    )
+    checks["vllm_strict_batch_equality_aggregated"] = all(
+        pair_record["i1_i2_equal_exact"] is True
+        for pair_record in deferred_audit["pair_records"]
+    )
+    try:
+        roll_vllm_iqiq_image_embeddings(
+            unequal,
+            shift=1,
+            require_pair_equality=True,
+        )
+    except ValueError:
+        checks["vllm_strict_deferred_nonduplicate_fails_closed"] = True
+    else:
+        checks["vllm_strict_deferred_nonduplicate_fails_closed"] = False
     iq = [{"type": "image", "value": "/tmp/i.png"}, {"type": "text", "value": "Q"}]
     iqiq = iq + [dict(item) for item in iq]
     topology = validate_iqiq_topology(
@@ -105,6 +175,62 @@ def main() -> None:
         checks["multi_image_source_fails_closed"] = True
     else:
         checks["multi_image_source_fails_closed"] = False
+
+    contract_dir = args.output_dir / "runtime-contract"
+    configure(contract_dir, "roll_right_1")
+    os.environ["REPLAY_VLLM_RUNTIME_CONTRACT"] = "1"
+    os.environ["REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID"] = "unit-runtime-contract"
+    write_vllm_runtime_contract(
+        model_family="qwen2_5_vl",
+        dataset="sentinel",
+        requests=[
+            {"prompt": "first", "image": torch.tensor([1, 2])},
+            {"prompt": "second", "image": torch.tensor([3, 4])},
+        ],
+        sampling_params=SimpleNamespace(
+            max_tokens=128,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            stop_token_ids=[1, 2],
+            seed=0,
+        ),
+    )
+    contract_path = next(contract_dir.glob("vllm_runtime_contract.pid*.jsonl"))
+    contract = json.loads(contract_path.read_text().strip())
+    checks["runtime_contract_two_distinct_requests"] = (
+        contract["request_count"] == 2
+        and len(set(contract["request_hashes"])) == 2
+    )
+    checks["runtime_contract_sampling_exact"] = contract["sampling_contract"] == {
+        "max_tokens": 128,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "stop_token_ids": [1, 2],
+        "seed": 0,
+    }
+    os.environ["REPLAY_VLLM_RUNTIME_CONTRACT_LEVEL"] = "count"
+    write_vllm_runtime_contract(
+        model_family="qwen2_5_vl",
+        dataset="sentinel",
+        requests=[object(), object()],
+        sampling_params=SimpleNamespace(max_tokens=128),
+    )
+    count_contract = json.loads(contract_path.read_text().splitlines()[-1])
+    checks["runtime_count_contract_skips_request_serialization"] = (
+        count_contract["request_identity_level"] == "count"
+        and count_contract["request_count"] == 2
+        and count_contract["request_hashes"] == []
+    )
+    os.environ["REPLAY_VLLM_RUNTIME_CONTRACT_LEVEL"] = "full"
+    os.environ["REPLAY_VLLM_RUNTIME_CONTRACT"] = "0"
 
     qwen_dir = args.output_dir / "qwen"
     configure(qwen_dir, "roll_right_1")

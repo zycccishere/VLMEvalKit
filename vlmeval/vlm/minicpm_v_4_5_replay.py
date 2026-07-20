@@ -31,7 +31,10 @@ from .replay_image_transform import (
 )
 from .replay_visual_token_shift import (
     VisualTokenShiftController,
+    arm_vllm_visual_token_shift_recording,
+    require_vllm_visual_token_shift_worker_handshake,
     visual_token_shift_enabled,
+    write_vllm_runtime_contract,
 )
 from ..smp import *
 
@@ -110,7 +113,7 @@ class MiniCPM_V_4_5(BaseModel):
             self.vllm_chat_template = self._build_vllm_chat_template(
                 Path(CHAT_TEMPLATES_DIR) / "template_minicpmv45.jinja"
             )
-            self.llm = LLM(
+            llm_kwargs = dict(
                 model=self.model_path,
                 trust_remote_code=True,
                 tensor_parallel_size=tp_size,
@@ -120,6 +123,15 @@ class MiniCPM_V_4_5(BaseModel):
                 gpu_memory_utilization=self.vllm_gpu_memory_utilization,
                 chat_template=self.vllm_chat_template,
             )
+            max_num_batched_tokens = os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", "").strip()
+            if max_num_batched_tokens.isdigit():
+                llm_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+            if visual_token_shift_enabled():
+                os.environ["REPLAY_VISUAL_TOKEN_SHIFT_CHUNKED_PREFILL_DISABLED"] = "1"
+                os.environ["REPLAY_VISUAL_TOKEN_SHIFT_PREFIX_CACHING_DISABLED"] = "1"
+                llm_kwargs["enable_chunked_prefill"] = False
+                llm_kwargs["enable_prefix_caching"] = False
+            self.llm = LLM(**llm_kwargs)
             print(
                 f"[MiniCPM_V_4_5] using vLLM tp={tp_size} "
                 f"max_model_len={self.vllm_max_model_len} max_num_seqs={self.vllm_max_num_seqs}",
@@ -691,6 +703,12 @@ class MiniCPM_V_4_5(BaseModel):
             [{"role": "user", "content": self._message_to_vllm_content(message, dataset=dataset)}]
             for message in messages
         ]
+        write_vllm_runtime_contract(
+            model_family="minicpm_o_4_5",
+            dataset=dataset,
+            requests=conversations,
+            sampling_params=sampling_params,
+        )
         outputs = self.llm.chat(
             conversations,
             sampling_params=sampling_params,
@@ -822,23 +840,22 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
     """Replay-enabled MiniCPM-V 4.5 with minimal message-level preprocessing."""
 
     def __init__(self, *args, **kwargs):
-        token_shift_requested = visual_token_shift_enabled()
-        if token_shift_requested:
-            # HF preserves each original image and slice boundary through
-            # get_vision_embedding; the generic vLLM route does not expose it.
-            kwargs["use_vllm"] = False
-            kwargs["_hf_vision_only"] = True
         super().__init__(*args, **kwargs)
+        if visual_token_shift_enabled() and self.use_vllm:
+            require_vllm_visual_token_shift_worker_handshake(model_family="minicpm_o_4_5")
+            arm_vllm_visual_token_shift_recording(model_family="minicpm_o_4_5")
         self.visual_token_shift = VisualTokenShiftController(
             model_family="minicpm45",
             model_name=self.model_path,
         )
         if self.visual_token_shift.enabled:
-            self.processor = self.visual_token_shift.wrap_minicpm_processor(self.processor)
-            self.visual_token_shift.install_minicpm_hf_hook(self.model)
+            backend = "vllm" if self.use_vllm else "hf"
+            if not self.use_vllm:
+                self.processor = self.visual_token_shift.wrap_minicpm_processor(self.processor)
+                self.visual_token_shift.install_minicpm_hf_hook(self.model)
             print(
                 f"[MiniCPM_V_4_5_Replay] visual_token_shift={self.visual_token_shift.mode} "
-                f"target_image_position={self.visual_token_shift.target_image_position} backend=hf",
+                f"target_image_position={self.visual_token_shift.target_image_position} backend={backend}",
                 flush=True,
             )
         self.replay_cfg = read_replay_config_from_env()
@@ -1058,6 +1075,8 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             repeat_times=self.replay_cfg["repeat_times"],
             image_transform_name=self.image_transform_name,
         )
+        if self.use_vllm:
+            return contextlib.nullcontext()
         return controller.sample(
             dataset=dataset,
             sample_meta=self._extract_replay_meta(original),
@@ -1104,6 +1123,12 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             )
             replayed_messages.append(replayed)
         if self.use_vllm:
+            for original, replayed in zip(messages, replayed_messages):
+                self._visual_token_shift_context(
+                    original=original,
+                    replayed=replayed,
+                    dataset=dataset,
+                )
             return self._generate_batch_inner_vllm(replayed_messages, dataset=dataset)
         generate_one = super().generate_inner
         results = []

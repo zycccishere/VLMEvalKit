@@ -1,6 +1,6 @@
-name: three_model_iqiq_image2_visual_token_roll_infer_20260719
+name: three_model_iqiq_image2_visual_token_roll_vllm_infer_20260720
 repo_root: "{repo_root}"
-results_root: runs/three_model_iqiq_image2_visual_token_roll_20260719
+results_root: runs/three_model_iqiq_image2_visual_token_roll_vllm_20260720
 node_gpu_ids: "0,1,2,3,4,5,6,7"
 scheduler: gpu_pool
 datasets:
@@ -56,5 +56,5 @@ evaluation:
 worker_monitor:
   enable: true
   interval_seconds: 300
-resume_infer_default: true
+resume_infer_default: false
 resume_infer_start_delay_seconds: 0

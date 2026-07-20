@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -181,6 +182,18 @@ def format_value(value: Any, repo_root: str) -> Any:
                 "MINICPM_TOKEN_ROLL_PYDEPS",
                 str(Path(token_roll_runtime_root) / "minicpmo-token-roll-pydeps"),
             ),
+            "qwen_token_roll_vllm_python": os.environ.get(
+                "QWEN_TOKEN_ROLL_VLLM_PYTHON",
+                "/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python",
+            ),
+            "minicpm_token_roll_vllm_python": os.environ.get(
+                "MINICPM_TOKEN_ROLL_VLLM_PYTHON",
+                "/user/zhangyicheng/miniconda3/envs/vlmeval_qwen35_vllm/bin/python",
+            ),
+            "vllm_token_roll_plugin_overlay": os.environ.get(
+                "VLLM_TOKEN_ROLL_PLUGIN_OVERLAY",
+                str(Path(repo_root) / ".vllm_plugin_overlay"),
+            ),
         }
         try:
             return value.format(**mapping)
@@ -303,6 +316,8 @@ class BenchmarkRunner:
     def __init__(self, repo_root: Path, args: argparse.Namespace) -> None:
         self.repo_root_path = repo_root
         self.args = args
+        self.matrix_config_path = Path(args.matrix_config).resolve()
+        self.model_config_path = Path(args.model_config).resolve()
         matrix = load_yaml(args.matrix_config)
         models_cfg = load_yaml(args.model_config)
         default_repo_root = str(repo_root)
@@ -312,10 +327,35 @@ class BenchmarkRunner:
         self.matrix_name = matrix["name"]
         self.node_gpu_ids = split_names(args.gpu_ids or str(matrix.get("node_gpu_ids", "0,1,2,3,4,5,6,7")))
         self.resume_infer = args.resume_infer if args.resume_infer is not None else truthy(matrix.get("resume_infer_default", False))
+        self.inference_cfg = matrix.get("inference", {})
+        self.inference_launch_mode = str(
+            self.inference_cfg.get("launch_mode", "run")
+        ).strip().lower()
+        if self.inference_launch_mode not in {"run", "existing"}:
+            raise ValueError(
+                f"Unsupported inference launch mode: {self.inference_launch_mode}"
+            )
+        self.inference_producer_matrix = str(
+            self.inference_cfg.get("producer_matrix", "")
+        ).strip()
+        if self.inference_launch_mode == "existing" and not self.inference_producer_matrix:
+            raise ValueError(
+                "inference.launch_mode=existing requires inference.producer_matrix"
+            )
         self.evaluation_cfg = matrix.get("evaluation", {})
         self.replay_cfg = matrix.get("replay", {})
         self.answer_format_cfg = matrix.get("answer_format", {})
         self.trace_cfg = matrix.get("trace", {})
+        self.infer_batch_size_override = (
+            int(matrix["infer_batch_size_override"])
+            if matrix.get("infer_batch_size_override") is not None
+            else None
+        )
+        self.max_num_seqs_override = (
+            int(matrix["max_num_seqs_override"])
+            if matrix.get("max_num_seqs_override") is not None
+            else None
+        )
         self.scheduler = str(args.scheduler or matrix.get("scheduler", "model_sequential")).strip()
         if self.scheduler not in {"model_sequential", "gpu_pool"}:
             raise ValueError(f"Unsupported scheduler: {self.scheduler}")
@@ -335,6 +375,8 @@ class BenchmarkRunner:
         )
         self.resume_infer_start_delay_seconds = max(0, int(resume_delay_raw))
         self.expected_count_cache: dict[tuple[str, str], int] = {}
+        self.content_identity_cache: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+        self.content_identity_lock = threading.Lock()
         self.env_ready: set[str] = set()
         self.env_ready_lock = threading.Lock()
         self.failures: list[str] = []
@@ -514,11 +556,25 @@ class BenchmarkRunner:
                     "node_rank": self.args.node_rank,
                     "gpu_ids": self.node_gpu_ids,
                     "resume_infer": self.resume_infer,
+                    "inference_launch_mode": self.inference_launch_mode,
+                    "inference_producer_matrix": self.inference_producer_matrix,
                     "scheduler": self.scheduler,
                     "results_root": str(self.results_root),
                     "task_manifest": str(self.task_manifest_path) if self.task_manifest_path is not None else "",
                     "task_count": len(self.tasks),
                     "model_order": self.model_order,
+                    "model_runtime": {
+                        model_key: {
+                            "env_profile": self.models[model_key].env_profile,
+                            "gpus_per_job": self.models[model_key].gpus_per_job,
+                            "infer_batch_size": self.infer_batch_size_override
+                            or self.models[model_key].infer_batch_size,
+                            "max_num_seqs": self.max_num_seqs_override
+                            or self.models[model_key].max_num_seqs,
+                            "tp_size": self.models[model_key].tp_size,
+                        }
+                        for model_key in self.model_order
+                    },
                     "policy_order": self.policy_order,
                     "mode_order": self.mode_order,
                     "transform_order": self.transform_order,
@@ -812,6 +868,7 @@ class BenchmarkRunner:
             "QWEN2VL_VLLM_TOP_K",
             "QWEN2VL_VLLM_MAX_TOKENS",
             "QWEN2VL_VLLM_STOP_TOKEN_IDS",
+            "QWEN2VL_VLLM_SEED",
         ]
         if not self._logicvista_qwen25vl_v0_enabled(model, task):
             for key in sampling_keys:
@@ -819,8 +876,12 @@ class BenchmarkRunner:
             return
         env["LOGICVISTA_QWEN25VL_FORCE_V0"] = "1"
         env["LOGICVISTA_QWEN25VL_LEGACY_SAMPLING"] = "1"
-        env.setdefault("LOGICVISTA_QWEN25VL_BATCH_SIZE", "128")
-        env.setdefault("LOGICVISTA_QWEN25VL_MAX_NUM_SEQS", "128")
+        env["LOGICVISTA_QWEN25VL_BATCH_SIZE"] = str(
+            self.infer_batch_size_for_task(model, task)
+        )
+        env["LOGICVISTA_QWEN25VL_MAX_NUM_SEQS"] = str(
+            self.max_num_seqs_for_task(model, task)
+        )
         env["VLLM_USE_V1"] = "0"
         env.setdefault("QWEN2VL_VLLM_REPETITION_PENALTY", "1.05")
         env.setdefault("QWEN2VL_VLLM_TEMPERATURE", "0.01")
@@ -828,16 +889,13 @@ class BenchmarkRunner:
         env.setdefault("QWEN2VL_VLLM_TOP_K", "0")
         env.setdefault("QWEN2VL_VLLM_MAX_TOKENS", "2048")
         env.setdefault("QWEN2VL_VLLM_STOP_TOKEN_IDS", "151645,151643")
+        env.setdefault("QWEN2VL_VLLM_SEED", "1234")
 
     def infer_batch_size_for_task(self, model: ModelSpec, task: Task) -> int:
-        if task.visual_token_shift != "none":
-            return 1
-        return model.infer_batch_size
+        return self.infer_batch_size_override or model.infer_batch_size
 
     def max_num_seqs_for_task(self, model: ModelSpec, task: Task) -> int:
-        if task.visual_token_shift != "none":
-            return 1
-        return model.max_num_seqs
+        return self.max_num_seqs_override or model.max_num_seqs
 
     def build_env(self, model: ModelSpec, task: Task, gpu_ids: list[str]) -> dict[str, str]:
         profile = self.env_profiles[model.env_profile]
@@ -882,7 +940,14 @@ class BenchmarkRunner:
         )
         env["REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR"] = str(self.task_root(task) / "_visual_token_shift")
         if task.visual_token_shift != "none":
-            env["MINICPM45_USE_VLLM"] = "0"
+            if self._is_qwen25vl_model(model):
+                env["REPLAY_VLLM_TARGET_FAMILY"] = "qwen2_5_vl"
+            elif model.key.startswith("minicpm_o_45"):
+                env["REPLAY_VLLM_TARGET_FAMILY"] = "minicpm_o_4_5"
+            else:
+                raise ValueError(
+                    f"visual-token shift has no vLLM target family for model {model.key}"
+                )
         env["REPLAY_PROMPT_TEMPLATE_NAME"] = policy.replay_prompt_template_name
         env["REPLAY_TIMES"] = str(self.replay_cfg.get("replay_times", 1))
         env["REPLAY_DEBUG"] = "0"
@@ -911,6 +976,15 @@ class BenchmarkRunner:
                 env["REPLAY_STAGE_DEBUG_SAMPLES"] = str(self.trace_cfg.get("samples", 1))
                 env["REPLAY_PROMPT_AUDIT"] = "1"
                 env["REPLAY_PROMPT_AUDIT_PRINT"] = str(int(truthy(self.trace_cfg.get("prompt_audit_print", False))))
+        env["REPLAY_VLLM_RUNTIME_CONTRACT"] = str(
+            int(trace_level == "full" or self.explicit_visual_token_shift_axis)
+        )
+        env["REPLAY_VLLM_RUNTIME_CONTRACT_LEVEL"] = (
+            "full" if trace_level == "full" else "count"
+        )
+        env["REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION"] = str(
+            int(trace_level == "full")
+        )
         allowlist_path = self.dataset_index_allowlists.get(task.dataset)
         if allowlist_path:
             env["DATASET_INDEX_ALLOWLIST_FILE"] = str(allowlist_path)
@@ -921,6 +995,9 @@ class BenchmarkRunner:
             env["REPLAY_BLANK_IMAGE_POSITIONS"] = "2"
             env["REPLAY_BLANK_IMAGE_PATH"] = str(blank_asset)
         max_num_seqs = self.max_num_seqs_for_task(model, task)
+        env["VLMEVAL_EFFECTIVE_INFER_BATCH_SIZE"] = str(
+            self.infer_batch_size_for_task(model, task)
+        )
         env["MINICPM45_VLLM_TP_SIZE"] = str(model.tp_size)
         env["MINICPM45_VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
         env["GEMMA3_VLLM_TP_SIZE"] = str(model.tp_size)
@@ -1243,8 +1320,422 @@ except Exception:
                 "registry_name": model.registry_name,
                 "model_path": model.model_path,
             },
+            "runtime": {
+                "env_profile": model.env_profile,
+                "gpus_per_job": model.gpus_per_job,
+                "infer_batch_size": self.infer_batch_size_for_task(model, task),
+                "max_num_seqs": self.max_num_seqs_for_task(model, task),
+                "tp_size": model.tp_size,
+            },
             "expected_rows": expected,
             "updated_at": self._timestamp(),
+        }
+
+    def visual_token_shift_impl_sha256(self) -> str:
+        relative_paths = (
+            "run.py",
+            "configs/models.yaml",
+            "vlmeval/vlm/replay_policy.py",
+            "vlmeval/vlm/qwen2_vl/replay_prompt_template.py",
+            "vlmeval/vlm/replay_visual_token_shift.py",
+            "vlmeval/vlm/replay_vllm_visual_token_models.py",
+            "vlmeval/vlm/replay_vllm_visual_token_plugin.py",
+            "vlmeval/vlm/qwen2_vl/model.py",
+            "vlmeval/vlm/minicpm_v_4_5_replay.py",
+            "vlmeval/cli/run_benchmark.py",
+        )
+        digest = hashlib.sha256()
+        for relative_path in relative_paths:
+            path = Path(self.repo_root) / relative_path
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        digest.update(str(self.matrix_config_path).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(self.matrix_config_path.read_bytes())
+        digest.update(b"\0")
+        digest.update(str(self.model_config_path).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(self.model_config_path.read_bytes())
+        digest.update(b"\0")
+        return digest.hexdigest()
+
+    def visual_token_shift_mechanism_sha256(self) -> str:
+        """Hash the mechanism code shared by smoke and production matrices."""
+        relative_paths = (
+            "run.py",
+            "configs/models.yaml",
+            "plugins/vllm_visual_token_shift/pyproject.toml",
+            "scripts/install_vllm_visual_token_shift_plugin.py",
+            "vlmeval/vlm/replay_policy.py",
+            "vlmeval/vlm/qwen2_vl/replay_prompt_template.py",
+            "vlmeval/vlm/replay_visual_token_shift.py",
+            "vlmeval/vlm/replay_vllm_visual_token_models.py",
+            "vlmeval/vlm/replay_vllm_visual_token_plugin.py",
+            "vlmeval/vlm/qwen2_vl/model.py",
+            "vlmeval/vlm/minicpm_v_4_5_replay.py",
+            "vlmeval/cli/run_benchmark.py",
+        )
+        digest = hashlib.sha256()
+        for relative_path in relative_paths:
+            path = Path(self.repo_root) / relative_path
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def visual_token_shift_validation_harness_sha256(self) -> str:
+        """Hash the real-smoke contract that is allowed to issue certificates."""
+        relative_paths = (
+            "configs/index_allowlists/token_roll_logicvista_first3_20260720.txt",
+            "configs/index_allowlists/token_roll_mathvision_first3_20260720.txt",
+            "configs/matrix_qwen3b_logicvista_iqiq_visual_token_roll_vllm_v0_smoke_20260720.yaml",
+            "configs/matrix_three_model_iqiq_visual_token_roll_vllm_smoke_20260720.yaml",
+            "scripts/run_vllm_visual_token_shift_real_smokes_20260720.sh",
+            "scripts/validate_vllm_visual_token_shift_real_dump_20260720.py",
+        )
+        digest = hashlib.sha256()
+        for relative_path in relative_paths:
+            path = Path(self.repo_root) / relative_path
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _allowlist_identity(self, task: Task) -> dict[str, Any]:
+        raw_path = self.dataset_index_allowlists.get(task.dataset)
+        if not raw_path:
+            return {"path": None, "sha256": None}
+        path = Path(raw_path).resolve()
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    @staticmethod
+    def _stream_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _sampled_sha256(path: Path) -> str:
+        size = path.stat().st_size
+        sample_size = 1024 * 1024
+        if size <= 3 * sample_size:
+            return BenchmarkRunner._stream_sha256(path)
+        digest = hashlib.sha256()
+        digest.update(str(size).encode("ascii"))
+        with path.open("rb") as handle:
+            for offset in (0, max(0, size // 2 - sample_size // 2), size - sample_size):
+                handle.seek(offset)
+                digest.update(str(offset).encode("ascii"))
+                digest.update(handle.read(sample_size))
+        return digest.hexdigest()
+
+    def _file_content_identity(self, path: Path, *, sampled: bool = False) -> dict[str, Any]:
+        resolved = path.resolve()
+        stat = resolved.stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        cache_key = f"{'sampled' if sampled else 'full'}:{resolved}"
+        with self.content_identity_lock:
+            cached = self.content_identity_cache.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                return dict(cached[1])
+            payload = {
+                "path": str(resolved),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "digest_kind": "sampled_head_middle_tail_1m" if sampled else "full_sha256",
+                "sha256": self._sampled_sha256(resolved) if sampled else self._stream_sha256(resolved),
+            }
+            self.content_identity_cache[cache_key] = (signature, payload)
+            return dict(payload)
+
+    def _source_tree_identity(self, root: Path) -> dict[str, Any]:
+        resolved = root.resolve()
+        paths = sorted(path for path in resolved.rglob("*.py") if path.is_file())
+        signature = tuple(
+            (str(path.relative_to(resolved)), path.stat().st_size, path.stat().st_mtime_ns)
+            for path in paths
+        )
+        cache_key = f"python-tree:{resolved}"
+        with self.content_identity_lock:
+            cached = self.content_identity_cache.get(cache_key)
+            if cached is not None and cached[0] == signature:
+                return dict(cached[1])
+            digest = hashlib.sha256()
+            for path in paths:
+                digest.update(str(path.relative_to(resolved)).encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+                digest.update(b"\0")
+            payload = {
+                "root": str(resolved),
+                "python_file_count": len(paths),
+                "python_source_sha256": digest.hexdigest(),
+            }
+            self.content_identity_cache[cache_key] = (signature, payload)
+            return dict(payload)
+
+    def _dataset_identity(self, task: Task, env: dict[str, str]) -> dict[str, Any]:
+        data_root = Path(env.get("LMUData", "")).expanduser()
+        candidates = [
+            data_root / f"{task.dataset}{suffix}"
+            for suffix in (".tsv", ".json", ".jsonl", ".xlsx")
+        ]
+        paths = [path for path in candidates if path.is_file()]
+        if not paths:
+            raise FileNotFoundError(
+                f"cannot fingerprint dataset artifact for {task.dataset} under {data_root}"
+            )
+        return {
+            "dataset": task.dataset,
+            "artifacts": [self._file_content_identity(path) for path in paths],
+            "media_binding": "dataset artifact includes the benchmark image payload or path field",
+        }
+
+    def _model_identity(self, model: ModelSpec) -> dict[str, Any]:
+        path = Path(model.model_path).expanduser()
+        payload: dict[str, Any] = {
+            "configured_path": model.model_path,
+            "exists": path.exists(),
+            "resolved_path": str(path.resolve()) if path.exists() else None,
+            "files": [],
+        }
+        if not path.is_dir():
+            return payload
+        files = []
+        for pattern in ("*.json", "*.py", "*.txt", "*.model", "*.safetensors", "*.bin"):
+            for candidate in path.glob(pattern):
+                if not candidate.is_file():
+                    continue
+                stat = candidate.stat()
+                record = {"name": candidate.name}
+                if candidate.suffix in {".safetensors", ".bin"} and stat.st_size > 8 * 1024 * 1024:
+                    record.update(self._file_content_identity(candidate, sampled=True))
+                else:
+                    record.update(self._file_content_identity(candidate))
+                files.append(record)
+        payload["files"] = sorted(files, key=lambda item: item["name"])
+        return payload
+
+    def _runtime_identity(self, model: ModelSpec, env: dict[str, str]) -> dict[str, Any]:
+        profile = self.env_profiles[model.env_profile]
+        script = """
+import importlib.util
+import json
+import platform
+import sys
+from importlib.metadata import PackageNotFoundError, version
+
+names = ["vllm", "transformers", "torch"]
+versions = {}
+source_roots = {}
+for name in names:
+    try:
+        versions[name] = version(name)
+    except PackageNotFoundError:
+        versions[name] = None
+    spec = importlib.util.find_spec(name)
+    roots = list(spec.submodule_search_locations or []) if spec is not None else []
+    source_roots[name] = roots[0] if roots else None
+print(json.dumps({
+    "python": sys.executable,
+    "python_version": platform.python_version(),
+    "packages": versions,
+    "source_roots": source_roots,
+}, sort_keys=True))
+"""
+        proc = subprocess.run(
+            [profile.python, "-c", script],
+            cwd=self.repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"failed to fingerprint runtime {model.env_profile}: {proc.stderr.strip()}"
+            )
+        payload = json.loads(proc.stdout.strip())
+        payload["source_identity"] = {
+            name: self._source_tree_identity(Path(root))
+            for name, root in payload.pop("source_roots").items()
+            if name in {"vllm", "transformers"} and root
+        }
+        return payload
+
+    def inference_provenance(
+        self,
+        task: Task,
+        model: ModelSpec,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        excluded_env = {
+            "CUDA_VISIBLE_DEVICES",
+            "REPLAY_INFERENCE_FINGERPRINT",
+            "REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID",
+        }
+        prefixes = (
+            "REPLAY_",
+            "VLLM_",
+            "QWEN2VL_",
+            "MINICPM45_",
+            "LOGICVISTA_",
+            "VLMEVAL_",
+        )
+        semantic_env = {
+            key: value
+            for key, value in sorted(env.items())
+            if key not in excluded_env
+            and (key == "PYTHONPATH" or key == "DATASET_INDEX_ALLOWLIST_FILE" or key.startswith(prefixes))
+        }
+        model_identity = self._model_identity(model)
+        runtime_identity = self._runtime_identity(model, env)
+        components = {
+            "schema_version": 2,
+            "implementation_sha256": self.visual_token_shift_impl_sha256(),
+            "mechanism_implementation_sha256": self.visual_token_shift_mechanism_sha256(),
+            "validation_harness_sha256": (
+                self.visual_token_shift_validation_harness_sha256()
+            ),
+            "repository_source_identity": self._source_tree_identity(
+                Path(self.repo_root) / "vlmeval"
+            ),
+            "allowlist": self._allowlist_identity(task),
+            "dataset_identity": self._dataset_identity(task, env),
+            "model_identity": model_identity,
+            "runtime_identity": runtime_identity,
+            "semantic_env": semantic_env,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(components, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return {**components, "fingerprint": fingerprint}
+
+    @staticmethod
+    def _smoke_binding_components(
+        provenance: dict[str, Any],
+        *,
+        model_key: str,
+        model_family: str,
+        mode: str,
+        engine_mode: str,
+    ) -> dict[str, Any]:
+        runtime = provenance.get("runtime_identity") or {}
+        runtime_sources = runtime.get("source_identity") or {}
+        model = provenance.get("model_identity") or {}
+        normalized_files = sorted(
+            (
+                {
+                    key: item.get(key)
+                    for key in ("name", "size", "digest_kind", "sha256")
+                }
+                for item in model.get("files", [])
+            ),
+            key=lambda item: str(item.get("name")),
+        )
+        model_content = {
+            "configured_path": model.get("configured_path"),
+            "resolved_path": model.get("resolved_path"),
+            "files": normalized_files,
+        }
+        model_content_sha256 = hashlib.sha256(
+            json.dumps(model_content, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return {
+            "schema_version": 1,
+            "model_key": model_key,
+            "model_family": model_family,
+            "mode": mode,
+            "vllm_engine_mode": engine_mode,
+            "mechanism_implementation_sha256": provenance.get(
+                "mechanism_implementation_sha256"
+            ),
+            "validation_harness_sha256": provenance.get(
+                "validation_harness_sha256"
+            ),
+            "repository_python_source_sha256": (
+                provenance.get("repository_source_identity") or {}
+            ).get("python_source_sha256"),
+            "runtime": {
+                "python": runtime.get("python"),
+                "python_version": runtime.get("python_version"),
+                "packages": runtime.get("packages"),
+                "vllm_python_source_sha256": (
+                    runtime_sources.get("vllm") or {}
+                ).get("python_source_sha256"),
+                "transformers_python_source_sha256": (
+                    runtime_sources.get("transformers") or {}
+                ).get("python_source_sha256"),
+            },
+            "model": {
+                "configured_path": model.get("configured_path"),
+                "resolved_path": model.get("resolved_path"),
+                "content_sha256": model_content_sha256,
+            },
+        }
+
+    def verify_vllm_visual_token_shift_smoke_certificate(
+        self,
+        task: Task,
+        model: ModelSpec,
+        env: dict[str, str],
+        inference_provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        certificate_path_raw = env.get(
+            "REPLAY_VISUAL_TOKEN_SHIFT_SMOKE_CERTIFICATE", ""
+        ).strip()
+        if not certificate_path_raw:
+            raise RuntimeError(
+                "lightweight vLLM token shift requires "
+                "REPLAY_VISUAL_TOKEN_SHIFT_SMOKE_CERTIFICATE"
+            )
+        certificate_path = Path(certificate_path_raw).expanduser().resolve()
+        certificate_bytes = certificate_path.read_bytes()
+        certificate = json.loads(certificate_bytes)
+        smoke_certificate = certificate.get("smoke_certificate") or {}
+        if (
+            certificate.get("all_passed") is not True
+            or smoke_certificate.get("schema_version") != 1
+            or smoke_certificate.get("valid") is not True
+        ):
+            raise RuntimeError("vLLM token-shift smoke certificate is not valid")
+        expected_components = self._smoke_binding_components(
+            inference_provenance,
+            model_key=model.key,
+            model_family=env.get("REPLAY_VLLM_TARGET_FAMILY", ""),
+            mode=task.visual_token_shift,
+            engine_mode="v0" if env.get("VLLM_USE_V1") == "0" else "v1",
+        )
+        expected_fingerprint = hashlib.sha256(
+            json.dumps(
+                expected_components, ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+        matches = [
+            entry
+            for entry in smoke_certificate.get("entries", [])
+            if entry.get("binding_fingerprint") == expected_fingerprint
+            and entry.get("binding") == expected_components
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "no unique full-smoke certificate matches the current "
+                f"code/runtime/model/mode identity: {expected_fingerprint}"
+            )
+        return {
+            "schema_version": 1,
+            "path": str(certificate_path),
+            "file_sha256": hashlib.sha256(certificate_bytes).hexdigest(),
+            "binding_fingerprint": expected_fingerprint,
         }
 
     def prediction_file_valid(self, pred_file: Path | None, expected: int) -> bool:
@@ -1268,7 +1759,16 @@ except Exception:
                 return False
         return True
 
-    def write_prediction_manifest(self, task: Task, model: ModelSpec, expected: int, pred_file: Path) -> None:
+    def write_prediction_manifest(
+        self,
+        task: Task,
+        model: ModelSpec,
+        expected: int,
+        pred_file: Path,
+        mechanism_evidence: dict[str, Any] | None = None,
+        runtime_contract_run_id: str | None = None,
+        inference_provenance: dict[str, Any] | None = None,
+    ) -> None:
         payload = self._task_payload(task, model, expected)
         payload.update(
             {
@@ -1276,6 +1776,9 @@ except Exception:
                 "status": "complete",
                 "prediction_file": str(pred_file),
                 "prediction_dir": str(self.prediction_dir(task)),
+                "mechanism_evidence": mechanism_evidence,
+                "runtime_contract_run_id": runtime_contract_run_id,
+                "inference_provenance": inference_provenance,
             }
         )
         self._write_json(self.prediction_manifest_path(task), payload)
@@ -1296,12 +1799,166 @@ except Exception:
         )
         self._write_json(self.eval_manifest_path(task), payload)
 
-    def infer_complete(self, task: Task, model: ModelSpec, expected: int) -> bool:
+    def infer_complete(
+        self,
+        task: Task,
+        model: ModelSpec,
+        expected: int,
+        env: dict[str, str],
+    ) -> bool:
         if expected < 0:
             return False
         manifest = self._read_json(self.prediction_manifest_path(task))
         if manifest.get("status") != "complete" or int(manifest.get("expected_rows", -1)) != expected:
             return False
+        current_provenance = self.inference_provenance(task, model, env)
+        if (
+            (manifest.get("inference_provenance") or {}).get("fingerprint")
+            != current_provenance["fingerprint"]
+        ):
+            return False
+        if task.visual_token_shift != "none":
+            evidence = manifest.get("mechanism_evidence") or {}
+            expected_runtime = {
+                "env_profile": model.env_profile,
+                "gpus_per_job": model.gpus_per_job,
+                "infer_batch_size": self.infer_batch_size_for_task(model, task),
+                "max_num_seqs": self.max_num_seqs_for_task(model, task),
+                "tp_size": model.tp_size,
+            }
+            if (
+                evidence.get("verified") is not True
+                or evidence.get("mode") != task.visual_token_shift
+                or evidence.get("model_key") != model.key
+                or evidence.get("matrix") != self.matrix_name
+                or evidence.get("model_path") != model.model_path
+                or evidence.get("inference_fingerprint")
+                != current_provenance["fingerprint"]
+                or manifest.get("runtime") != expected_runtime
+            ):
+                return False
+            if not truthy(
+                env.get("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", "0")
+            ):
+                try:
+                    current_certificate = (
+                        self.verify_vllm_visual_token_shift_smoke_certificate(
+                            task, model, env, current_provenance
+                        )
+                    )
+                except Exception:
+                    return False
+                if evidence.get("smoke_certificate") != current_certificate:
+                    return False
+        pred_file = self.infer_file_path(task, model)
+        return self.prediction_file_valid(pred_file, expected)
+
+    def existing_infer_complete(
+        self,
+        task: Task,
+        model: ModelSpec,
+        expected: int,
+        env: dict[str, str],
+    ) -> bool:
+        """Validate a producer matrix's inference without taking ownership of it."""
+        if expected < 0:
+            return False
+        manifest = self._read_json(self.prediction_manifest_path(task))
+        if (
+            manifest.get("status") != "complete"
+            or manifest.get("matrix") != self.inference_producer_matrix
+            or int(manifest.get("expected_rows", -1)) != expected
+        ):
+            return False
+        recorded_provenance = manifest.get("inference_provenance") or {}
+        recorded_fingerprint = recorded_provenance.get("fingerprint")
+        if not recorded_fingerprint:
+            return False
+        current_provenance = self.inference_provenance(task, model, env)
+        immutable_components = (
+            "mechanism_implementation_sha256",
+            "validation_harness_sha256",
+            "repository_source_identity",
+            "allowlist",
+            "dataset_identity",
+            "model_identity",
+            "runtime_identity",
+        )
+        if any(
+            recorded_provenance.get(key) != current_provenance.get(key)
+            for key in immutable_components
+        ):
+            return False
+        ignored_semantic_env = {"REPLAY_VISUAL_TOKEN_SHIFT_SMOKE_CERTIFICATE"}
+        recorded_semantic_env = {
+            key: value
+            for key, value in (recorded_provenance.get("semantic_env") or {}).items()
+            if key not in ignored_semantic_env
+        }
+        current_semantic_env = {
+            key: value
+            for key, value in (current_provenance.get("semantic_env") or {}).items()
+            if key not in ignored_semantic_env
+        }
+        if recorded_semantic_env != current_semantic_env:
+            return False
+        expected_task = {
+            "tag": task.tag,
+            "index": task.index,
+            "model_key": task.model_key,
+            "policy_key": task.policy_key,
+            "mode": task.mode,
+            "transform": task.transform,
+            "visual_token_shift": task.visual_token_shift,
+            "dataset": task.dataset,
+        }
+        expected_model = {
+            "key": model.key,
+            "registry_name": model.registry_name,
+            "model_path": model.model_path,
+        }
+        expected_runtime = {
+            "env_profile": model.env_profile,
+            "gpus_per_job": model.gpus_per_job,
+            "infer_batch_size": self.infer_batch_size_for_task(model, task),
+            "max_num_seqs": self.max_num_seqs_for_task(model, task),
+            "tp_size": model.tp_size,
+        }
+        if (
+            manifest.get("task") != expected_task
+            or manifest.get("model") != expected_model
+            or manifest.get("runtime") != expected_runtime
+        ):
+            return False
+        if task.visual_token_shift != "none":
+            evidence = manifest.get("mechanism_evidence") or {}
+            if (
+                evidence.get("verified") is not True
+                or evidence.get("mode") != task.visual_token_shift
+                or evidence.get("model_key") != model.key
+                or evidence.get("matrix") != self.inference_producer_matrix
+                or evidence.get("model_path") != model.model_path
+                or evidence.get("inference_fingerprint") != recorded_fingerprint
+            ):
+                return False
+            stored_certificate = evidence.get("smoke_certificate") or {}
+            certificate_path = str(stored_certificate.get("path", "")).strip()
+            if not certificate_path:
+                return False
+            certificate_env = dict(env)
+            certificate_env["REPLAY_VISUAL_TOKEN_SHIFT_SMOKE_CERTIFICATE"] = (
+                certificate_path
+            )
+            try:
+                current_certificate = (
+                    self.verify_vllm_visual_token_shift_smoke_certificate(
+                        task, model, certificate_env, recorded_provenance
+                    )
+                )
+            except Exception:
+                return False
+            if stored_certificate != current_certificate:
+                return False
         pred_file = self.infer_file_path(task, model)
         return self.prediction_file_valid(pred_file, expected)
 
@@ -1416,11 +2073,287 @@ except Exception:
         if rc != 0:
             print(f"[FAIL][FORMAT] {task.tag}: rc={rc} log={log_path}", flush=True)
 
+    def verify_vllm_visual_token_shift_run(
+        self,
+        task: Task,
+        model: ModelSpec,
+        env: dict[str, str],
+        expected_count: int,
+        inference_provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        run_id = env.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", "")
+        model_family = env.get("REPLAY_VLLM_TARGET_FAMILY", "")
+        inference_fingerprint = inference_provenance["fingerprint"]
+        dump_dir = Path(env["REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR"])
+        expected_ranks = set(range(model.tp_size))
+        contracts = []
+        for path in dump_dir.glob("vllm_runtime_contract.pid*.jsonl"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if payload.get("run_id") == run_id:
+                    contracts.append(payload)
+        if not contracts:
+            raise RuntimeError("missing vLLM runtime request contract")
+        if any(
+            item.get("phase") != "vllm_runtime_contract"
+            or item.get("model_family") != model_family
+            or item.get("mode") != task.visual_token_shift
+            or item.get("inference_fingerprint") != inference_fingerprint
+            or int(item.get("effective_infer_batch_size", -1))
+            != self.infer_batch_size_for_task(model, task)
+            or int(item.get("effective_max_num_seqs", -1))
+            != self.max_num_seqs_for_task(model, task)
+            for item in contracts
+        ):
+            raise RuntimeError("invalid vLLM runtime request contract")
+        contract_request_count = sum(int(item.get("request_count", -1)) for item in contracts)
+        if contract_request_count != expected_count:
+            raise RuntimeError(
+                f"runtime request coverage mismatch: expected={expected_count} "
+                f"contract={contract_request_count}"
+            )
+        handshakes = []
+        for path in dump_dir.glob(f"worker_handshake.{model_family}.pid*.json"):
+            payload = self._read_json(path)
+            if (
+                payload.get("run_id") == run_id
+                and payload.get("model_family") == model_family
+                and payload.get("mode") == task.visual_token_shift
+            ):
+                handshakes.append(payload)
+        handshake_ranks = {int(item["rank"]) for item in handshakes}
+        if handshake_ranks != expected_ranks or len(handshakes) != len(expected_ranks):
+            raise RuntimeError(
+                f"worker handshake ranks mismatch: expected={sorted(expected_ranks)} "
+                f"observed={sorted(handshake_ranks)} records={len(handshakes)}"
+            )
+        if any(
+            item.get("phase") != "worker_model_initialized"
+            or item.get("backend") != "vllm"
+            or item.get("target_family") != model_family
+            or item.get("inference_fingerprint") != inference_fingerprint
+            or int(item.get("scheduler_max_num_seqs", -1))
+            != self.max_num_seqs_for_task(model, task)
+            or not item.get("model_class")
+            or not item.get("model_name")
+            for item in handshakes
+        ):
+            raise RuntimeError("invalid vLLM worker handshake metadata")
+
+        expected_stage = (
+            "legacy_v0_post_projector_pre_llm"
+            if model_family == "qwen2_5_vl" and env.get("VLLM_USE_V1") == "0"
+            else "post_gather_pre_llm_get_input_embeddings"
+            if model_family == "qwen2_5_vl"
+            else "post_gather_pre_llm_embed_input_ids"
+        )
+        expected_shift = {"noop_vllm": 0, "roll_right_1": 1, "roll_left_1": -1}.get(
+            task.visual_token_shift
+        )
+        full_validation = truthy(env.get("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", "0"))
+        if expected_shift is None:
+            raise RuntimeError(f"unsupported audited visual-token shift {task.visual_token_shift}")
+
+        records = []
+        for path in dump_dir.glob("visual_token_shift.vllm.pid*.jsonl"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if payload.get("run_id") == run_id:
+                    records.append(payload)
+        record_ranks = {int(item["rank"]) for item in records}
+        if record_ranks != expected_ranks:
+            raise RuntimeError(
+                f"shift record ranks mismatch: expected={sorted(expected_ranks)} "
+                f"observed={sorted(record_ranks)}"
+            )
+        for rank in expected_ranks:
+            rank_records = [item for item in records if int(item["rank"]) == rank]
+            if len(rank_records) != 1:
+                raise RuntimeError(
+                    f"expected exactly one dumped prefill shift on rank {rank}, got {len(rank_records)}"
+                )
+            record = rank_records[0]
+            if (
+                record.get("mode") != task.visual_token_shift
+                or record.get("model_family") != model_family
+                or record.get("phase") != "visual_token_shift"
+                or record.get("backend") != "vllm"
+                or record.get("stage") != expected_stage
+                or record.get("real_request") is not True
+                or record.get("recording_armed") is not True
+                or record.get("inference_fingerprint") != inference_fingerprint
+                or record.get("strict") is not True
+                or record.get("full_tensor_validation") is not full_validation
+                or record.get("validation_level")
+                != ("full" if full_validation else "lightweight")
+            ):
+                raise RuntimeError(f"invalid vLLM visual-token shift record on rank {rank}")
+            if full_validation:
+                if (
+                    record.get("input_ids_unchanged_exact") is not True
+                    or record.get("is_multimodal_unchanged_exact") is not True
+                    or record.get("item_token_coverage_exact") is not True
+                    or record.get("item_span_grouping_exact") is not True
+                    or record.get("final_mm_scatter_exact") is not True
+                    or record.get("output_shape_matches_input_ids") is not True
+                ):
+                    raise RuntimeError(f"invalid full tensor validation on rank {rank}")
+                if model_family == "qwen2_5_vl" and record.get("item_span_lengths_exact") is not True:
+                    raise RuntimeError(f"invalid Qwen placeholder spans on rank {rank}")
+            elif record.get("output_shape_matches_input_ids") is not True:
+                raise RuntimeError(f"invalid lightweight output shape on rank {rank}")
+            if not full_validation and record.get("audit", {}).get("pair_equality_required") is not False:
+                raise RuntimeError(f"lightweight audit unexpectedly scans pair values on rank {rank}")
+            pairs = record.get("audit", {}).get("pair_records", [])
+            if not pairs:
+                raise RuntimeError(f"invalid IQIQ pair audit on rank {rank}")
+            for pair in pairs:
+                token_count = int(pair.get("shape", [0])[0])
+                canonical_source = [
+                    int((output_index - expected_shift) % token_count)
+                    for output_index in range(token_count)
+                ]
+                if (
+                    int(pair.get("shift", 99)) != expected_shift
+                    or pair.get("source_index_for_output") != canonical_source
+                    or pair.get("i2_out_of_place") is not True
+                ):
+                    raise RuntimeError(
+                        f"invalid canonical token roll on rank {rank} pair {pair.get('pair_index')}"
+                    )
+                if full_validation and (
+                    pair.get("i1_i2_equal_exact") is not True
+                    or pair.get("i1_unchanged_exact") is not True
+                    or pair.get("i2_source_unchanged_exact") is not True
+                    or pair.get("i2_roll_exact") is not True
+                    or float(pair.get("max_abs_error", float("inf"))) != 0.0
+                ):
+                    raise RuntimeError(
+                        f"invalid exact tensor roll on rank {rank} pair {pair.get('pair_index')}"
+                    )
+
+        call_records = []
+        for path in dump_dir.glob("visual_token_shift_calls.vllm.pid*.jsonl"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    payload = json.loads(line)
+                    if payload.get("run_id") == run_id:
+                        call_records.append(payload)
+        call_counts_by_rank = {}
+        pair_counts_by_rank: dict[int, list[int]] = {}
+        for rank in expected_ranks:
+            rank_calls = sorted(
+                (item for item in call_records if int(item.get("rank", -1)) == rank),
+                key=lambda item: int(item.get("call_index", -1)),
+            )
+            call_indices = [int(item.get("call_index", -1)) for item in rank_calls]
+            if call_indices != list(range(1, len(rank_calls) + 1)) or not rank_calls:
+                raise RuntimeError(
+                    f"non-contiguous or empty prefill call audit on rank {rank}: {call_indices}"
+                )
+            for item in rank_calls:
+                if (
+                    item.get("mode") != task.visual_token_shift
+                    or item.get("model_family") != model_family
+                    or item.get("real_request") is not True
+                    or item.get("recording_armed") is not True
+                    or item.get("inference_fingerprint") != inference_fingerprint
+                    or item.get("full_tensor_validation") is not full_validation
+                    or item.get("validation_level")
+                    != ("full" if full_validation else "lightweight")
+                    or item.get("pair_structure_validated") is not True
+                ):
+                    raise RuntimeError(
+                        f"invalid all-prefill call audit on rank {rank} call {item.get('call_index')}"
+                    )
+                if full_validation:
+                    if (
+                        item.get("all_iqiq_pairs_equal_exact") is not True
+                        or item.get("input_ids_unchanged_exact") is not True
+                        or item.get("is_multimodal_unchanged_exact") is not True
+                        or item.get("final_mm_scatter_exact") is not True
+                        or item.get("item_token_coverage_exact") is not True
+                        or item.get("item_span_grouping_exact") is not True
+                        or item.get("output_shape_matches_input_ids") is not True
+                        or (
+                            model_family == "qwen2_5_vl"
+                            and item.get("item_span_lengths_exact") is not True
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"invalid full prefill audit on rank {rank} call {item.get('call_index')}"
+                        )
+                elif (
+                    item.get("output_shape_matches_input_ids") is not True
+                    or item.get("all_iqiq_pairs_equal_exact") is not None
+                ):
+                    raise RuntimeError(
+                        f"invalid lightweight prefill audit on rank {rank} call {item.get('call_index')}"
+                    )
+            pair_counts = [int(item.get("request_pair_count", -1)) for item in rank_calls]
+            if any(count <= 0 for count in pair_counts) or sum(pair_counts) != contract_request_count:
+                raise RuntimeError(
+                    f"prefill request coverage mismatch on rank {rank}: "
+                    f"calls={pair_counts} contract={contract_request_count}"
+                )
+            pair_counts_by_rank[rank] = pair_counts
+            call_counts_by_rank[str(rank)] = len(rank_calls)
+        if len({tuple(counts) for counts in pair_counts_by_rank.values()}) != 1:
+            raise RuntimeError(f"TP prefill call partition mismatch: {pair_counts_by_rank}")
+        return {
+            "verified": True,
+            "backend": "vllm",
+            "mode": task.visual_token_shift,
+            "model_key": model.key,
+            "model_family": model_family,
+            "matrix": self.matrix_name,
+            "model_path": model.model_path,
+            "implementation_sha256": inference_provenance["implementation_sha256"],
+            "inference_fingerprint": inference_fingerprint,
+            "run_id": run_id,
+            "expected_tp_ranks": sorted(expected_ranks),
+            "worker_handshake_count": len(handshakes),
+            "shift_record_count": len(records),
+            "runtime_contract_count": len(contracts),
+            "validated_request_count": contract_request_count,
+            "validated_prefill_calls_by_rank": call_counts_by_rank,
+            "validated_prefill_pair_counts_by_rank": {
+                str(rank): counts for rank, counts in pair_counts_by_rank.items()
+            },
+        }
+
     def run_infer(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
         log_path = self.log_root(task) / "infer" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         ensure_dir(self.model_output_root(task, model))
         ensure_dir(self.prediction_dir(task))
         batch_size = self.infer_batch_size_for_task(model, task)
+        env["REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID"] = (
+            f"{self.matrix_name}.task{task.index}.pid{os.getpid()}.{time.time_ns()}"
+        )
+        inference_provenance = self.inference_provenance(task, model, env)
+        env["REPLAY_INFERENCE_FINGERPRINT"] = inference_provenance["fingerprint"]
+        smoke_certificate_evidence = None
+        full_validation = truthy(
+            env.get("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", "0")
+        )
+        if task.visual_token_shift != "none" and not full_validation:
+            try:
+                smoke_certificate_evidence = (
+                    self.verify_vllm_visual_token_shift_smoke_certificate(
+                        task, model, env, inference_provenance
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"[FAIL][INFER][SMOKE_CERTIFICATE] {task.tag}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return 88
         cmd = [
             self.env_profiles[model.env_profile].python,
             "run.py",
@@ -1450,10 +2383,63 @@ except Exception:
             flush=True,
         )
         rc = self.run_subprocess(cmd, env, log_path)
+        post_run_provenance = self.inference_provenance(task, model, env)
+        if post_run_provenance["fingerprint"] != inference_provenance["fingerprint"]:
+            print(
+                f"[FAIL][INFER][PROVENANCE] {task.tag}: inference inputs changed while the task was running",
+                flush=True,
+            )
+            rc = 87
+        if rc == 0 and smoke_certificate_evidence is not None:
+            try:
+                post_run_certificate_evidence = (
+                    self.verify_vllm_visual_token_shift_smoke_certificate(
+                        task, model, env, post_run_provenance
+                    )
+                )
+                if post_run_certificate_evidence != smoke_certificate_evidence:
+                    raise RuntimeError(
+                        "smoke certificate identity changed while inference was running"
+                    )
+            except Exception as exc:
+                print(
+                    f"[FAIL][INFER][SMOKE_CERTIFICATE] {task.tag}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                rc = 88
+        mechanism_evidence = None
+        if rc == 0 and task.visual_token_shift != "none":
+            try:
+                mechanism_evidence = self.verify_vllm_visual_token_shift_run(
+                    task,
+                    model,
+                    env,
+                    expected_count,
+                    inference_provenance,
+                )
+                if smoke_certificate_evidence is not None:
+                    mechanism_evidence["smoke_certificate"] = (
+                        smoke_certificate_evidence
+                    )
+            except Exception as exc:
+                print(
+                    f"[FAIL][INFER][TOKEN_SHIFT] {task.tag}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                rc = 86
         if rc == 0:
             pred_file = self.infer_file_path(task, model)
             if self.prediction_file_valid(pred_file, expected_count):
-                self.write_prediction_manifest(task, model, expected_count, pred_file)
+                self.write_prediction_manifest(
+                    task,
+                    model,
+                    expected_count,
+                    pred_file,
+                    mechanism_evidence=mechanism_evidence,
+                    runtime_contract_run_id=env.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID"),
+                    inference_provenance=inference_provenance,
+                )
             print(f"[DONE][INFER] {task.tag} log={log_path}", flush=True)
         else:
             print(f"[FAIL][INFER] {task.tag} rc={rc} log={log_path}", flush=True)
@@ -1505,7 +2491,15 @@ except Exception:
         if expected_count < 0:
             raise RuntimeError(f"dataset unavailable/build failed: {task.dataset}")
 
-        infer_was_complete = self.infer_complete(task, model, expected_count)
+        infer_was_complete = (
+            self.existing_infer_complete(task, model, expected_count, env)
+            if self.inference_launch_mode == "existing"
+            else self.infer_complete(task, model, expected_count, env)
+        )
+        if self.inference_launch_mode == "existing" and not infer_was_complete:
+            raise RuntimeError(
+                "existing inference failed producer provenance/certificate validation"
+            )
         if infer_was_complete and self.eval_complete(task, model, expected_count):
             acc_paths = ", ".join(str(path) for path in self.acc_marker_paths(task, model))
             if acc_paths:
@@ -1536,7 +2530,12 @@ except Exception:
             if infer_rc != 0:
                 raise RuntimeError(f"infer failed rc={infer_rc}")
 
-        if not self.infer_complete(task, model, expected_count):
+        infer_still_complete = (
+            self.existing_infer_complete(task, model, expected_count, env)
+            if self.inference_launch_mode == "existing"
+            else self.infer_complete(task, model, expected_count, env)
+        )
+        if not infer_still_complete:
             raise RuntimeError("infer incomplete after run")
 
         if self.eval_complete(task, model, expected_count):

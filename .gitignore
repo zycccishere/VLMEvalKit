@@ -218,6 +218,7 @@ tmp_*/
 
 # Local experiment/runtime state
 runs/
+.vllm_plugin_overlay/
 checkpoints/
 LMUData/
 .verify_lmu_data/

@@ -28,7 +28,10 @@ from ..replay_image_transform import (
 )
 from ..replay_visual_token_shift import (
     VisualTokenShiftController,
+    arm_vllm_visual_token_shift_recording,
+    require_vllm_visual_token_shift_worker_handshake,
     visual_token_shift_enabled,
+    write_vllm_runtime_contract,
 )
 from .replay_prompt_template import (
     apply_prompt_template_to_content,
@@ -345,7 +348,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             if gpu_utils is None:
                 env_gpu_utils = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "").strip()
                 gpu_utils = float(env_gpu_utils) if env_gpu_utils else 0.9
-            self.llm = LLM(
+            llm_kwargs = dict(
                 model=self.model_path,
                 max_num_seqs=max_num_seqs,
                 max_model_len=max_model_len,
@@ -355,6 +358,15 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 trust_remote_code=True,
                 enforce_eager=enforce_eager,
             )
+            max_num_batched_tokens = os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", "").strip()
+            if max_num_batched_tokens.isdigit():
+                llm_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+            if visual_token_shift_enabled():
+                os.environ["REPLAY_VISUAL_TOKEN_SHIFT_CHUNKED_PREFILL_DISABLED"] = "1"
+                os.environ["REPLAY_VISUAL_TOKEN_SHIFT_PREFIX_CACHING_DISABLED"] = "1"
+                llm_kwargs["enable_chunked_prefill"] = False
+                llm_kwargs["enable_prefix_caching"] = False
+            self.llm = LLM(**llm_kwargs)
 
         elif self.use_lmdeploy:
             from lmdeploy import TurbomindEngineConfig, pipeline, ChatTemplateConfig
@@ -1131,6 +1143,9 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 kwargs["stop_token_ids"] = [int(x) for x in stop_ids.replace(",", " ").split() if x]
             else:
                 kwargs["stop_token_ids"] = None
+            seed = env.get("QWEN2VL_VLLM_SEED", "").strip()
+            if seed:
+                kwargs["seed"] = int(seed)
             sampling_params = SamplingParams(**kwargs)
             print(f"using sampling_params: {sampling_params}", flush=True)
             return sampling_params
@@ -1297,6 +1312,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
     def generate_inner_vllm(self, message, dataset=None):
         sampling_params = self._build_vllm_sampling_params()
         req = self._build_vllm_request(message, dataset=dataset)
+        write_vllm_runtime_contract(
+            model_family="qwen2_5_vl",
+            dataset=dataset,
+            requests=[req],
+            sampling_params=sampling_params,
+        )
         outputs = self.llm.generate(req, sampling_params=sampling_params)
         generated_text = ''
         for o in outputs:
@@ -1320,6 +1341,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                     return [self.generate_inner_vllm(msg, dataset=dataset) for msg in messages]
                 sampling_params = self._build_vllm_sampling_params()
                 reqs = [self._build_vllm_request(msg, dataset=dataset) for msg in messages]
+                write_vllm_runtime_contract(
+                    model_family="qwen2_5_vl",
+                    dataset=dataset,
+                    requests=reqs,
+                    sampling_params=sampling_params,
+                )
                 outputs = self.llm.generate(reqs, sampling_params=sampling_params)
                 results = []
                 for output in outputs:
@@ -1335,21 +1362,21 @@ class Qwen2VLChatReplay(Qwen2VLChat):
     """Replay-enabled Qwen2VLChat with minimal intrusion."""
 
     def __init__(self, *args, **kwargs):
-        token_shift_requested = visual_token_shift_enabled()
-        if token_shift_requested:
-            # Exact I2 boundaries are available in the HF visual forward. vLLM
-            # may batch multimodal items across requests and lose that boundary.
-            kwargs["use_vllm"] = False
         super().__init__(*args, **kwargs)
+        if visual_token_shift_enabled() and self.use_vllm:
+            require_vllm_visual_token_shift_worker_handshake(model_family="qwen2_5_vl")
+            arm_vllm_visual_token_shift_recording(model_family="qwen2_5_vl")
         self.visual_token_shift = VisualTokenShiftController(
             model_family="qwen2_5_vl",
             model_name=self.model_path,
         )
         if self.visual_token_shift.enabled:
-            self.visual_token_shift.install_qwen_hf_hook(self.model)
+            backend = "vllm" if self.use_vllm else "hf"
+            if not self.use_vllm:
+                self.visual_token_shift.install_qwen_hf_hook(self.model)
             print(
                 f"[Qwen2VLChatReplay] visual_token_shift={self.visual_token_shift.mode} "
-                f"target_image_position={self.visual_token_shift.target_image_position} backend=hf",
+                f"target_image_position={self.visual_token_shift.target_image_position} backend={backend}",
                 flush=True,
             )
         self.replay_cfg = read_replay_config_from_env()
@@ -1556,7 +1583,17 @@ class Qwen2VLChatReplay(Qwen2VLChat):
     def _prepare_content_vllm(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
         content = super()._prepare_content_vllm(inputs, dataset=dataset)
         replayed = self._apply_template_replay_pipeline(content, dataset=dataset)
-        return self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
+        transformed = self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
+        controller = getattr(self, "visual_token_shift", None)
+        if controller is not None and controller.enabled:
+            controller.validate_and_bind_iqiq_topology(
+                original=content,
+                replayed=transformed,
+                replay_mode=self.replay_cfg["mode"],
+                repeat_times=self.replay_cfg["repeat_times"],
+                image_transform_name=self.image_transform_name,
+            )
+        return transformed
 
     def _run_with_replay_cfg(
         self,
