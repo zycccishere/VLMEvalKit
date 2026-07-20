@@ -30,6 +30,32 @@ def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def contiguous_partition_refines(
+    refinement: list[int],
+    coarser: list[int],
+) -> bool:
+    """Whether worker calls split, but never cross, driver call boundaries."""
+    if (
+        not refinement
+        or not coarser
+        or any(value <= 0 for value in refinement)
+        or any(value <= 0 for value in coarser)
+        or sum(refinement) != sum(coarser)
+    ):
+        return False
+    refinement_boundaries = set()
+    offset = 0
+    for value in refinement:
+        offset += value
+        refinement_boundaries.add(offset)
+    offset = 0
+    for value in coarser:
+        offset += value
+        if offset not in refinement_boundaries:
+            return False
+    return True
+
+
 def detect_node_rank() -> int:
     for name in ("NODE_RANK", "SLURM_NODEID", "RANK", "OMPI_COMM_WORLD_RANK", "PMI_RANK"):
         raw = os.environ.get(name)
@@ -939,11 +965,15 @@ class BenchmarkRunner:
             int(truthy(self.trace_cfg.get("visual_token_raw_dump", False)))
         )
         env["REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR"] = str(self.task_root(task) / "_visual_token_shift")
-        if task.visual_token_shift != "none":
+        matched_token_roll_runtime = truthy(
+            env.get("REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME", "0")
+        )
+        if task.visual_token_shift != "none" or matched_token_roll_runtime:
             if self._is_qwen25vl_model(model):
                 env["REPLAY_VLLM_TARGET_FAMILY"] = "qwen2_5_vl"
             elif model.key.startswith("minicpm_o_45"):
                 env["REPLAY_VLLM_TARGET_FAMILY"] = "minicpm_o_4_5"
+                env["REPLAY_MINICPM_EXPECTED_QUERY_NUM"] = "64"
             else:
                 raise ValueError(
                     f"visual-token shift has no vLLM target family for model {model.key}"
@@ -1389,9 +1419,7 @@ except Exception:
     def visual_token_shift_validation_harness_sha256(self) -> str:
         """Hash the real-smoke contract that is allowed to issue certificates."""
         relative_paths = (
-            "configs/index_allowlists/token_roll_logicvista_first3_20260720.txt",
             "configs/index_allowlists/token_roll_mathvision_first3_20260720.txt",
-            "configs/matrix_qwen3b_logicvista_iqiq_visual_token_roll_vllm_v0_smoke_20260720.yaml",
             "configs/matrix_three_model_iqiq_visual_token_roll_vllm_smoke_20260720.yaml",
             "scripts/run_vllm_visual_token_shift_real_smokes_20260720.sh",
             "scripts/validate_vllm_visual_token_shift_real_dump_20260720.py",
@@ -1817,7 +1845,10 @@ print(json.dumps({
             != current_provenance["fingerprint"]
         ):
             return False
-        if task.visual_token_shift != "none":
+        matched_token_roll_runtime = truthy(
+            env.get("REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME", "0")
+        )
+        if task.visual_token_shift != "none" or matched_token_roll_runtime:
             evidence = manifest.get("mechanism_evidence") or {}
             expected_runtime = {
                 "env_profile": model.env_profile,
@@ -1829,15 +1860,21 @@ print(json.dumps({
             if (
                 evidence.get("verified") is not True
                 or evidence.get("mode") != task.visual_token_shift
+                or (
+                    task.visual_token_shift == "none"
+                    and evidence.get("control") is not True
+                )
                 or evidence.get("model_key") != model.key
                 or evidence.get("matrix") != self.matrix_name
                 or evidence.get("model_path") != model.model_path
+                or evidence.get("run_id")
+                != manifest.get("runtime_contract_run_id")
                 or evidence.get("inference_fingerprint")
                 != current_provenance["fingerprint"]
                 or manifest.get("runtime") != expected_runtime
             ):
                 return False
-            if not truthy(
+            if task.visual_token_shift != "none" and not truthy(
                 env.get("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", "0")
             ):
                 try:
@@ -1930,17 +1967,29 @@ print(json.dumps({
             or manifest.get("runtime") != expected_runtime
         ):
             return False
-        if task.visual_token_shift != "none":
+        matched_token_roll_runtime = truthy(
+            env.get("REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME", "0")
+        )
+        if task.visual_token_shift != "none" or matched_token_roll_runtime:
             evidence = manifest.get("mechanism_evidence") or {}
             if (
                 evidence.get("verified") is not True
                 or evidence.get("mode") != task.visual_token_shift
+                or (
+                    task.visual_token_shift == "none"
+                    and evidence.get("control") is not True
+                )
                 or evidence.get("model_key") != model.key
                 or evidence.get("matrix") != self.inference_producer_matrix
                 or evidence.get("model_path") != model.model_path
+                or evidence.get("run_id")
+                != manifest.get("runtime_contract_run_id")
                 or evidence.get("inference_fingerprint") != recorded_fingerprint
             ):
                 return False
+            if task.visual_token_shift == "none":
+                pred_file = self.infer_file_path(task, model)
+                return self.prediction_file_valid(pred_file, expected)
             stored_certificate = evidence.get("smoke_certificate") or {}
             certificate_path = str(stored_certificate.get("path", "")).strip()
             if not certificate_path:
@@ -2086,6 +2135,10 @@ print(json.dumps({
         inference_fingerprint = inference_provenance["fingerprint"]
         dump_dir = Path(env["REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR"])
         expected_ranks = set(range(model.tp_size))
+        expected_engine_mode = "v0" if env.get("VLLM_USE_V1") == "0" else "v1"
+        full_validation = truthy(
+            env.get("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", "0")
+        )
         contracts = []
         for path in dump_dir.glob("vllm_runtime_contract.pid*.jsonl"):
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -2096,6 +2149,7 @@ print(json.dumps({
                     contracts.append(payload)
         if not contracts:
             raise RuntimeError("missing vLLM runtime request contract")
+        contracts.sort(key=lambda item: float(item.get("timestamp", 0.0)))
         if any(
             item.get("phase") != "vllm_runtime_contract"
             or item.get("model_family") != model_family
@@ -2105,6 +2159,10 @@ print(json.dumps({
             != self.infer_batch_size_for_task(model, task)
             or int(item.get("effective_max_num_seqs", -1))
             != self.max_num_seqs_for_task(model, task)
+            or item.get("actual_vllm_engine_mode") != expected_engine_mode
+            or not item.get("actual_vllm_engine_module")
+            or not item.get("actual_vllm_engine_qualname")
+            or not item.get("actual_vllm_runtime_config")
             for item in contracts
         ):
             raise RuntimeError("invalid vLLM runtime request contract")
@@ -2114,6 +2172,90 @@ print(json.dumps({
                 f"runtime request coverage mismatch: expected={expected_count} "
                 f"contract={contract_request_count}"
             )
+        contract_request_counts = [
+            int(item.get("request_count", -1)) for item in contracts
+        ]
+        expected_request_counts = []
+        remaining_request_count = expected_count
+        effective_batch_size = self.infer_batch_size_for_task(model, task)
+        while remaining_request_count > 0:
+            call_request_count = min(effective_batch_size, remaining_request_count)
+            expected_request_counts.append(call_request_count)
+            remaining_request_count -= call_request_count
+        if contract_request_counts != expected_request_counts:
+            raise RuntimeError(
+                "runtime request call partition mismatch: "
+                f"expected={expected_request_counts} "
+                f"contract={contract_request_counts}"
+            )
+        runtime_configs = [
+            item.get("actual_vllm_runtime_config") or {} for item in contracts
+        ]
+        if len({json.dumps(item, sort_keys=True) for item in runtime_configs}) != 1:
+            raise RuntimeError("concrete vLLM runtime config changed across calls")
+        runtime_config = runtime_configs[0]
+        if (
+            int(runtime_config.get("max_num_seqs") or -1)
+            != self.max_num_seqs_for_task(model, task)
+            or int(runtime_config.get("tensor_parallel_size") or -1) != model.tp_size
+            or runtime_config.get("enable_chunked_prefill") is not False
+            or runtime_config.get("disable_chunked_mm_input") is not True
+            or runtime_config.get("enable_prefix_caching") is not False
+            or int(runtime_config.get("max_model_len") or 0) <= 0
+            or int(runtime_config.get("max_num_batched_tokens") or 0) <= 0
+            or not isinstance(runtime_config.get("limit_mm_per_prompt"), dict)
+        ):
+            raise RuntimeError("invalid concrete vLLM runtime config")
+        request_metadata_by_call = [
+            list(contract.get("request_metadata", [])) for contract in contracts
+        ]
+        request_metadata = [
+            metadata for call_metadata in request_metadata_by_call
+            for metadata in call_metadata
+        ]
+        if full_validation and model_family == "minicpm_o_4_5":
+            if any(
+                len(call_metadata) != call_request_count
+                or [
+                    int(metadata.get("request_index", -1))
+                    for metadata in call_metadata
+                ]
+                != list(range(call_request_count))
+                for call_metadata, call_request_count in zip(
+                    request_metadata_by_call,
+                    contract_request_counts,
+                )
+            ) or len(request_metadata) != contract_request_count or any(
+                metadata.get("image_count") != 2
+                or len(metadata.get("image_sha256") or []) != 2
+                or len(metadata.get("minicpm_num_slices") or []) != 2
+                or metadata["image_sha256"][0] != metadata["image_sha256"][1]
+                or metadata["minicpm_num_slices"][0]
+                != metadata["minicpm_num_slices"][1]
+                for metadata in request_metadata
+            ):
+                raise RuntimeError("invalid MiniCPM driver slice metadata")
+            if any(
+                len(
+                    {
+                        tuple(
+                            int(value)
+                            for value in metadata.get(
+                                "minicpm_num_slices",
+                                [],
+                            )
+                        )
+                        for metadata in call_metadata
+                    }
+                )
+                != len(call_metadata)
+                for call_metadata in request_metadata_by_call
+                if len(call_metadata) > 1
+            ):
+                raise RuntimeError(
+                    "MiniCPM sentinel slices are not request-distinguishing "
+                    "within a driver call"
+                )
         handshakes = []
         for path in dump_dir.glob(f"worker_handshake.{model_family}.pid*.json"):
             payload = self._read_json(path)
@@ -2136,6 +2278,12 @@ print(json.dumps({
             or item.get("inference_fingerprint") != inference_fingerprint
             or int(item.get("scheduler_max_num_seqs", -1))
             != self.max_num_seqs_for_task(model, task)
+            or int(item.get("scheduler_max_num_batched_tokens", -1))
+            != int(runtime_config.get("max_num_batched_tokens", -2))
+            or item.get("scheduler_enable_chunked_prefill") is not False
+            or item.get("scheduler_disable_chunked_mm_input") is not True
+            or item.get("cache_enable_prefix_caching") is not False
+            or item.get("vllm_engine_mode") != expected_engine_mode
             or not item.get("model_class")
             or not item.get("model_name")
             for item in handshakes
@@ -2149,12 +2297,79 @@ print(json.dumps({
             if model_family == "qwen2_5_vl"
             else "post_gather_pre_llm_embed_input_ids"
         )
+        if task.visual_token_shift == "none":
+            none_shift_records = []
+            for path in dump_dir.glob("visual_token_shift.vllm.pid*.jsonl"):
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        payload = json.loads(line)
+                        if payload.get("run_id") == run_id:
+                            none_shift_records.append(payload)
+            none_call_records = []
+            for path in dump_dir.glob("visual_token_shift_calls.vllm.pid*.jsonl"):
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        payload = json.loads(line)
+                        if payload.get("run_id") == run_id:
+                            none_call_records.append(payload)
+            if none_shift_records or none_call_records:
+                raise RuntimeError(
+                    "matched none control unexpectedly shifted visual tokens"
+                )
+            return {
+                "verified": True,
+                "control": True,
+                "backend": "vllm",
+                "mode": "none",
+                "model_key": model.key,
+                "model_family": model_family,
+                "matrix": self.matrix_name,
+                "model_path": model.model_path,
+                "implementation_sha256": inference_provenance["implementation_sha256"],
+                "inference_fingerprint": inference_fingerprint,
+                "run_id": run_id,
+                "expected_tp_ranks": sorted(expected_ranks),
+                "worker_handshake_count": len(handshakes),
+                "shift_record_count": 0,
+                "runtime_contract_count": len(contracts),
+                "validated_request_count": contract_request_count,
+                "actual_vllm_engine_mode": contracts[0]["actual_vllm_engine_mode"],
+                "actual_vllm_engine_module": contracts[0]["actual_vllm_engine_module"],
+                "actual_vllm_engine_qualname": contracts[0]["actual_vllm_engine_qualname"],
+                "actual_vllm_runtime_config": runtime_config,
+            }
         expected_shift = {"noop_vllm": 0, "roll_right_1": 1, "roll_left_1": -1}.get(
             task.visual_token_shift
         )
-        full_validation = truthy(env.get("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", "0"))
         if expected_shift is None:
             raise RuntimeError(f"unsupported audited visual-token shift {task.visual_token_shift}")
+
+        def minicpm_placeholder_contract_exact(item: dict[str, Any]) -> bool:
+            query_num = int(
+                item.get("minicpm_query_num")
+                or (item.get("model_metadata") or {}).get("query_num")
+                or 0
+            )
+            item_counts = [int(value) for value in item.get("item_token_counts") or []]
+            span_groups = item.get("item_span_groups") or []
+            slice_counts = [
+                int(value)
+                for value in item.get("minicpm_placeholder_slice_counts") or []
+            ]
+            return bool(
+                query_num == 64
+                and item.get("minicpm_placeholder_token_contract_exact") is True
+                and len(item_counts) == len(span_groups) == len(slice_counts)
+                and slice_counts == [len(group) for group in span_groups]
+                and all(
+                    all(int(span_length) == query_num for span_length in group)
+                    for group in span_groups
+                )
+                and all(
+                    item_count == query_num * slice_count
+                    for item_count, slice_count in zip(item_counts, slice_counts)
+                )
+            )
 
         records = []
         for path in dump_dir.glob("visual_token_shift.vllm.pid*.jsonl"):
@@ -2170,70 +2385,158 @@ print(json.dumps({
                 f"shift record ranks mismatch: expected={sorted(expected_ranks)} "
                 f"observed={sorted(record_ranks)}"
             )
+        raw_call_indices_by_rank: dict[int, list[int]] = {}
         for rank in expected_ranks:
-            rank_records = [item for item in records if int(item["rank"]) == rank]
-            if len(rank_records) != 1:
-                raise RuntimeError(
-                    f"expected exactly one dumped prefill shift on rank {rank}, got {len(rank_records)}"
-                )
-            record = rank_records[0]
-            if (
-                record.get("mode") != task.visual_token_shift
-                or record.get("model_family") != model_family
-                or record.get("phase") != "visual_token_shift"
-                or record.get("backend") != "vllm"
-                or record.get("stage") != expected_stage
-                or record.get("real_request") is not True
-                or record.get("recording_armed") is not True
-                or record.get("inference_fingerprint") != inference_fingerprint
-                or record.get("strict") is not True
-                or record.get("full_tensor_validation") is not full_validation
-                or record.get("validation_level")
-                != ("full" if full_validation else "lightweight")
+            rank_records = sorted(
+                (item for item in records if int(item["rank"]) == rank),
+                key=lambda item: int(item.get("call_index", -1)),
+            )
+            raw_call_indices = [
+                int(item.get("call_index", -1)) for item in rank_records
+            ]
+            if not rank_records or raw_call_indices != list(
+                range(1, len(rank_records) + 1)
             ):
-                raise RuntimeError(f"invalid vLLM visual-token shift record on rank {rank}")
-            if full_validation:
+                raise RuntimeError(
+                    "raw prefill shifts must be a non-empty contiguous call prefix "
+                    f"on rank {rank}, got {raw_call_indices}"
+                )
+            raw_call_indices_by_rank[rank] = raw_call_indices
+            for record in rank_records:
                 if (
-                    record.get("input_ids_unchanged_exact") is not True
-                    or record.get("is_multimodal_unchanged_exact") is not True
-                    or record.get("item_token_coverage_exact") is not True
-                    or record.get("item_span_grouping_exact") is not True
-                    or record.get("final_mm_scatter_exact") is not True
-                    or record.get("output_shape_matches_input_ids") is not True
-                ):
-                    raise RuntimeError(f"invalid full tensor validation on rank {rank}")
-                if model_family == "qwen2_5_vl" and record.get("item_span_lengths_exact") is not True:
-                    raise RuntimeError(f"invalid Qwen placeholder spans on rank {rank}")
-            elif record.get("output_shape_matches_input_ids") is not True:
-                raise RuntimeError(f"invalid lightweight output shape on rank {rank}")
-            if not full_validation and record.get("audit", {}).get("pair_equality_required") is not False:
-                raise RuntimeError(f"lightweight audit unexpectedly scans pair values on rank {rank}")
-            pairs = record.get("audit", {}).get("pair_records", [])
-            if not pairs:
-                raise RuntimeError(f"invalid IQIQ pair audit on rank {rank}")
-            for pair in pairs:
-                token_count = int(pair.get("shape", [0])[0])
-                canonical_source = [
-                    int((output_index - expected_shift) % token_count)
-                    for output_index in range(token_count)
-                ]
-                if (
-                    int(pair.get("shift", 99)) != expected_shift
-                    or pair.get("source_index_for_output") != canonical_source
-                    or pair.get("i2_out_of_place") is not True
+                    record.get("mode") != task.visual_token_shift
+                    or record.get("model_family") != model_family
+                    or record.get("phase") != "visual_token_shift"
+                    or record.get("backend") != "vllm"
+                    or record.get("stage") != expected_stage
+                    or record.get("real_request") is not True
+                    or record.get("recording_armed") is not True
+                    or record.get("inference_fingerprint") != inference_fingerprint
+                    or record.get("strict") is not True
+                    or record.get("full_tensor_validation") is not full_validation
+                    or record.get("validation_level")
+                    != ("full" if full_validation else "lightweight")
                 ):
                     raise RuntimeError(
-                        f"invalid canonical token roll on rank {rank} pair {pair.get('pair_index')}"
+                        f"invalid vLLM visual-token shift record on rank {rank}"
                     )
-                if full_validation and (
-                    pair.get("i1_i2_equal_exact") is not True
-                    or pair.get("i1_unchanged_exact") is not True
-                    or pair.get("i2_source_unchanged_exact") is not True
-                    or pair.get("i2_roll_exact") is not True
-                    or float(pair.get("max_abs_error", float("inf"))) != 0.0
+                if full_validation:
+                    if (
+                        record.get("input_ids_unchanged_exact") is not True
+                        or record.get("is_multimodal_unchanged_exact") is not True
+                        or record.get("item_token_coverage_exact") is not True
+                        or record.get("item_span_grouping_exact") is not True
+                        or record.get("final_mm_scatter_exact") is not True
+                        or record.get("output_shape_matches_input_ids") is not True
+                    ):
+                        raise RuntimeError(
+                            f"invalid full tensor validation on rank {rank}"
+                        )
+                    if model_family == "qwen2_5_vl" and record.get(
+                        "item_span_lengths_exact"
+                    ) is not True:
+                        raise RuntimeError(
+                            f"invalid Qwen placeholder spans on rank {rank}"
+                        )
+                    if model_family == "qwen2_5_vl" and record.get(
+                        "qwen_grid_token_count_exact"
+                    ) is not True:
+                        raise RuntimeError(
+                            f"invalid Qwen grid token count on rank {rank}"
+                        )
+                    if model_family == "minicpm_o_4_5" and not (
+                        minicpm_placeholder_contract_exact(record)
+                    ):
+                        raise RuntimeError(
+                            f"invalid MiniCPM slice contract on rank {rank}"
+                        )
+                elif record.get("output_shape_matches_input_ids") is not True:
+                    raise RuntimeError(
+                        f"invalid lightweight output shape on rank {rank}"
+                    )
+                if not full_validation and record.get("audit", {}).get(
+                    "pair_equality_required"
+                ) is not False:
+                    raise RuntimeError(
+                        "lightweight audit unexpectedly scans pair values on "
+                        f"rank {rank}"
+                    )
+                pairs = record.get("audit", {}).get("pair_records", [])
+                if not pairs:
+                    raise RuntimeError(f"invalid IQIQ pair audit on rank {rank}")
+                for pair in pairs:
+                    token_count = int(pair.get("shape", [0])[0])
+                    canonical_source = [
+                        int((output_index - expected_shift) % token_count)
+                        for output_index in range(token_count)
+                    ]
+                    if (
+                        int(pair.get("shift", 99)) != expected_shift
+                        or pair.get("source_index_for_output") != canonical_source
+                        or pair.get("i2_out_of_place") is not True
+                    ):
+                        raise RuntimeError(
+                            "invalid canonical token roll on rank "
+                            f"{rank} pair {pair.get('pair_index')}"
+                        )
+                    if full_validation and (
+                        pair.get("i1_i2_equal_exact") is not True
+                        or pair.get("i1_unchanged_exact") is not True
+                        or pair.get("i2_source_unchanged_exact") is not True
+                        or pair.get("i2_roll_exact") is not True
+                        or float(pair.get("max_abs_error", float("inf"))) != 0.0
+                    ):
+                        raise RuntimeError(
+                            "invalid exact tensor roll on rank "
+                            f"{rank} pair {pair.get('pair_index')}"
+                        )
+            if full_validation and model_family == "minicpm_o_4_5":
+                raw_pair_counts = [
+                    len((record.get("audit") or {}).get("pair_records", []))
+                    for record in rank_records
+                ]
+                if not contiguous_partition_refines(
+                    raw_pair_counts,
+                    contract_request_counts,
                 ):
                     raise RuntimeError(
-                        f"invalid exact tensor roll on rank {rank} pair {pair.get('pair_index')}"
+                        "MiniCPM worker prefill partition is not a contiguous "
+                        "refinement of driver calls: "
+                        f"worker={raw_pair_counts} driver={contract_request_counts}"
+                    )
+                driver_slice_pairs = [
+                    tuple(
+                        int(value)
+                        for value in metadata.get("minicpm_num_slices", [])
+                    )
+                    for metadata in request_metadata
+                ]
+                worker_slice_pairs = []
+                for record in rank_records:
+                    pair_records = (record.get("audit") or {}).get(
+                        "pair_records",
+                        [],
+                    )
+                    slice_counts = record.get(
+                        "minicpm_placeholder_slice_counts"
+                    ) or []
+                    if len(slice_counts) != 2 * len(pair_records):
+                        raise RuntimeError(
+                            "MiniCPM worker slice counts do not cover IQIQ pairs"
+                        )
+                    worker_slice_pairs.extend(
+                        tuple(
+                            int(value)
+                            for value in slice_counts[
+                                2 * pair_index : 2 * pair_index + 2
+                            ]
+                        )
+                        for pair_index in range(len(pair_records))
+                    )
+                if worker_slice_pairs != driver_slice_pairs:
+                    raise RuntimeError(
+                        "MiniCPM driver and worker slice order differ: "
+                        f"driver={driver_slice_pairs} worker={worker_slice_pairs}"
                     )
 
         call_records = []
@@ -2254,6 +2557,12 @@ print(json.dumps({
             if call_indices != list(range(1, len(rank_calls) + 1)) or not rank_calls:
                 raise RuntimeError(
                     f"non-contiguous or empty prefill call audit on rank {rank}: {call_indices}"
+                )
+            raw_call_indices = raw_call_indices_by_rank[rank]
+            if raw_call_indices != call_indices[: len(raw_call_indices)]:
+                raise RuntimeError(
+                    "raw prefill calls are not an audited-call prefix on rank "
+                    f"{rank}: raw={raw_call_indices} audited={call_indices}"
                 )
             for item in rank_calls:
                 if (
@@ -2281,7 +2590,14 @@ print(json.dumps({
                         or item.get("output_shape_matches_input_ids") is not True
                         or (
                             model_family == "qwen2_5_vl"
-                            and item.get("item_span_lengths_exact") is not True
+                            and (
+                                item.get("item_span_lengths_exact") is not True
+                                or item.get("qwen_grid_token_count_exact") is not True
+                            )
+                        )
+                        or (
+                            model_family == "minicpm_o_4_5"
+                            and not minicpm_placeholder_contract_exact(item)
                         )
                     ):
                         raise RuntimeError(
@@ -2295,10 +2611,14 @@ print(json.dumps({
                         f"invalid lightweight prefill audit on rank {rank} call {item.get('call_index')}"
                     )
             pair_counts = [int(item.get("request_pair_count", -1)) for item in rank_calls]
-            if any(count <= 0 for count in pair_counts) or sum(pair_counts) != contract_request_count:
+            if not contiguous_partition_refines(
+                pair_counts,
+                contract_request_counts,
+            ):
                 raise RuntimeError(
-                    f"prefill request coverage mismatch on rank {rank}: "
-                    f"calls={pair_counts} contract={contract_request_count}"
+                    "worker prefill calls are not a contiguous refinement of "
+                    f"driver calls on rank {rank}: worker={pair_counts} "
+                    f"driver={contract_request_counts}"
                 )
             pair_counts_by_rank[rank] = pair_counts
             call_counts_by_rank[str(rank)] = len(rank_calls)
@@ -2324,6 +2644,10 @@ print(json.dumps({
             "validated_prefill_pair_counts_by_rank": {
                 str(rank): counts for rank, counts in pair_counts_by_rank.items()
             },
+            "actual_vllm_engine_mode": contracts[0]["actual_vllm_engine_mode"],
+            "actual_vllm_engine_module": contracts[0]["actual_vllm_engine_module"],
+            "actual_vllm_engine_qualname": contracts[0]["actual_vllm_engine_qualname"],
+            "actual_vllm_runtime_config": runtime_config,
         }
 
     def run_infer(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
@@ -2409,7 +2733,10 @@ print(json.dumps({
                 )
                 rc = 88
         mechanism_evidence = None
-        if rc == 0 and task.visual_token_shift != "none":
+        if rc == 0 and (
+            task.visual_token_shift != "none"
+            or truthy(env.get("REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME", "0"))
+        ):
             try:
                 mechanism_evidence = self.verify_vllm_visual_token_shift_run(
                     task,

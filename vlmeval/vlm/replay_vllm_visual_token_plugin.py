@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 
-from .replay_visual_token_shift import canonicalize_visual_token_shift
+from .replay_visual_token_shift import (
+    canonicalize_visual_token_shift,
+    vllm_visual_token_shift_runtime_enabled,
+)
 
 
 def register() -> None:
     mode = canonicalize_visual_token_shift(os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT", "none"))
-    if mode == "none":
+    if mode == "none" and not vllm_visual_token_shift_runtime_enabled(mode):
         return
 
     from vllm import ModelRegistry

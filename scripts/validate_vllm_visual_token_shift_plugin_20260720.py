@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -26,11 +27,13 @@ class FakeMultiModalRegistry:
 
 
 class FakeVLLMBase:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *, vllm_config, prefix=""):
         self.captured_embeddings = None
+        self.visual = SimpleNamespace(spatial_merge_size=1)
         self.config = SimpleNamespace(
             image_token_id=99,
             _name_or_path="synthetic-vllm-model",
+            query_num=1,
         )
 
     def _scatter(self, input_ids, multimodal_embeddings, is_multimodal):
@@ -55,7 +58,12 @@ class FakeVLLMBase:
         return self._scatter(input_ids, multimodal_embeddings, input_ids == 99)
 
     def _process_image_input(self, image_input):
+        if isinstance(image_input, dict) and "embeddings" in image_input:
+            return image_input["embeddings"]
         return image_input
+
+    def _process_vision_input(self, image_input):
+        return image_input["embeddings"]
 
     def get_input_embeddings_v0(self, input_ids, image_input=None, video_input=None):
         image_embeddings = self._process_image_input(image_input)
@@ -124,6 +132,7 @@ def configure(dump_dir: Path) -> None:
             "REPLAY_IMAGE_TRANSFORM": "baseline",
             "REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID": "synthetic-three-request-batch",
             "REPLAY_VLLM_TARGET_FAMILY": "qwen2_5_vl",
+            "REPLAY_MINICPM_EXPECTED_QUERY_NUM": "1",
             "VLLM_USE_V1": "1",
         }
     )
@@ -171,6 +180,21 @@ def main() -> None:
         "qwen_plugin_did_not_register_minicpm": "MiniCPMO"
         not in FakeModelRegistry.registrations,
     }
+    for name, model_cls in (
+        ("qwen", models.ReplayShiftQwen2_5VL),
+        ("minicpm", models.ReplayShiftMiniCPMO45),
+    ):
+        signature = inspect.signature(model_cls.__init__)
+        checks[f"{name}_loader_signature_has_vllm_config"] = (
+            "vllm_config" in signature.parameters
+            and signature.parameters["vllm_config"].kind
+            is inspect.Parameter.KEYWORD_ONLY
+        )
+        checks[f"{name}_loader_signature_has_prefix"] = (
+            "prefix" in signature.parameters
+            and signature.parameters["prefix"].kind
+            is inspect.Parameter.KEYWORD_ONLY
+        )
     os.environ["REPLAY_VLLM_TARGET_FAMILY"] = "minicpm_o_4_5"
     plugin.register()
     checks["plugin_registered_minicpm"] = "MiniCPMO" in FakeModelRegistry.registrations
@@ -178,14 +202,100 @@ def main() -> None:
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=False,
+            disable_chunked_mm_input=True,
             max_num_seqs=2,
             max_num_batched_tokens=32768,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
     )
+    for check_name, bad_config, expected_text in (
+        (
+            "rejects_chunked_prefill",
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    enable_chunked_prefill=True,
+                    disable_chunked_mm_input=True,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            ),
+            "enable_chunked_prefill=False",
+        ),
+        (
+            "requires_disable_chunked_mm_input",
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    enable_chunked_prefill=False,
+                    disable_chunked_mm_input=False,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            ),
+            "disable_chunked_mm_input=True",
+        ),
+        (
+            "rejects_prefix_caching",
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    enable_chunked_prefill=False,
+                    disable_chunked_mm_input=True,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=True),
+            ),
+            "enable_prefix_caching=False",
+        ),
+        (
+            "rejects_unknown_chunked_prefill",
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    enable_chunked_prefill=None,
+                    disable_chunked_mm_input=True,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            ),
+            "enable_chunked_prefill=False",
+        ),
+        (
+            "rejects_unknown_prefix_caching",
+            SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    enable_chunked_prefill=False,
+                    disable_chunked_mm_input=True,
+                ),
+                cache_config=SimpleNamespace(enable_prefix_caching=None),
+            ),
+            "enable_prefix_caching=False",
+        ),
+    ):
+        try:
+            models.ReplayShiftQwen2_5VL(vllm_config=bad_config)
+        except RuntimeError as exc:
+            checks[check_name] = expected_text in str(exc)
+        else:
+            checks[check_name] = False
     os.environ["REPLAY_VLLM_TARGET_FAMILY"] = "qwen2_5_vl"
     qwen = models.ReplayShiftQwen2_5VL(vllm_config=config)
     shifts = importlib.import_module("vlmeval.vlm.replay_visual_token_shift")
+    checks["normalizes_vllm_v0_multimodal_limit"] = (
+        shifts._extract_limit_mm_per_prompt(
+            SimpleNamespace(
+                get_multimodal_config=lambda: SimpleNamespace(
+                    limit_per_prompt={"image": 8}
+                )
+            )
+        )
+        == {"image": 8}
+    )
+    checks["normalizes_vllm_v1_multimodal_limit"] = (
+        shifts._extract_limit_mm_per_prompt(
+            SimpleNamespace(
+                multimodal_config=SimpleNamespace(
+                    limit_per_prompt={
+                        "image": SimpleNamespace(count=8),
+                    }
+                )
+            )
+        )
+        == {"image": 8}
+    )
     handshakes = shifts.require_vllm_visual_token_shift_worker_handshake(
         model_family="qwen2_5_vl",
         timeout_seconds=0,
@@ -225,6 +335,16 @@ def main() -> None:
         *pair([11, 12]),
         *pair([21, 22, 23, 24]),
     ]
+    minicpm._process_vision_input(
+        {
+            "type": "pixel_values",
+            "num_slices": torch.tensor(
+                [int(item.shape[0]) for item in minicpm_items],
+                dtype=torch.long,
+            ),
+            "embeddings": minicpm_items,
+        }
+    )
     shifts.arm_vllm_visual_token_shift_recording(model_family="minicpm_o_4_5")
     minicpm_input_ids = input_ids_with_split_spans(minicpm_items)
     minicpm_is_multimodal = minicpm_input_ids == 99
@@ -253,9 +373,15 @@ def main() -> None:
         *pair([100, 200]),
     ]
     legacy_input_ids = input_ids_for_items(legacy_items)
+    legacy_image_input = {
+        "embeddings": legacy_items,
+        "image_grid_thw": torch.tensor(
+            [[1, 1, int(item.shape[0])] for item in legacy_items]
+        ),
+    }
     legacy.get_input_embeddings_v0(
         legacy_input_ids,
-        image_input=legacy_items,
+        image_input=legacy_image_input,
     )
     checks["qwen_legacy_v0_post_projector_roll"] = (
         legacy.captured_embeddings[1].flatten().tolist() == [4, 1, 2, 3]
@@ -275,6 +401,16 @@ def main() -> None:
 
     os.environ["REPLAY_VLLM_TARGET_FAMILY"] = "minicpm_o_4_5"
     minicpm_noop = models.ReplayShiftMiniCPMO45(vllm_config=config)
+    minicpm_noop._process_vision_input(
+        {
+            "type": "pixel_values",
+            "num_slices": torch.tensor(
+                [int(item.shape[0]) for item in minicpm_items],
+                dtype=torch.long,
+            ),
+            "embeddings": minicpm_items,
+        }
+    )
     minicpm_noop.embed_input_ids(
         minicpm_input_ids,
         minicpm_items,
@@ -290,7 +426,7 @@ def main() -> None:
     legacy_noop = models.ReplayShiftQwen2_5VL(vllm_config=config)
     legacy_noop.get_input_embeddings_v0(
         legacy_input_ids,
-        image_input=legacy_items,
+        image_input=legacy_image_input,
     )
     checks["qwen_legacy_v0_matched_runtime_noop_exact"] = all(
         torch.equal(before, after)
@@ -362,6 +498,14 @@ def main() -> None:
         and record["item_span_grouping_exact"] is True
         and record["item_span_lengths_required"] is False
         and record["item_span_lengths_exact"] is None
+        and record["minicpm_placeholder_token_contract_exact"] is True
+        and record["minicpm_placeholder_slice_counts"]
+        == [len(group) for group in record["item_span_groups"]]
+        and all(
+            span_length == 1
+            for group in record["item_span_groups"]
+            for span_length in group
+        )
         and len(record["multimodal_span_lengths"]) > len(record["item_token_counts"])
         for record in minicpm_records
     )
@@ -411,6 +555,43 @@ def main() -> None:
                     after,
                     before[source],
                 )
+
+    fake_v0_engine = type("LLMEngine", (), {})
+    fake_v0_engine.__module__ = "vllm.engine.llm_engine"
+    fake_v1_engine = type("LLMEngine", (), {})
+    fake_v1_engine.__module__ = "vllm.v1.engine.llm_engine"
+    checks["actual_v0_engine_classified"] = shifts.record_vllm_engine_identity(
+        SimpleNamespace(engine_class=fake_v0_engine)
+    )["mode"] == "v0"
+    checks["actual_v1_engine_classified"] = shifts.record_vllm_engine_identity(
+        SimpleNamespace(engine_class=fake_v1_engine)
+    )["mode"] == "v1"
+
+    os.environ.update(
+        {
+            "REPLAY_VISUAL_TOKEN_SHIFT": "none",
+            "REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME": "1",
+            "REPLAY_VLLM_TARGET_FAMILY": "qwen2_5_vl",
+            "REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID": "synthetic-matched-none",
+            "REPLAY_INFERENCE_FINGERPRINT": "synthetic-none-fingerprint",
+            "VLLM_USE_V1": "0",
+        }
+    )
+    plugin.register()
+    checks["matched_none_plugin_registered"] = (
+        "Qwen2_5_VLForConditionalGeneration" in FakeModelRegistry.registrations
+    )
+    models.ReplayShiftQwen2_5VL(vllm_config=config)
+    none_handshakes = shifts.require_vllm_visual_token_shift_worker_handshake(
+        model_family="qwen2_5_vl",
+        timeout_seconds=0,
+    )
+    checks["matched_none_worker_handshake_found"] = (
+        len(none_handshakes) == 1
+        and none_handshakes[0]["mode"] == "none"
+        and none_handshakes[0]["scheduler_enable_chunked_prefill"] is False
+        and none_handshakes[0]["cache_enable_prefix_caching"] is False
+    )
 
     summary = {"all_passed": all(checks.values()), "checks": checks}
     (args.output_dir / "summary.json").write_text(

@@ -66,9 +66,11 @@ def _group_spans_by_item(
 class _ReplayVisualTokenShiftMixin:
     replay_model_family = "unknown"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        vllm_config = kwargs.get("vllm_config")
-        super().__init__(*args, **kwargs)
+    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+        # vLLM reflects this exact keyword-only signature to select its current
+        # model-loader ABI. A generic *args/**kwargs signature is treated as a
+        # legacy model and is initialized without vllm_config.
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         if not _truthy("REPLAY_VISUAL_TOKEN_SHIFT_CHUNKED_PREFILL_DISABLED", "0"):
             raise RuntimeError(
                 "vLLM visual-token shift requires the wrapper to disable chunked prefill"
@@ -79,12 +81,25 @@ class _ReplayVisualTokenShiftMixin:
             )
         scheduler_config = getattr(vllm_config, "scheduler_config", None)
         chunked = getattr(scheduler_config, "enable_chunked_prefill", None)
-        if chunked is True:
-            raise RuntimeError("vLLM visual-token shift cannot run with chunked prefill enabled")
+        if chunked is not False:
+            raise RuntimeError(
+                "vLLM visual-token shift requires enable_chunked_prefill=False"
+            )
+        disable_chunked_mm_input = getattr(
+            scheduler_config,
+            "disable_chunked_mm_input",
+            None,
+        )
+        if disable_chunked_mm_input is not True:
+            raise RuntimeError(
+                "vLLM visual-token shift requires disable_chunked_mm_input=True"
+            )
         cache_config = getattr(vllm_config, "cache_config", None)
         prefix_caching = getattr(cache_config, "enable_prefix_caching", None)
-        if prefix_caching is True:
-            raise RuntimeError("vLLM visual-token shift cannot run with prefix caching enabled")
+        if prefix_caching is not False:
+            raise RuntimeError(
+                "vLLM visual-token shift requires enable_prefix_caching=False"
+            )
         self._replay_shift_call_count = 0
         self._replay_shift_dump_count = 0
         self._replay_shift_instance_id = f"{time.time_ns()}_{id(self)}"
@@ -98,11 +113,17 @@ class _ReplayVisualTokenShiftMixin:
             "max_num_batched_tokens",
             None,
         )
+        self._replay_scheduler_enable_chunked_prefill = chunked
+        self._replay_scheduler_disable_chunked_mm_input = disable_chunked_mm_input
+        self._replay_cache_enable_prefix_caching = prefix_caching
         self._replay_write_worker_handshake()
 
     def _replay_write_worker_handshake(self) -> None:
         mode = canonicalize_visual_token_shift(os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT", "none"))
-        if mode == "none":
+        if mode == "none" and not _truthy(
+            "REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME",
+            "0",
+        ):
             return
         dump_dir_raw = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR", "").strip()
         if not dump_dir_raw:
@@ -128,6 +149,15 @@ class _ReplayVisualTokenShiftMixin:
             "inference_fingerprint": os.environ.get("REPLAY_INFERENCE_FINGERPRINT", ""),
             "scheduler_max_num_seqs": self._replay_scheduler_max_num_seqs,
             "scheduler_max_num_batched_tokens": self._replay_scheduler_max_num_batched_tokens,
+            "scheduler_enable_chunked_prefill": self._replay_scheduler_enable_chunked_prefill,
+            "scheduler_disable_chunked_mm_input": self._replay_scheduler_disable_chunked_mm_input,
+            "cache_enable_prefix_caching": self._replay_cache_enable_prefix_caching,
+            "vllm_engine_mode": (
+                "v0"
+                if self.replay_model_family == "qwen2_5_vl"
+                and not _truthy("VLLM_USE_V1", "1")
+                else "v1"
+            ),
         }
         dump_dir = Path(dump_dir_raw)
         dump_dir.mkdir(parents=True, exist_ok=True)
@@ -305,6 +335,9 @@ class _ReplayVisualTokenShiftMixin:
                 "pair_structure_validated": bool(pair_records),
                 "output_shape_matches_input_ids": True,
                 "expected_mm_token_count": pending["expected_mm_token_count"],
+                "qwen_grid_token_count_exact": pending.get(
+                    "qwen_grid_token_count_exact"
+                ),
             }
             call_path = dump_dir / f"visual_token_shift_calls.vllm.pid{os.getpid()}.jsonl"
             with call_path.open("a", encoding="utf-8") as handle:
@@ -396,6 +429,39 @@ class _ReplayVisualTokenShiftMixin:
             pending["item_span_lengths_exact"] = None
         pending["item_span_grouping_exact"] = item_span_grouping_exact
         pending["item_span_groups"] = item_span_groups
+        placeholder_slice_counts = (
+            [len(group) for group in item_span_groups]
+            if self.replay_model_family == "minicpm_o_4_5"
+            and item_span_groups is not None
+            else None
+        )
+        pending["minicpm_placeholder_slice_counts"] = placeholder_slice_counts
+        if self.replay_model_family == "minicpm_o_4_5":
+            query_num = int((pending.get("model_metadata") or {}).get("query_num") or 0)
+            expected_query_num = int(
+                os.environ.get("REPLAY_MINICPM_EXPECTED_QUERY_NUM", "64")
+            )
+            pending["minicpm_placeholder_token_contract_exact"] = bool(
+                query_num == expected_query_num
+                and len(item_token_counts) == len(placeholder_slice_counts or [])
+                and all(
+                    len(group) == int(slice_count)
+                    and all(int(span_length) == query_num for span_length in group)
+                    for group, slice_count in zip(
+                        item_span_groups or [],
+                        placeholder_slice_counts or [],
+                    )
+                )
+                and all(
+                    int(item_count) == query_num * int(slice_count)
+                    for item_count, slice_count in zip(
+                        item_token_counts,
+                        placeholder_slice_counts or [],
+                    )
+                )
+            )
+        else:
+            pending["minicpm_placeholder_token_contract_exact"] = None
         pending["output_shape_matches_input_ids"] = (
             tuple(inputs_embeds.shape[:-1]) == tuple(input_ids.shape)
         )
@@ -403,12 +469,21 @@ class _ReplayVisualTokenShiftMixin:
         pending["multimodal_span_lengths"] = multimodal_span_lengths
         pending["final_mm_token_count"] = int(final_mm_scatter.shape[0])
         pending["expected_mm_token_count"] = expected_mm_token_count
-        if not all(validation_values) or not item_span_grouping_exact:
+        if (
+            not all(validation_values)
+            or not item_span_grouping_exact
+            or (
+                self.replay_model_family == "minicpm_o_4_5"
+                and pending["minicpm_placeholder_token_contract_exact"] is not True
+            )
+        ):
             raise RuntimeError(
                 "vLLM final LLM-input invariant failed: "
                 f"input={validation_values[0]} mask={validation_values[1]} "
                 f"coverage={validation_values[2]} spans={validation_values[3]} "
-                f"scatter={validation_values[4]} grouping={item_span_grouping_exact}"
+                f"scatter={validation_values[4]} grouping={item_span_grouping_exact} "
+                "minicpm_placeholder_tokens="
+                f"{pending['minicpm_placeholder_token_contract_exact']}"
             )
 
         dump_dir = Path(pending["dump_dir"])
@@ -448,6 +523,18 @@ class _ReplayVisualTokenShiftMixin:
             "item_token_counts": pending.get("item_token_counts"),
             "multimodal_span_lengths": pending.get("multimodal_span_lengths"),
             "final_mm_token_count": pending.get("final_mm_token_count"),
+            "qwen_grid_token_count_exact": pending.get(
+                "qwen_grid_token_count_exact"
+            ),
+            "minicpm_query_num": (pending.get("model_metadata") or {}).get(
+                "query_num"
+            ),
+            "minicpm_placeholder_slice_counts": pending.get(
+                "minicpm_placeholder_slice_counts"
+            ),
+            "minicpm_placeholder_token_contract_exact": pending.get(
+                "minicpm_placeholder_token_contract_exact"
+            ),
         }
         call_path = dump_dir / f"visual_token_shift_calls.vllm.pid{os.getpid()}.jsonl"
         with call_path.open("a", encoding="utf-8") as handle:
@@ -591,6 +678,31 @@ class ReplayShiftQwen2_5VL(
             image_embeddings,
             stage="legacy_v0_post_projector_pre_llm",
         )
+        if pending is not None:
+            grid_thw = image_input.get("image_grid_thw")
+            merge_size = int(getattr(self.visual, "spatial_merge_size", 0))
+            if grid_thw is None or merge_size <= 0:
+                raise RuntimeError("Qwen v0 token roll cannot validate image_grid_thw")
+            grid_rows = grid_thw.detach().to(dtype=torch.long).cpu()
+            expected_counts = (
+                grid_rows.prod(dim=-1) // (merge_size * merge_size)
+            ).tolist()
+            actual_counts = [int(item.shape[0]) for item in shifted]
+            grid_token_count_exact = expected_counts == actual_counts
+            if not grid_token_count_exact:
+                raise RuntimeError(
+                    "Qwen v0 visual-token counts differ from image_grid_thw: "
+                    f"expected={expected_counts} actual={actual_counts}"
+                )
+            pending.update(
+                {
+                    "qwen_image_grid_thw": grid_rows.tolist(),
+                    "qwen_spatial_merge_size": merge_size,
+                    "qwen_expected_visual_token_counts": expected_counts,
+                    "qwen_actual_visual_token_counts": actual_counts,
+                    "qwen_grid_token_count_exact": True,
+                }
+            )
         if getattr(self, "_replay_legacy_v0_active", False):
             self._replay_legacy_v0_pending = (pending, shifted)
         else:

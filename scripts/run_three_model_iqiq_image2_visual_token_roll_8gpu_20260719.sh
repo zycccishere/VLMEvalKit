@@ -65,15 +65,16 @@ install_plugin_overlay() {
   "${CONTROL_PYTHON}" scripts/install_vllm_visual_token_shift_plugin.py \
     --target "${VLLM_TOKEN_ROLL_PLUGIN_OVERLAY}"
   PYTHONPATH="${REPO_ROOT}:${VLLM_TOKEN_ROLL_PLUGIN_OVERLAY}" \
+    VLLM_USE_V1=0 \
     REPLAY_VISUAL_TOKEN_SHIFT=roll_right_1 \
     REPLAY_VLLM_TARGET_FAMILY=qwen2_5_vl \
     "${QWEN_TOKEN_ROLL_VLLM_PYTHON}" -c \
-    'from importlib.metadata import entry_points; eps=[ep for ep in entry_points(group="vllm.general_plugins") if ep.name == "vlmeval_visual_token_shift"]; assert len(eps) == 1; register=eps[0].load(); assert callable(register); register(); from vlmeval.vlm.replay_vllm_visual_token_models import ReplayShiftQwen2_5VL; assert ReplayShiftQwen2_5VL.replay_model_family == "qwen2_5_vl"'
+    'import inspect; from importlib.metadata import entry_points; eps=[ep for ep in entry_points(group="vllm.general_plugins") if ep.name == "vlmeval_visual_token_shift"]; assert len(eps) == 1; register=eps[0].load(); assert callable(register); register(); from vlmeval.vlm.replay_vllm_visual_token_models import ReplayShiftQwen2_5VL; sig=inspect.signature(ReplayShiftQwen2_5VL.__init__); assert ReplayShiftQwen2_5VL.replay_model_family == "qwen2_5_vl" and "vllm_config" in sig.parameters and "prefix" in sig.parameters'
   PYTHONPATH="${REPO_ROOT}:${VLLM_TOKEN_ROLL_PLUGIN_OVERLAY}" \
     REPLAY_VISUAL_TOKEN_SHIFT=roll_right_1 \
     REPLAY_VLLM_TARGET_FAMILY=minicpm_o_4_5 \
     "${MINICPM_TOKEN_ROLL_VLLM_PYTHON}" -c \
-    'from importlib.metadata import entry_points; eps=[ep for ep in entry_points(group="vllm.general_plugins") if ep.name == "vlmeval_visual_token_shift"]; assert len(eps) == 1; register=eps[0].load(); assert callable(register); register(); from vlmeval.vlm.replay_vllm_visual_token_models import ReplayShiftMiniCPMO45; assert ReplayShiftMiniCPMO45.replay_model_family == "minicpm_o_4_5"'
+    'import inspect; from importlib.metadata import entry_points; eps=[ep for ep in entry_points(group="vllm.general_plugins") if ep.name == "vlmeval_visual_token_shift"]; assert len(eps) == 1; register=eps[0].load(); assert callable(register); register(); from vlmeval.vlm.replay_vllm_visual_token_models import ReplayShiftMiniCPMO45; sig=inspect.signature(ReplayShiftMiniCPMO45.__init__); assert ReplayShiftMiniCPMO45.replay_model_family == "minicpm_o_4_5" and "vllm_config" in sig.parameters and "prefix" in sig.parameters'
 }
 
 run_matrix() {
@@ -86,7 +87,6 @@ run_matrix() {
 run_real_smoke_gate() {
   local smoke_summary="${REPO_ROOT}/runs/vllm_visual_token_shift_real_smoke_20260720_summary.json"
   GPU_IDS="${TOKEN_ROLL_SMOKE_GPU_IDS:-0,1,2,3}" \
-    V0_GPU_IDS="${TOKEN_ROLL_SMOKE_V0_GPU_IDS:-0,1}" \
     bash scripts/run_vllm_visual_token_shift_real_smokes_20260720.sh
   "${CONTROL_PYTHON}" -c \
     'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); data=json.loads(p.read_text()); assert data.get("all_passed") is True and (data.get("smoke_certificate") or {}).get("valid") is True, data' \

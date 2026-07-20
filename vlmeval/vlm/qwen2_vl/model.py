@@ -29,8 +29,10 @@ from ..replay_image_transform import (
 from ..replay_visual_token_shift import (
     VisualTokenShiftController,
     arm_vllm_visual_token_shift_recording,
+    record_vllm_engine_identity,
     require_vllm_visual_token_shift_worker_handshake,
     visual_token_shift_enabled,
+    vllm_visual_token_shift_runtime_enabled,
     write_vllm_runtime_contract,
 )
 from .replay_prompt_template import (
@@ -361,12 +363,20 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             max_num_batched_tokens = os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", "").strip()
             if max_num_batched_tokens.isdigit():
                 llm_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
-            if visual_token_shift_enabled():
+            if vllm_visual_token_shift_runtime_enabled():
                 os.environ["REPLAY_VISUAL_TOKEN_SHIFT_CHUNKED_PREFILL_DISABLED"] = "1"
                 os.environ["REPLAY_VISUAL_TOKEN_SHIFT_PREFIX_CACHING_DISABLED"] = "1"
                 llm_kwargs["enable_chunked_prefill"] = False
                 llm_kwargs["enable_prefix_caching"] = False
+                llm_kwargs["disable_chunked_mm_input"] = True
             self.llm = LLM(**llm_kwargs)
+            if vllm_visual_token_shift_runtime_enabled():
+                record_vllm_engine_identity(
+                    self.llm,
+                    expected_limit_mm_per_prompt={
+                        "image": self.limit_mm_per_prompt,
+                    },
+                )
 
         elif self.use_lmdeploy:
             from lmdeploy import TurbomindEngineConfig, pipeline, ChatTemplateConfig
@@ -1363,8 +1373,9 @@ class Qwen2VLChatReplay(Qwen2VLChat):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if visual_token_shift_enabled() and self.use_vllm:
+        if vllm_visual_token_shift_runtime_enabled() and self.use_vllm:
             require_vllm_visual_token_shift_worker_handshake(model_family="qwen2_5_vl")
+        if visual_token_shift_enabled() and self.use_vllm:
             arm_vllm_visual_token_shift_recording(model_family="qwen2_5_vl")
         self.visual_token_shift = VisualTokenShiftController(
             model_family="qwen2_5_vl",

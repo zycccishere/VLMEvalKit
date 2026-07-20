@@ -65,6 +65,145 @@ def visual_token_shift_enabled(name: str | None = None) -> bool:
     return canonicalize_visual_token_shift(name) != NO_VISUAL_TOKEN_SHIFT
 
 
+def vllm_visual_token_shift_runtime_enabled(name: str | None = None) -> bool:
+    """Whether the matched vLLM runtime must be active, including controls."""
+    return visual_token_shift_enabled(name) or _env_truthy(
+        "REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME",
+        "0",
+    )
+
+
+def _normalize_limit_mm_per_prompt(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized = {}
+    for modality, options in value.items():
+        if isinstance(options, bool):
+            raise RuntimeError("invalid boolean vLLM multimodal item limit")
+        if isinstance(options, int):
+            count = options
+        elif isinstance(options, dict):
+            count = options.get("count")
+        else:
+            count = getattr(options, "count", None)
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise RuntimeError(
+                f"cannot normalize vLLM multimodal item limit for {modality!r}"
+            )
+        normalized[str(modality)] = int(count)
+    return normalized
+
+
+def _extract_limit_mm_per_prompt(model_config: Any) -> dict[str, int] | None:
+    direct = _normalize_limit_mm_per_prompt(
+        getattr(model_config, "limit_mm_per_prompt", None)
+    )
+    if direct is not None:
+        return direct
+
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    if multimodal_config is None:
+        getter = getattr(model_config, "get_multimodal_config", None)
+        if callable(getter):
+            multimodal_config = getter()
+    if multimodal_config is None:
+        return None
+    return _normalize_limit_mm_per_prompt(
+        getattr(multimodal_config, "limit_per_prompt", None)
+    )
+
+
+def record_vllm_engine_identity(
+    llm: Any,
+    *,
+    expected_limit_mm_per_prompt: dict[str, int] | None = None,
+) -> dict[str, str]:
+    """Record the concrete driver engine class selected by vLLM."""
+    engine_class = getattr(llm, "engine_class", None)
+    if engine_class is None:
+        engine = getattr(llm, "llm_engine", None)
+        engine_class = type(engine) if engine is not None else None
+    if engine_class is None:
+        raise RuntimeError("vLLM runtime does not expose its concrete engine class")
+
+    module = str(getattr(engine_class, "__module__", ""))
+    qualname = str(getattr(engine_class, "__qualname__", ""))
+    if module.startswith("vllm.v1."):
+        engine_mode = "v1"
+    elif module.startswith("vllm.engine."):
+        engine_mode = "v0"
+    else:
+        raise RuntimeError(
+            "cannot classify concrete vLLM engine class: "
+            f"{module}.{qualname}"
+        )
+    os.environ["REPLAY_VLLM_ACTUAL_ENGINE_MODE"] = engine_mode
+    os.environ["REPLAY_VLLM_ACTUAL_ENGINE_MODULE"] = module
+    os.environ["REPLAY_VLLM_ACTUAL_ENGINE_QUALNAME"] = qualname
+    llm_engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(llm_engine, "vllm_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    limit_mm_per_prompt = _extract_limit_mm_per_prompt(model_config)
+    if (
+        expected_limit_mm_per_prompt is not None
+        and limit_mm_per_prompt != expected_limit_mm_per_prompt
+    ):
+        raise RuntimeError(
+            "concrete vLLM multimodal item limit differs from requested config: "
+            f"actual={limit_mm_per_prompt!r} "
+            f"expected={expected_limit_mm_per_prompt!r}"
+        )
+    runtime_config = {
+        "max_model_len": getattr(model_config, "max_model_len", None),
+        "enforce_eager": getattr(model_config, "enforce_eager", None),
+        "limit_mm_per_prompt": limit_mm_per_prompt,
+        "max_num_seqs": getattr(scheduler_config, "max_num_seqs", None),
+        "max_num_batched_tokens": getattr(
+            scheduler_config,
+            "max_num_batched_tokens",
+            None,
+        ),
+        "enable_chunked_prefill": getattr(
+            scheduler_config,
+            "enable_chunked_prefill",
+            None,
+        ),
+        "disable_chunked_mm_input": getattr(
+            scheduler_config,
+            "disable_chunked_mm_input",
+            None,
+        ),
+        "enable_prefix_caching": getattr(
+            cache_config,
+            "enable_prefix_caching",
+            None,
+        ),
+        "gpu_memory_utilization": getattr(
+            cache_config,
+            "gpu_memory_utilization",
+            None,
+        ),
+        "tensor_parallel_size": getattr(
+            parallel_config,
+            "tensor_parallel_size",
+            None,
+        ),
+    }
+    os.environ["REPLAY_VLLM_ACTUAL_RUNTIME_CONFIG_JSON"] = json.dumps(
+        _stable_runtime_value(runtime_config),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return {
+        "mode": engine_mode,
+        "module": module,
+        "qualname": qualname,
+    }
+
+
 def _vllm_recording_arm_path(*, model_family: str) -> Path:
     run_id = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", "").strip()
     dump_dir_raw = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR", "").strip()
@@ -102,7 +241,7 @@ def require_vllm_visual_token_shift_worker_handshake(
     timeout_seconds: float = 30.0,
 ) -> list[dict[str, Any]]:
     """Require every expected TP worker to instantiate the replay model class."""
-    if not visual_token_shift_enabled():
+    if not vllm_visual_token_shift_runtime_enabled():
         return []
     run_id = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_RUN_ID", "").strip()
     dump_dir_raw = os.environ.get("REPLAY_VISUAL_TOKEN_SHIFT_DUMP_DIR", "").strip()
@@ -303,6 +442,7 @@ def write_vllm_runtime_contract(
     dataset: str | None,
     requests: list[Any],
     sampling_params: Any,
+    request_metadata: list[Any] | None = None,
 ) -> None:
     if not _env_truthy("REPLAY_VLLM_RUNTIME_CONTRACT", "0"):
         return
@@ -333,6 +473,11 @@ def write_vllm_runtime_contract(
             ).hexdigest()
             for request in serialized_requests
         ]
+    if request_metadata is not None and len(request_metadata) != len(requests):
+        raise RuntimeError(
+            "vLLM runtime metadata must have one entry per request: "
+            f"metadata={len(request_metadata)} requests={len(requests)}"
+        )
     payload = {
         "phase": "vllm_runtime_contract",
         "timestamp": time.time(),
@@ -344,6 +489,11 @@ def write_vllm_runtime_contract(
         "dataset": str(dataset) if dataset is not None else None,
         "request_count": len(requests),
         "request_hashes": request_hashes,
+        "request_metadata": (
+            [_stable_runtime_value(item) for item in request_metadata]
+            if request_metadata is not None
+            else []
+        ),
         "request_identity_level": contract_level,
         "effective_infer_batch_size": int(
             os.environ.get("VLMEVAL_EFFECTIVE_INFER_BATCH_SIZE", len(requests))
@@ -353,6 +503,21 @@ def write_vllm_runtime_contract(
             field: _stable_runtime_value(getattr(sampling_params, field, None))
             for field in sampling_fields
         },
+        "actual_vllm_engine_mode": os.environ.get(
+            "REPLAY_VLLM_ACTUAL_ENGINE_MODE",
+            "",
+        ),
+        "actual_vllm_engine_module": os.environ.get(
+            "REPLAY_VLLM_ACTUAL_ENGINE_MODULE",
+            "",
+        ),
+        "actual_vllm_engine_qualname": os.environ.get(
+            "REPLAY_VLLM_ACTUAL_ENGINE_QUALNAME",
+            "",
+        ),
+        "actual_vllm_runtime_config": json.loads(
+            os.environ.get("REPLAY_VLLM_ACTUAL_RUNTIME_CONFIG_JSON", "{}")
+        ),
         "inference_fingerprint": os.environ.get("REPLAY_INFERENCE_FINGERPRINT", ""),
     }
     dump_dir = Path(dump_dir_raw)

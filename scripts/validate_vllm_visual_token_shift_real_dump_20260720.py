@@ -19,7 +19,8 @@ POLICY_MODE_ROOT = Path("default/image_text_image_text")
 MODEL_SPECS = {
     "qwen25vl_3b_token_roll": {
         "family": "qwen2_5_vl",
-        "stage": "post_gather_pre_llm_get_input_embeddings",
+        "stage": "legacy_v0_post_projector_pre_llm",
+        "engine_mode": "v0",
         "ranks": {0},
         "batch_size": 2,
         "max_num_seqs": 2,
@@ -27,7 +28,8 @@ MODEL_SPECS = {
     },
     "qwen25vl_32b_token_roll": {
         "family": "qwen2_5_vl",
-        "stage": "post_gather_pre_llm_get_input_embeddings",
+        "stage": "legacy_v0_post_projector_pre_llm",
+        "engine_mode": "v0",
         "ranks": {0, 1},
         "batch_size": 2,
         "max_num_seqs": 2,
@@ -36,12 +38,38 @@ MODEL_SPECS = {
     "minicpm_o_45_token_roll": {
         "family": "minicpm_o_4_5",
         "stage": "post_gather_pre_llm_embed_input_ids",
+        "engine_mode": "v1",
         "ranks": {0},
         "batch_size": 2,
         "max_num_seqs": 2,
         "tp_size": 1,
     },
 }
+
+
+def contiguous_partition_refines(
+    refinement: list[int],
+    coarser: list[int],
+) -> bool:
+    if (
+        not refinement
+        or not coarser
+        or any(value <= 0 for value in refinement)
+        or any(value <= 0 for value in coarser)
+        or sum(refinement) != sum(coarser)
+    ):
+        return False
+    boundaries = set()
+    offset = 0
+    for value in refinement:
+        offset += value
+        boundaries.add(offset)
+    offset = 0
+    for value in coarser:
+        offset += value
+        if offset not in boundaries:
+            return False
+    return True
 
 
 def smoke_binding_components(
@@ -272,6 +300,45 @@ def validate_raw_record(
         failures.append("per-image-item slice span grouping is invalid")
     if expected_family == "minicpm_o_4_5" and not any(len(group) > 1 for group in span_groups):
         failures.append("MiniCPM smoke did not exercise a multi-slice image item")
+    if expected_family == "qwen2_5_vl":
+        if record.get("qwen_grid_token_count_exact") is not True:
+            failures.append("Qwen image_grid_thw token-count check is not exact")
+        grid_rows = record.get("qwen_image_grid_thw") or []
+        merge_size = int(record.get("qwen_spatial_merge_size") or 0)
+        expected_counts = record.get("qwen_expected_visual_token_counts") or []
+        actual_counts = record.get("qwen_actual_visual_token_counts") or []
+        independent_counts = [
+            int(np.prod(row)) // (merge_size * merge_size)
+            for row in grid_rows
+        ] if merge_size > 0 else []
+        if not (
+            independent_counts
+            and independent_counts == expected_counts == actual_counts == item_counts
+        ):
+            failures.append("Qwen grid-derived and actual visual-token counts differ")
+    if expected_family == "minicpm_o_4_5":
+        query_num = int((record.get("model_metadata") or {}).get("query_num") or 0)
+        placeholder_slice_counts = (
+            record.get("minicpm_placeholder_slice_counts") or []
+        )
+        if query_num != 64:
+            failures.append(f"MiniCPM query_num is not 64: {query_num}")
+        if record.get("minicpm_placeholder_token_contract_exact") is not True:
+            failures.append("MiniCPM placeholder/token contract is not exact")
+        if not (
+            placeholder_slice_counts
+            and placeholder_slice_counts == [len(group) for group in span_groups]
+            and all(
+                all(int(span_length) == query_num for span_length in group)
+                for group in span_groups
+            )
+        ) or any(
+            int(item_count) != query_num * int(slice_count)
+            for item_count, slice_count in zip(item_counts, placeholder_slice_counts)
+        ):
+            failures.append(
+                "MiniCPM placeholder spans and LLM visual-token counts differ"
+            )
     for key in (
         "model_name",
         "input_ids_sha256",
@@ -390,6 +457,18 @@ def validate_condition(
     if runtime.get("max_num_seqs") != spec["max_num_seqs"]:
         failures.append(f"max_num_seqs != {spec['max_num_seqs']}")
 
+    semantic_env = dict(provenance.get("semantic_env") or {})
+    semantic_env.pop("REPLAY_VISUAL_TOKEN_SHIFT", None)
+    task_dir_text = str(task_dir.resolve())
+    normalized_semantic_env = {
+        key: (
+            value.replace(task_dir_text, "<TASK_DIR>")
+            if isinstance(value, str)
+            else value
+        )
+        for key, value in semantic_env.items()
+    }
+
     run_id = manifest.get("runtime_contract_run_id")
     contracts = [
         record
@@ -409,47 +488,142 @@ def validate_condition(
             for request_hash in contract.get("request_hashes", [])
         ]
         request_count = sum(int(contract.get("request_count", -1)) for contract in contracts)
+        contract_request_counts = [
+            int(contract.get("request_count", -1)) for contract in contracts
+        ]
+        expected_request_counts = []
+        remaining_request_count = MIN_BATCH_SIZE
+        while remaining_request_count > 0:
+            call_request_count = min(spec["batch_size"], remaining_request_count)
+            expected_request_counts.append(call_request_count)
+            remaining_request_count -= call_request_count
         sampling_contracts = [contract.get("sampling_contract") for contract in contracts]
+        request_metadata_by_call = [
+            list(contract.get("request_metadata", [])) for contract in contracts
+        ]
+        request_metadata = [
+            metadata for call_metadata in request_metadata_by_call
+            for metadata in call_metadata
+        ]
+        runtime_configs = [
+            contract.get("actual_vllm_runtime_config") for contract in contracts
+        ]
         if any(
             contract.get("mode") != mode
             or contract.get("model_family") != spec["family"]
             or contract.get("request_identity_level") != "full"
             or int(contract.get("effective_infer_batch_size", -1)) != spec["batch_size"]
             or int(contract.get("effective_max_num_seqs", -1)) != spec["max_num_seqs"]
+            or contract.get("actual_vllm_engine_mode") != spec["engine_mode"]
+            or not contract.get("actual_vllm_engine_module")
+            or not contract.get("actual_vllm_engine_qualname")
+            or not contract.get("actual_vllm_runtime_config")
             or contract.get("inference_fingerprint") != inference_fingerprint
             for contract in contracts
         ) or (
             request_count != MIN_BATCH_SIZE
+            or contract_request_counts != expected_request_counts
             or len(request_hashes) != MIN_BATCH_SIZE
             or len(set(request_hashes)) != MIN_BATCH_SIZE
             or len({json.dumps(item, sort_keys=True) for item in sampling_contracts}) != 1
+            or len({json.dumps(item, sort_keys=True) for item in runtime_configs}) != 1
         ):
             failures.append("runtime request/sampling contract is invalid")
+        if spec["family"] == "minicpm_o_4_5":
+            if any(
+                len(call_metadata) != call_request_count
+                or [
+                    int(metadata.get("request_index", -1))
+                    for metadata in call_metadata
+                ]
+                != list(range(call_request_count))
+                for call_metadata, call_request_count in zip(
+                    request_metadata_by_call,
+                    contract_request_counts,
+                )
+            ) or len(request_metadata) != request_count or any(
+                metadata.get("image_count") != 2
+                or len(metadata.get("image_sha256") or []) != 2
+                or len(metadata.get("image_sizes") or []) != 2
+                or len(metadata.get("minicpm_num_slices") or []) != 2
+                or metadata["image_sha256"][0] != metadata["image_sha256"][1]
+                or metadata["minicpm_num_slices"][0]
+                != metadata["minicpm_num_slices"][1]
+                or any(
+                    int(value) <= 0
+                    for value in metadata.get("minicpm_num_slices") or []
+                )
+                for metadata in request_metadata
+            ):
+                failures.append("MiniCPM driver request slice metadata is invalid")
+            if len(
+                {
+                    tuple(metadata.get("image_sha256") or [])
+                    for metadata in request_metadata
+                }
+            ) != request_count:
+                failures.append("MiniCPM sentinel driver image hashes are not distinct")
+            if any(
+                len(
+                    {
+                        tuple(
+                            int(value)
+                            for value in metadata.get(
+                                "minicpm_num_slices",
+                                [],
+                            )
+                        )
+                        for metadata in call_metadata
+                    }
+                )
+                != len(call_metadata)
+                for call_metadata in request_metadata_by_call
+                if len(call_metadata) > 1
+            ):
+                failures.append(
+                    "MiniCPM sentinel slices are not request-distinguishing "
+                    "within each driver call"
+                )
+        elif request_metadata:
+            failures.append("Qwen runtime unexpectedly contains MiniCPM request metadata")
+        if any(
+            not isinstance(config, dict)
+            or int(config.get("max_num_seqs") or -1) != spec["max_num_seqs"]
+            or int(config.get("tensor_parallel_size") or -1) != spec["tp_size"]
+            or config.get("enable_chunked_prefill") is not False
+            or config.get("disable_chunked_mm_input") is not True
+            or config.get("enable_prefix_caching") is not False
+            or int(config.get("max_model_len") or 0) <= 0
+            or int(config.get("max_num_batched_tokens") or 0) <= 0
+            or not isinstance(config.get("limit_mm_per_prompt"), dict)
+            for config in runtime_configs
+        ):
+            failures.append("concrete vLLM runtime configuration is invalid")
         runtime_contract = {
             "request_count": request_count,
             "request_hashes": request_hashes,
             "sampling_contract": sampling_contracts[0],
             "contract_count": len(contracts),
+            "actual_vllm_engine_mode": contracts[0].get(
+                "actual_vllm_engine_mode"
+            ),
+            "actual_vllm_engine_module": contracts[0].get(
+                "actual_vllm_engine_module"
+            ),
+            "actual_vllm_engine_qualname": contracts[0].get(
+                "actual_vllm_engine_qualname"
+            ),
+            "actual_vllm_runtime_config": contracts[0].get(
+                "actual_vllm_runtime_config"
+            ),
+            "request_metadata": request_metadata,
+            "request_metadata_by_call": request_metadata_by_call,
+            "request_counts_by_call": contract_request_counts,
+            "normalized_semantic_env": normalized_semantic_env,
         }
     if not run_id:
         failures.append("runtime contract run id is missing from prediction manifest")
 
-    if mode == "none":
-        if load_records(task_dir):
-            failures.append("native none control unexpectedly produced shift records")
-        if load_call_records(task_dir):
-            failures.append("native none control unexpectedly produced shift call audits")
-        return [], output_signature(frame), runtime_contract, failures
-
-    evidence = manifest.get("mechanism_evidence") or {}
-    if (
-        evidence.get("verified") is not True
-        or evidence.get("mode") != mode
-        or evidence.get("inference_fingerprint") != inference_fingerprint
-        or int(evidence.get("validated_request_count", -1)) != MIN_BATCH_SIZE
-    ):
-        failures.append("prediction manifest lacks matching mechanism evidence")
-    run_id = evidence.get("run_id")
     handshakes = []
     for path in (task_dir / "_visual_token_shift").glob(
         f"worker_handshake.{spec['family']}.pid*.json"
@@ -470,33 +644,147 @@ def validate_condition(
         or item.get("target_family") != spec["family"]
         or item.get("inference_fingerprint") != inference_fingerprint
         or int(item.get("scheduler_max_num_seqs", -1)) != spec["max_num_seqs"]
+        or int(item.get("scheduler_max_num_batched_tokens", -1))
+        != int(
+            (runtime_contract.get("actual_vllm_runtime_config") or {}).get(
+                "max_num_batched_tokens",
+                -2,
+            )
+        )
+        or item.get("scheduler_enable_chunked_prefill") is not False
+        or item.get("scheduler_disable_chunked_mm_input") is not True
+        or item.get("cache_enable_prefix_caching") is not False
+        or item.get("vllm_engine_mode") != runtime_contract.get(
+            "actual_vllm_engine_mode"
+        )
         or not item.get("model_class")
         or not item.get("model_name")
         for item in handshakes
     ):
-        failures.append("worker handshake mode/model family mismatch")
+        failures.append("worker handshake mode/model family/runtime mismatch")
+
+    if mode == "none":
+        evidence = manifest.get("mechanism_evidence") or {}
+        if (
+            evidence.get("verified") is not True
+            or evidence.get("control") is not True
+            or evidence.get("mode") != "none"
+            or evidence.get("run_id") != run_id
+            or evidence.get("inference_fingerprint") != inference_fingerprint
+            or int(evidence.get("validated_request_count", -1)) != MIN_BATCH_SIZE
+            or evidence.get("actual_vllm_engine_mode")
+            != runtime_contract.get("actual_vllm_engine_mode")
+            or evidence.get("actual_vllm_runtime_config")
+            != runtime_contract.get("actual_vllm_runtime_config")
+        ):
+            failures.append("matched none manifest lacks verified runtime evidence")
+        if load_records(task_dir):
+            failures.append("native none control unexpectedly produced shift records")
+        if load_call_records(task_dir):
+            failures.append("native none control unexpectedly produced shift call audits")
+        return [], output_signature(frame), runtime_contract, failures
+
+    evidence = manifest.get("mechanism_evidence") or {}
+    if (
+        evidence.get("verified") is not True
+        or evidence.get("mode") != mode
+        or evidence.get("inference_fingerprint") != inference_fingerprint
+        or int(evidence.get("validated_request_count", -1)) != MIN_BATCH_SIZE
+    ):
+        failures.append("prediction manifest lacks matching mechanism evidence")
+    evidence_run_id = evidence.get("run_id")
+    if evidence_run_id != run_id:
+        failures.append("mechanism evidence and runtime contract run ids differ")
     records = [record for record in load_records(task_dir) if record.get("run_id") == run_id]
     ranks = {int(record.get("rank", -1)) for record in records}
     if ranks != spec["ranks"]:
         failures.append(f"record ranks {sorted(ranks)} != {sorted(spec['ranks'])}")
     for rank in spec["ranks"]:
         rank_records = [record for record in records if int(record.get("rank", -1)) == rank]
-        if len(rank_records) != 1:
-            failures.append(f"rank {rank} record count {len(rank_records)} != 1")
-            continue
-        record = rank_records[0]
-        if record.get("model_family") != spec["family"]:
-            failures.append(f"rank {rank} model family mismatch")
-        failures.extend(
-            f"rank {rank}: {failure}"
-            for failure in validate_raw_record(
-                record,
-                expected_mode=mode,
-                expected_stage=spec["stage"],
-                expected_family=spec["family"],
-                expected_fingerprint=inference_fingerprint,
+        rank_records.sort(key=lambda item: int(item.get("call_index", -1)))
+        if len(rank_records) < MIN_PREFILL_CALLS:
+            failures.append(
+                f"rank {rank} raw record count {len(rank_records)} < {MIN_PREFILL_CALLS}"
             )
-        )
+            continue
+        for record in rank_records:
+            if record.get("model_family") != spec["family"]:
+                failures.append(f"rank {rank} model family mismatch")
+            failures.extend(
+                f"rank {rank} call {record.get('call_index')}: {failure}"
+                for failure in validate_raw_record(
+                    record,
+                    expected_mode=mode,
+                    expected_stage=spec["stage"],
+                    expected_family=spec["family"],
+                    expected_fingerprint=inference_fingerprint,
+                )
+            )
+        raw_pair_fingerprints = [
+            (tuple(pair.get("shape") or []), pair.get("i1_before_sha256"))
+            for record in rank_records
+            for pair in (record.get("audit") or {}).get("pair_records", [])
+        ]
+        if len(raw_pair_fingerprints) != int(runtime_contract.get("request_count", -1)):
+            failures.append(f"rank {rank} raw pair coverage differs from runtime contract")
+        if len(set(raw_pair_fingerprints)) != len(raw_pair_fingerprints):
+            failures.append(f"rank {rank} sentinel request visual fingerprints are not distinct")
+        if spec["family"] == "minicpm_o_4_5":
+            raw_pair_counts = [
+                len((record.get("audit") or {}).get("pair_records", []))
+                for record in rank_records
+            ]
+            if not contiguous_partition_refines(
+                raw_pair_counts,
+                runtime_contract.get("request_counts_by_call", []),
+            ):
+                failures.append(
+                    f"rank {rank} MiniCPM worker partition {raw_pair_counts} "
+                    "does not refine driver calls"
+                )
+            driver_slice_pairs = [
+                tuple(
+                    int(value)
+                    for value in metadata.get("minicpm_num_slices", [])
+                )
+                for metadata in runtime_contract.get("request_metadata", [])
+            ]
+            worker_slice_pairs = []
+            worker_pair_token_counts = []
+            for record in rank_records:
+                pair_records = (record.get("audit") or {}).get("pair_records", [])
+                slice_counts = record.get("minicpm_placeholder_slice_counts") or []
+                if len(slice_counts) != 2 * len(pair_records):
+                    failures.append(
+                        f"rank {rank} MiniCPM slice counts do not cover IQIQ pairs"
+                    )
+                    continue
+                for pair_index, pair_record in enumerate(pair_records):
+                    worker_slice_pairs.append(
+                        tuple(
+                            int(value)
+                            for value in slice_counts[2 * pair_index : 2 * pair_index + 2]
+                        )
+                    )
+                    worker_pair_token_counts.append(
+                        int((pair_record.get("shape") or [0])[0])
+                    )
+            if worker_slice_pairs != driver_slice_pairs:
+                failures.append(
+                    f"rank {rank} MiniCPM driver and worker slices differ: "
+                    f"driver={driver_slice_pairs} worker={worker_slice_pairs}"
+                )
+            if any(
+                slices[0] != slices[1]
+                or token_count != 64 * slices[1]
+                for slices, token_count in zip(
+                    worker_slice_pairs,
+                    worker_pair_token_counts,
+                )
+            ):
+                failures.append(
+                    f"rank {rank} MiniCPM raw pair shape differs from driver slices"
+                )
     call_records = [
         record for record in load_call_records(task_dir) if record.get("run_id") == run_id
     ]
@@ -530,7 +818,24 @@ def validate_condition(
                 or call.get("validation_level") != "full"
                 or (
                     spec["family"] == "qwen2_5_vl"
-                    and call.get("item_span_lengths_exact") is not True
+                    and (
+                        call.get("item_span_lengths_exact") is not True
+                        or call.get("qwen_grid_token_count_exact") is not True
+                    )
+                )
+                or (
+                    spec["family"] == "minicpm_o_4_5"
+                    and (
+                        int(call.get("minicpm_query_num") or 0) != 64
+                        or call.get("minicpm_placeholder_token_contract_exact")
+                        is not True
+                        or not call.get("minicpm_placeholder_slice_counts")
+                        or any(
+                            int(span_length) != 64
+                            for group in call.get("item_span_groups") or []
+                            for span_length in group
+                        )
+                    )
                 )
                 or call.get("real_request") is not True
                 or call.get("recording_armed") is not True
@@ -542,8 +847,22 @@ def validate_condition(
         pair_counts_by_rank[rank] = [
             int(call.get("request_pair_count", -1)) for call in rank_calls
         ]
-        if sum(pair_counts_by_rank[rank]) != int(runtime_contract.get("request_count", -1)):
-            failures.append(f"rank {rank} prefill coverage differs from runtime contract")
+        if not contiguous_partition_refines(
+            pair_counts_by_rank[rank],
+            runtime_contract.get("request_counts_by_call", []),
+        ):
+            failures.append(
+                f"rank {rank} prefill partition does not refine driver calls"
+            )
+        raw_call_indices = sorted(
+            int(record.get("call_index", -1))
+            for record in records
+            if int(record.get("rank", -1)) == rank
+        )
+        if raw_call_indices != expected_indices:
+            failures.append(
+                f"rank {rank} raw dump calls {raw_call_indices} != audited calls {expected_indices}"
+            )
     if len({tuple(counts) for counts in pair_counts_by_rank.values()}) > 1:
         failures.append(f"TP prefill call partitions differ: {pair_counts_by_rank}")
     return records, output_signature(frame), runtime_contract, failures
@@ -554,6 +873,14 @@ def runtime_contract_signature(record: dict[str, Any]) -> dict[str, Any]:
         "request_count": record.get("request_count"),
         "request_hashes": record.get("request_hashes"),
         "sampling_contract": record.get("sampling_contract"),
+        "actual_vllm_engine_mode": record.get("actual_vllm_engine_mode"),
+        "actual_vllm_engine_module": record.get("actual_vllm_engine_module"),
+        "actual_vllm_engine_qualname": record.get("actual_vllm_engine_qualname"),
+        "actual_vllm_runtime_config": record.get("actual_vllm_runtime_config"),
+        "request_metadata": record.get("request_metadata"),
+        "request_counts_by_call": record.get("request_counts_by_call"),
+        "request_metadata_by_call": record.get("request_metadata_by_call"),
+        "normalized_semantic_env": record.get("normalized_semantic_env"),
     }
 
 
@@ -579,8 +906,7 @@ def tp_hash_signature(record: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--v1-root", type=Path, required=True)
-    parser.add_argument("--v0-root", type=Path, required=True)
+    parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -593,26 +919,34 @@ def main() -> None:
         mode_records = {}
         mode_bindings = {}
         for mode in ("none", "noop_vllm", "roll_right_1"):
-            task_dir = args.v1_root / POLICY_MODE_ROOT / mode / model_key / "MathVision"
+            task_dir = args.root / POLICY_MODE_ROOT / mode / model_key / "MathVision"
             records, signature, runtime_contract, condition_failures = validate_condition(
                 task_dir,
                 model_key=model_key,
                 mode=mode,
                 spec=spec,
             )
-            label = f"v1/{model_key}/{mode}"
+            label = f"{spec['engine_mode']}/{model_key}/{mode}"
             accepted[label] = {
                 "record_ranks": sorted({int(record["rank"]) for record in records}),
                 "failures": condition_failures,
             }
             failures.extend(f"{label}: {failure}" for failure in condition_failures)
             try:
+                actual_engine_mode = runtime_contract.get(
+                    "actual_vllm_engine_mode"
+                )
+                if actual_engine_mode != spec["engine_mode"]:
+                    raise ValueError(
+                        "runtime engine differs from model specification: "
+                        f"{actual_engine_mode!r} != {spec['engine_mode']!r}"
+                    )
                 entry = smoke_certificate_entry(
                     task_dir,
                     model_key=model_key,
                     model_family=spec["family"],
                     mode=mode,
-                    engine_mode="v1",
+                    engine_mode=actual_engine_mode,
                 )
                 mode_bindings[mode] = {
                     key: value
@@ -627,13 +961,19 @@ def main() -> None:
             runtime_contracts[mode] = runtime_contract
             mode_records[mode] = records
         if signatures["none"] != signatures["noop_vllm"]:
-            failures.append(f"v1/{model_key}: native none and matched-runtime noop outputs differ")
+            failures.append(
+                f"{spec['engine_mode']}/{model_key}: native none and "
+                "matched-runtime noop outputs differ"
+            )
         if not (
             runtime_contract_signature(runtime_contracts["none"])
             == runtime_contract_signature(runtime_contracts["noop_vllm"])
             == runtime_contract_signature(runtime_contracts["roll_right_1"])
         ):
-            failures.append(f"v1/{model_key}: request or SamplingParams contracts differ")
+            failures.append(
+                f"{spec['engine_mode']}/{model_key}: request or "
+                "SamplingParams contracts differ"
+            )
         if len(mode_bindings) != 3 or len(
             {
                 json.dumps(binding, ensure_ascii=False, sort_keys=True)
@@ -641,83 +981,31 @@ def main() -> None:
             }
         ) != 1:
             failures.append(
-                f"v1/{model_key}: code/runtime/model identity differs across controls"
+                f"{spec['engine_mode']}/{model_key}: "
+                "code/runtime/model identity differs across controls"
             )
         if model_key == "qwen25vl_32b_token_roll":
             for mode in ("noop_vllm", "roll_right_1"):
-                by_rank = {int(record["rank"]): record for record in mode_records[mode]}
-                if set(by_rank) == {0, 1} and tp_hash_signature(by_rank[0]) != tp_hash_signature(by_rank[1]):
-                    failures.append(f"v1/{model_key}/{mode}: TP rank embedding hashes differ")
-
-    for model_key in ("qwen25vl_3b_token_roll", "qwen25vl_32b_token_roll"):
-        v0_spec = dict(MODEL_SPECS[model_key])
-        v0_spec["stage"] = "legacy_v0_post_projector_pre_llm"
-        v0_signatures = {}
-        v0_runtime_contracts = {}
-        v0_mode_records = {}
-        v0_mode_bindings = {}
-        for mode in ("none", "noop_vllm", "roll_right_1"):
-            task_dir = (
-                args.v0_root
-                / POLICY_MODE_ROOT
-                / mode
-                / model_key
-                / "LogicVista"
-            )
-            records, signature, runtime_contract, condition_failures = validate_condition(
-                task_dir,
-                model_key=model_key,
-                mode=mode,
-                spec=v0_spec,
-            )
-            label = f"v0/{model_key}/{mode}"
-            accepted[label] = {
-                "record_ranks": sorted({int(record["rank"]) for record in records}),
-                "failures": condition_failures,
-            }
-            failures.extend(f"{label}: {failure}" for failure in condition_failures)
-            try:
-                entry = smoke_certificate_entry(
-                    task_dir,
-                    model_key=model_key,
-                    model_family=v0_spec["family"],
-                    mode=mode,
-                    engine_mode="v0",
-                )
-                v0_mode_bindings[mode] = {
-                    key: value
-                    for key, value in entry["binding"].items()
-                    if key != "mode"
-                }
-                if mode != "none":
-                    certificate_entries.append(entry)
-            except Exception as exc:
-                failures.append(f"{label}: failed to build smoke certificate: {exc}")
-            v0_signatures[mode] = signature
-            v0_runtime_contracts[mode] = runtime_contract
-            v0_mode_records[mode] = records
-        if v0_signatures["none"] != v0_signatures["noop_vllm"]:
-            failures.append(f"v0/{model_key}: native none and matched-runtime noop outputs differ")
-        if not (
-            runtime_contract_signature(v0_runtime_contracts["none"])
-            == runtime_contract_signature(v0_runtime_contracts["noop_vllm"])
-            == runtime_contract_signature(v0_runtime_contracts["roll_right_1"])
-        ):
-            failures.append(f"v0/{model_key}: request or SamplingParams contracts differ")
-        if len(v0_mode_bindings) != 3 or len(
-            {
-                json.dumps(binding, ensure_ascii=False, sort_keys=True)
-                for binding in v0_mode_bindings.values()
-            }
-        ) != 1:
-            failures.append(
-                f"v0/{model_key}: code/runtime/model identity differs across controls"
-            )
-        if model_key == "qwen25vl_32b_token_roll":
-            for mode in ("noop_vllm", "roll_right_1"):
-                by_rank = {int(record["rank"]): record for record in v0_mode_records[mode]}
-                if set(by_rank) == {0, 1} and tp_hash_signature(by_rank[0]) != tp_hash_signature(by_rank[1]):
-                    failures.append(f"v0/{model_key}/{mode}: TP rank embedding hashes differ")
+                by_rank = {}
+                for rank in (0, 1):
+                    rank_map = {}
+                    for record in mode_records[mode]:
+                        if int(record["rank"]) != rank:
+                            continue
+                        call_index = int(record["call_index"])
+                        if call_index in rank_map:
+                            failures.append(
+                                f"{spec['engine_mode']}/{model_key}/{mode}: "
+                                f"duplicate TP call index {call_index} on rank {rank}"
+                            )
+                            continue
+                        rank_map[call_index] = tp_hash_signature(record)
+                    by_rank[rank] = rank_map
+                if all(by_rank.values()) and by_rank[0] != by_rank[1]:
+                    failures.append(
+                        f"{spec['engine_mode']}/{model_key}/{mode}: "
+                        "TP rank embedding hashes differ"
+                    )
 
     summary = {
         "all_passed": not failures,

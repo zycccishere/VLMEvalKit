@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -32,8 +33,10 @@ from .replay_image_transform import (
 from .replay_visual_token_shift import (
     VisualTokenShiftController,
     arm_vllm_visual_token_shift_recording,
+    record_vllm_engine_identity,
     require_vllm_visual_token_shift_worker_handshake,
     visual_token_shift_enabled,
+    vllm_visual_token_shift_runtime_enabled,
     write_vllm_runtime_contract,
 )
 from ..smp import *
@@ -126,12 +129,20 @@ class MiniCPM_V_4_5(BaseModel):
             max_num_batched_tokens = os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", "").strip()
             if max_num_batched_tokens.isdigit():
                 llm_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
-            if visual_token_shift_enabled():
+            if vllm_visual_token_shift_runtime_enabled():
                 os.environ["REPLAY_VISUAL_TOKEN_SHIFT_CHUNKED_PREFILL_DISABLED"] = "1"
                 os.environ["REPLAY_VISUAL_TOKEN_SHIFT_PREFIX_CACHING_DISABLED"] = "1"
                 llm_kwargs["enable_chunked_prefill"] = False
                 llm_kwargs["enable_prefix_caching"] = False
+                llm_kwargs["disable_chunked_mm_input"] = True
             self.llm = LLM(**llm_kwargs)
+            if vllm_visual_token_shift_runtime_enabled():
+                record_vllm_engine_identity(
+                    self.llm,
+                    expected_limit_mm_per_prompt={
+                        "image": max(1, self.vllm_max_images),
+                    },
+                )
             print(
                 f"[MiniCPM_V_4_5] using vLLM tp={tp_size} "
                 f"max_model_len={self.vllm_max_model_len} max_num_seqs={self.vllm_max_num_seqs}",
@@ -694,6 +705,60 @@ class MiniCPM_V_4_5(BaseModel):
     def _generate_inner_vllm(self, message, dataset=None):
         return self._generate_batch_inner_vllm([message], dataset=dataset)[0]
 
+    def _build_vllm_driver_visual_metadata(self, conversations):
+        if not _env_truthy("REPLAY_VISUAL_TOKEN_SHIFT_FULL_VALIDATION", False):
+            return None
+        metadata = []
+        image_processor = self.processor.image_processor
+        for request_index, conversation in enumerate(conversations):
+            content = conversation[0].get("content", [])
+            images = [
+                item["image_pil"]
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "image_pil"
+            ]
+            if len(images) != 2:
+                raise RuntimeError(
+                    "MiniCPM IQIQ smoke requires exactly two driver images per request"
+                )
+            slice_counts = []
+            image_hashes = []
+            image_sizes = []
+            for image in images:
+                processed = image_processor([image])
+                pixel_values = processed.get("pixel_values")
+                if not isinstance(pixel_values, list) or len(pixel_values) != 1:
+                    raise RuntimeError(
+                        "MiniCPM driver image processor returned invalid pixel_values"
+                    )
+                slice_count = len(pixel_values[0])
+                if slice_count <= 0:
+                    raise RuntimeError("MiniCPM driver image has no visual slices")
+                slice_counts.append(int(slice_count))
+                image_sizes.append([int(image.width), int(image.height)])
+                image_hashes.append(
+                    hashlib.sha256(
+                        (
+                            f"{image.mode}:{image.width}x{image.height}:"
+                        ).encode("ascii")
+                        + image.tobytes()
+                    ).hexdigest()
+                )
+            if image_hashes[0] != image_hashes[1] or slice_counts[0] != slice_counts[1]:
+                raise RuntimeError(
+                    "MiniCPM IQIQ driver images are not exact duplicate controls"
+                )
+            metadata.append(
+                {
+                    "request_index": request_index,
+                    "image_count": 2,
+                    "image_sha256": image_hashes,
+                    "image_sizes": image_sizes,
+                    "minicpm_num_slices": slice_counts,
+                }
+            )
+        return metadata
+
     def _generate_batch_inner_vllm(self, messages, dataset=None):
         sampling_params, chat_template_kwargs = self._build_vllm_sampling(dataset=dataset)
         chat_template = None
@@ -703,11 +768,13 @@ class MiniCPM_V_4_5(BaseModel):
             [{"role": "user", "content": self._message_to_vllm_content(message, dataset=dataset)}]
             for message in messages
         ]
+        request_metadata = self._build_vllm_driver_visual_metadata(conversations)
         write_vllm_runtime_contract(
             model_family="minicpm_o_4_5",
             dataset=dataset,
             requests=conversations,
             sampling_params=sampling_params,
+            request_metadata=request_metadata,
         )
         outputs = self.llm.chat(
             conversations,
@@ -841,8 +908,9 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if visual_token_shift_enabled() and self.use_vllm:
+        if vllm_visual_token_shift_runtime_enabled() and self.use_vllm:
             require_vllm_visual_token_shift_worker_handshake(model_family="minicpm_o_4_5")
+        if visual_token_shift_enabled() and self.use_vllm:
             arm_vllm_visual_token_shift_recording(model_family="minicpm_o_4_5")
         self.visual_token_shift = VisualTokenShiftController(
             model_family="minicpm45",

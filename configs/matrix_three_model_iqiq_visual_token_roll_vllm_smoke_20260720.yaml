@@ -35,7 +35,7 @@ replay:
   prompt_audit_print: 0
 trace:
   level: full
-  samples: 1
+  samples: 3
   visual_token_raw_dump: 1
   dump_max_chars: 12000
   prompt_audit_print: 0

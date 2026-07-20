@@ -47,6 +47,8 @@ env_profiles:
       VLMEVAL_API_MINIMAL_IMPORT: '1'
       VLMEVAL_VLM_MINIMAL_IMPORT: '1'
       VLMEVAL_LAZY_INIT: '1'
+      VLLM_USE_V1: '0'
+      REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME: '1'
   vllm_token_roll_minicpm:
     python: '{minicpm_token_roll_vllm_python}'
     pythonpath:
@@ -64,6 +66,8 @@ env_profiles:
       VLMEVAL_VLM_MINIMAL_IMPORT: '1'
       VLMEVAL_LAZY_INIT: '1'
       MINICPM45_USE_VLLM: '1'
+      VLLM_USE_V1: '1'
+      REPLAY_VLLM_MATCHED_TOKEN_ROLL_RUNTIME: '1'
   main_vlmeval:
     python: '{conda_root}/envs/vlmevalkit/bin/python'
     pythonpath:
