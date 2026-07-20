@@ -24,6 +24,7 @@ export VLMEVAL_LAZY_INIT=1
 
 if [[ "${TOKEN_ROLL_KEEP_PROXY:-0}" != "1" ]]; then
   unset http_proxy https_proxy all_proxy
+  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
 fi
 
 MODE="${1:-infer}"
