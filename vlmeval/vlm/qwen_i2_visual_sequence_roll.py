@@ -12,11 +12,99 @@ from .replay_visual_token_shift import roll_visual_token_blocks
 
 
 VISUAL_SEQUENCE_ROLL_RIGHT_1 = "visual_sequence_roll_right_1"
+VALIDATED_ATTENTION_RETURN_ARITY = {
+    "4.53.3": 3,
+    "5.5.0": 2,
+}
 
 
 def tensor_sha256(tensor: torch.Tensor) -> str:
     raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(raw).hexdigest()
+
+
+def qwen_attention_return_arity(version: str) -> int:
+    normalized = str(version).strip()
+    try:
+        return VALIDATED_ATTENTION_RETURN_ARITY[normalized]
+    except KeyError as exc:
+        raise RuntimeError(
+            "Unvalidated Transformers runtime for Qwen attention tracing: "
+            f"version={normalized!r}; validated={sorted(VALIDATED_ATTENTION_RETURN_ARITY)}"
+        ) from exc
+
+
+def processed_image_pair_contract(
+    model_inputs: dict[str, Any],
+    *,
+    spatial_merge_size: int,
+) -> dict[str, Any]:
+    pixel_values = model_inputs.get("pixel_values")
+    grid_thw = model_inputs.get("image_grid_thw")
+    if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 2:
+        raise TypeError(
+            "Qwen repeated-image contract requires flattened pixel_values [patch_rows, features], "
+            f"got {type(pixel_values)} shape={getattr(pixel_values, 'shape', None)}"
+        )
+    integer_dtypes = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
+    if (
+        not isinstance(grid_thw, torch.Tensor)
+        or grid_thw.ndim != 2
+        or grid_thw.shape[1] != 3
+        or grid_thw.dtype not in integer_dtypes
+    ):
+        raise TypeError(
+            "Qwen repeated-image contract requires integer image_grid_thw [images, 3], "
+            f"got {type(grid_thw)} shape={getattr(grid_thw, 'shape', None)} "
+            f"dtype={getattr(grid_thw, 'dtype', None)}"
+        )
+    merge_size = int(spatial_merge_size)
+    if merge_size <= 0:
+        raise ValueError(f"invalid Qwen spatial_merge_size={merge_size}")
+    grid_rows = [[int(value) for value in row] for row in grid_thw.detach().cpu().tolist()]
+    if any(value <= 0 for row in grid_rows for value in row):
+        raise ValueError(f"Qwen image_grid_thw entries must be positive, got {grid_rows}")
+    patch_row_counts = [int(t * h * w) for t, h, w in grid_rows]
+    merge_area = merge_size * merge_size
+    if any(count % merge_area != 0 for count in patch_row_counts):
+        raise ValueError(
+            "Qwen image patch rows must be divisible by spatial_merge_size^2: "
+            f"counts={patch_row_counts} spatial_merge_size={merge_size}"
+        )
+    if len(patch_row_counts) != 2 or sum(patch_row_counts) != int(pixel_values.shape[0]):
+        raise ValueError(
+            "Qwen IQI repeated-image patch-row split mismatch: "
+            f"grid_thw={grid_rows} patch_row_counts={patch_row_counts} "
+            f"pixel_values_shape={list(pixel_values.shape)}"
+        )
+    image1_patch_rows, image2_patch_rows = pixel_values.split(patch_row_counts, dim=0)
+    same_grid = grid_rows[0] == grid_rows[1]
+    same_shape = image1_patch_rows.shape == image2_patch_rows.shape
+    patch_rows_exact = same_shape and torch.equal(image1_patch_rows, image2_patch_rows)
+    if same_shape:
+        difference = (image1_patch_rows.float() - image2_patch_rows.float()).abs()
+        max_abs_diff = float(difference.max().item())
+        mean_abs_diff = float(difference.mean().item())
+    else:
+        max_abs_diff = float("inf")
+        mean_abs_diff = float("inf")
+    return {
+        "validated": bool(same_grid and same_shape and patch_rows_exact),
+        "stage": "qwen_processor_output_pre_vit",
+        "image_count": 2,
+        "grid_thw": grid_rows,
+        "spatial_merge_size": merge_size,
+        "patch_row_counts": patch_row_counts,
+        "pixel_values_shape": list(pixel_values.shape),
+        "image_patch_row_shapes": [list(image1_patch_rows.shape), list(image2_patch_rows.shape)],
+        "same_grid": bool(same_grid),
+        "same_shape": bool(same_shape),
+        "patch_rows_exact": bool(patch_rows_exact),
+        "max_abs_diff": max_abs_diff,
+        "mean_abs_diff": mean_abs_diff,
+        "image1_sha256": tensor_sha256(image1_patch_rows),
+        "image2_sha256": tensor_sha256(image2_patch_rows),
+    }
 
 
 class QwenI2VisualSequenceRoll:
@@ -67,6 +155,7 @@ class QwenI2VisualSequenceRoll:
             "language_injection_hook_count": 0,
             "case_id": str(case_id),
             "intervention": str(intervention),
+            "capture_enabled": bool(enabled),
             "roll_enabled": bool(roll_enabled),
         }
         if not enabled:
@@ -145,8 +234,15 @@ class QwenI2VisualSequenceRoll:
         image1_before = chunks[0].detach()
         image2_before = chunks[1].detach()
         repeated_image_embeddings_exact = torch.equal(image1_before, image2_before)
-        if not repeated_image_embeddings_exact:
-            raise RuntimeError("IQI probe received non-identical I1/I2 embeddings before sequence intervention")
+        embedding_difference = (image1_before.float() - image2_before.float()).abs()
+        embedding_difference_rms = torch.sqrt(torch.mean(embedding_difference.square()))
+        image2_rms = torch.sqrt(torch.mean(image2_before.float().square()))
+        embedding_relative_rms = embedding_difference_rms / torch.clamp(image2_rms, min=1e-12)
+        embedding_mean_cosine = torch.nn.functional.cosine_similarity(
+            image1_before.float(),
+            image2_before.float(),
+            dim=-1,
+        ).mean()
 
         if state["roll_enabled"]:
             image2_after_3d, verification = roll_visual_token_blocks(
@@ -204,6 +300,10 @@ class QwenI2VisualSequenceRoll:
                 "output_shape": list(final_container.shape),
                 "dtype": str(merged_output.dtype),
                 "repeated_image_embeddings_exact": bool(repeated_image_embeddings_exact),
+                "repeated_image_embeddings_max_abs_diff": float(embedding_difference.max().item()),
+                "repeated_image_embeddings_mean_abs_diff": float(embedding_difference.mean().item()),
+                "repeated_image_embeddings_relative_rms": float(embedding_relative_rms.item()),
+                "repeated_image_embeddings_mean_cosine": float(embedding_mean_cosine.item()),
                 "image1_unchanged_exact": bool(image1_exact),
                 "image2_final_exact": bool(image2_exact),
                 "image1_before_sha256": tensor_sha256(image1_before),

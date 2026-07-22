@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict-contract", action="store_true")
     parser.add_argument("--strict-logicvista100", action="store_true")
     parser.add_argument("--require-visual-sequence-raw", action="store_true")
+    parser.add_argument("--require-processor-pair-raw", action="store_true")
     parser.add_argument(
         "--require-target-box",
         action="store_true",
@@ -166,6 +168,85 @@ def scalar_mean_matches(observed: Any, values: np.ndarray, atol: float) -> bool:
     return metric_matches(observed, float(np.asarray(values, dtype=np.float64).mean()), atol)
 
 
+def array_sha256(value: np.ndarray) -> str:
+    raw = np.ascontiguousarray(value).view(np.uint8).tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def validate_processor_pair_raw(
+    raw_path: Path,
+    contract: dict[str, Any],
+    *,
+    image1_tokens: int,
+    image2_tokens: int,
+) -> tuple[bool, dict[str, Any]]:
+    detail: dict[str, Any] = {"path": str(raw_path)}
+    try:
+        with np.load(raw_path) as raw:
+            pixel_values = np.asarray(raw["pixel_values"])
+            grid_thw = np.asarray(raw["image_grid_thw"])
+        detail.update(
+            {
+                "pixel_values_shape": list(pixel_values.shape),
+                "pixel_values_dtype": str(pixel_values.dtype),
+                "grid_thw": grid_thw.tolist(),
+                "grid_dtype": str(grid_thw.dtype),
+            }
+        )
+        if (
+            pixel_values.ndim != 2
+            or grid_thw.shape != (2, 3)
+            or not np.issubdtype(grid_thw.dtype, np.integer)
+            or bool(np.any(grid_thw <= 0))
+        ):
+            return False, detail
+        patch_row_counts = np.prod(grid_thw.astype(np.int64), axis=1)
+        raw_same_grid = np.array_equal(grid_thw[0], grid_thw[1])
+        merge_size = int(contract.get("spatial_merge_size", 0))
+        merge_area = merge_size * merge_size
+        if (
+            merge_size <= 0
+            or bool(np.any(patch_row_counts % merge_area != 0))
+            or int(patch_row_counts.sum()) != int(pixel_values.shape[0])
+        ):
+            return False, detail
+        split_at = int(patch_row_counts[0])
+        image1_patch_rows = pixel_values[:split_at]
+        image2_patch_rows = pixel_values[split_at:]
+        image1_sha = array_sha256(image1_patch_rows)
+        image2_sha = array_sha256(image2_patch_rows)
+        exact = np.array_equal(image1_patch_rows, image2_patch_rows)
+        detail.update(
+            {
+                "patch_row_counts": patch_row_counts.tolist(),
+                "image1_sha256": image1_sha,
+                "image2_sha256": image2_sha,
+                "patch_rows_exact": bool(exact),
+                "same_grid": bool(raw_same_grid),
+            }
+        )
+        ok = (
+            exact
+            and raw_same_grid
+            and np.array_equal(grid_thw, np.asarray(contract.get("grid_thw"), dtype=grid_thw.dtype))
+            and patch_row_counts.tolist() == contract.get("patch_row_counts")
+            and list(pixel_values.shape) == contract.get("pixel_values_shape")
+            and [list(image1_patch_rows.shape), list(image2_patch_rows.shape)]
+            == contract.get("image_patch_row_shapes")
+            and image1_sha == contract.get("image1_sha256")
+            and image2_sha == contract.get("image2_sha256")
+            and contract.get("patch_rows_exact") is True
+            and contract.get("max_abs_diff") == 0.0
+            and contract.get("mean_abs_diff") == 0.0
+            and int(patch_row_counts[0] // merge_area) == image1_tokens
+            and int(patch_row_counts[1] // merge_area) == image2_tokens
+        )
+        return bool(ok), detail
+    except Exception as exc:
+        detail["error"] = f"{type(exc).__name__}: {exc}"
+        return False, detail
+
+
 def correspondence_band_mass(matrix_norm: np.ndarray, cheb_dist: np.ndarray, radius: int) -> float:
     mask = cheb_dist <= radius
     return float(matrix_norm[mask].sum() / max(matrix_norm.shape[0], 1))
@@ -190,11 +271,13 @@ def validate(
     strict_contract: bool,
     strict_logicvista100: bool,
     require_visual_sequence_raw: bool,
+    require_processor_pair_raw: bool,
 ) -> dict[str, Any]:
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     checks: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     raw_sequence_count = 0
+    raw_processor_pair_count = 0
 
     if strict_contract:
         add_check(checks, failures, "strict_expected_cases", expected_cases > 0, expected_cases)
@@ -315,6 +398,25 @@ def validate(
             is_sequence_roll = transform == VISUAL_SEQUENCE_ROLL_RIGHT_1
             is_hook_noop = transform == VISUAL_SEQUENCE_HOOK_NOOP
             attention_runtime = payload.get("attention_runtime_contract") or {}
+            image_pair_contract = payload.get("processed_image_pair_contract") or {}
+            if transform in {"baseline", VISUAL_SEQUENCE_ROLL_RIGHT_1, VISUAL_SEQUENCE_HOOK_NOOP}:
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} processed_repeated_image_contract",
+                    image_pair_contract.get("validated") is True
+                    and image_pair_contract.get("stage") == "qwen_processor_output_pre_vit"
+                    and image_pair_contract.get("image_count") == 2
+                    and image_pair_contract.get("same_grid") is True
+                    and image_pair_contract.get("same_shape") is True
+                    and image_pair_contract.get("patch_rows_exact") is True
+                    and int(image_pair_contract.get("spatial_merge_size", 0)) > 0
+                    and len(image_pair_contract.get("patch_row_counts") or []) == 2
+                    and image_pair_contract.get("max_abs_diff") == 0.0
+                    and image_pair_contract.get("mean_abs_diff") == 0.0
+                    and image_pair_contract.get("image1_sha256") == image_pair_contract.get("image2_sha256"),
+                    image_pair_contract,
+                )
             if strict_contract:
                 add_check(
                     checks,
@@ -393,6 +495,7 @@ def validate(
                     intervention.get("family") == "visual_sequence_roll"
                     and intervention.get("pixel_equivalent") is None
                     and sequence_record.get("applied") is True
+                    and sequence_record.get("capture_enabled") is True
                     and sequence_record.get("apply_count") == 1
                     and sequence_record.get("stage") == "qwen_post_spatial_merger_pre_llm_injection"
                     and sequence_record.get("roll_tokens") == 1
@@ -400,7 +503,11 @@ def validate(
                     and sequence_record.get("exact_roll_verified") is True
                     and sequence_record.get("image1_unchanged_exact") is True
                     and sequence_record.get("image2_final_exact") is True
-                    and sequence_record.get("repeated_image_embeddings_exact") is True
+                    and isinstance(sequence_record.get("repeated_image_embeddings_exact"), bool)
+                    and is_finite_number(sequence_record.get("repeated_image_embeddings_max_abs_diff"))
+                    and is_finite_number(sequence_record.get("repeated_image_embeddings_mean_abs_diff"))
+                    and is_finite_number(sequence_record.get("repeated_image_embeddings_relative_rms"))
+                    and is_finite_number(sequence_record.get("repeated_image_embeddings_mean_cosine"))
                     and sequence_record.get("visual_hook_count") == 1
                     and sequence_record.get("language_injection_hook_count") == 1
                     and sequence_record.get("llm_i1_injection_exact") is True
@@ -436,12 +543,70 @@ def validate(
                     injected_i1 = np.asarray(raw["llm_injected_image1"])
                     injected_i2 = np.asarray(raw["llm_injected_image2"])
                     raw_source = np.asarray(raw["source_index_for_output"], dtype=np.int64)
+                    embedding_exact = np.array_equal(i1_before, i2_before)
+                    embedding_difference = np.abs(
+                        i1_before.astype(np.float64) - i2_before.astype(np.float64)
+                    )
+                    embedding_max_abs_diff = float(embedding_difference.max())
+                    embedding_mean_abs_diff = float(embedding_difference.mean())
+                    embedding_difference_rms = float(np.sqrt(np.mean(np.square(embedding_difference))))
+                    image2_rms = float(np.sqrt(np.mean(np.square(i2_before.astype(np.float64)))))
+                    embedding_relative_rms = embedding_difference_rms / max(image2_rms, 1e-12)
+                    i1_rows = i1_before.astype(np.float64)
+                    i2_rows = i2_before.astype(np.float64)
+                    cosine_denominator = np.maximum(np.linalg.norm(i1_rows, axis=-1), 1e-8) * np.maximum(
+                        np.linalg.norm(i2_rows, axis=-1),
+                        1e-8,
+                    )
+                    embedding_mean_cosine = float(
+                        np.mean(np.sum(i1_rows * i2_rows, axis=-1) / cosine_denominator)
+                    )
+                    embedding_metrics_match = (
+                        sequence_record.get("repeated_image_embeddings_exact") == bool(embedding_exact)
+                        and metric_matches(
+                            sequence_record.get("repeated_image_embeddings_max_abs_diff"),
+                            embedding_max_abs_diff,
+                            1e-6,
+                        )
+                        and metric_matches(
+                            sequence_record.get("repeated_image_embeddings_mean_abs_diff"),
+                            embedding_mean_abs_diff,
+                            1e-6,
+                        )
+                        and metric_matches(
+                            sequence_record.get("repeated_image_embeddings_relative_rms"),
+                            embedding_relative_rms,
+                            1e-6,
+                        )
+                        and metric_matches(
+                            sequence_record.get("repeated_image_embeddings_mean_cosine"),
+                            embedding_mean_cosine,
+                            1e-6,
+                        )
+                        and embedding_max_abs_diff >= embedding_mean_abs_diff >= 0.0
+                        and embedding_relative_rms >= 0.0
+                        and -1.0 <= embedding_mean_cosine <= 1.0
+                        and (
+                            not embedding_exact
+                            or (
+                                embedding_max_abs_diff == 0.0
+                                and embedding_mean_abs_diff == 0.0
+                                and embedding_relative_rms == 0.0
+                            )
+                        )
+                    )
                     raw_detail = {
                         "path": str(raw_path),
                         "i1_shape": list(i1_before.shape),
                         "i2_shape": list(i2_before.shape),
                         "source_head": raw_source[:8].tolist(),
                         "source_tail": raw_source[-8:].tolist(),
+                        "repeated_image_embeddings_exact": bool(embedding_exact),
+                        "repeated_image_embeddings_max_abs_diff": embedding_max_abs_diff,
+                        "repeated_image_embeddings_mean_abs_diff": embedding_mean_abs_diff,
+                        "repeated_image_embeddings_relative_rms": embedding_relative_rms,
+                        "repeated_image_embeddings_mean_cosine": embedding_mean_cosine,
+                        "embedding_metrics_match": bool(embedding_metrics_match),
                     }
                     add_check(
                         checks,
@@ -455,8 +620,25 @@ def validate(
                         and np.array_equal(i1_before, i1_after)
                         and np.array_equal(i2_after, i2_before[raw_source])
                         and np.array_equal(injected_i1, i1_after)
-                        and np.array_equal(injected_i2, i2_after),
+                        and np.array_equal(injected_i2, i2_after)
+                        and embedding_metrics_match,
                         raw_detail,
+                    )
+                processor_raw_rel = str(image_pair_contract.get("raw_npz_path") or "")
+                if processor_raw_rel:
+                    raw_processor_pair_count += 1
+                    processor_raw_ok, processor_raw_detail = validate_processor_pair_raw(
+                        output_dir / processor_raw_rel,
+                        image_pair_contract,
+                        image1_tokens=image1_tokens,
+                        image2_tokens=image2_tokens,
+                    )
+                    add_check(
+                        checks,
+                        failures,
+                        f"{case['case_id']} {transform} raw_processor_pair_dump",
+                        processor_raw_ok,
+                        processor_raw_detail,
                     )
                 baseline_payload = transforms.get(VISUAL_SEQUENCE_HOOK_NOOP) or transforms.get("baseline")
                 baseline_sequence = (
@@ -894,6 +1076,14 @@ def validate(
             raw_sequence_count > 0,
             raw_sequence_count,
         )
+    if require_processor_pair_raw:
+        add_check(
+            checks,
+            failures,
+            "processor_pair_raw_present",
+            raw_processor_pair_count > 0,
+            raw_processor_pair_count,
+        )
 
     return {
         "ok": not failures,
@@ -918,6 +1108,7 @@ def main() -> int:
         strict_contract=args.strict_contract,
         strict_logicvista100=args.strict_logicvista100,
         require_visual_sequence_raw=args.require_visual_sequence_raw,
+        require_processor_pair_raw=args.require_processor_pair_raw,
     )
     (output_dir / "smoke_validation.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",

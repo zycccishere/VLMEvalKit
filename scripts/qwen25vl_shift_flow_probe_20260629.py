@@ -16,6 +16,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from transformers import __version__ as transformers_version
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(THIS_DIR)
@@ -59,6 +60,8 @@ from vlmeval.vlm.replay_image_transform import (  # noqa: E402
 from vlmeval.vlm.qwen_i2_visual_sequence_roll import (  # noqa: E402
     VISUAL_SEQUENCE_ROLL_RIGHT_1,
     QwenI2VisualSequenceRoll,
+    processed_image_pair_contract,
+    qwen_attention_return_arity,
     tensor_sha256,
 )
 
@@ -134,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--text-scope",
         default="historical_all_non_image_non_special",
         choices=["historical_all_non_image_non_special", "q1_between_images"],
-        help="Which non-image tokens are included in the historical I2-to-Q/text mass metric.",
+        help="Which non-image tokens are included in the I2-to-Q/text mass metric.",
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
@@ -173,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Save raw pre/post I1 and I2 post-merger embeddings for the first N sequence-roll cases.",
+    )
+    parser.add_argument(
+        "--processor-pair-raw-dump-limit",
+        type=int,
+        default=0,
+        help="Save raw pre-ViT pixel_values and image_grid_thw for the first N sequence-roll cases.",
     )
     return parser
 
@@ -622,6 +631,7 @@ class QwenTransformPairFlowTracer:
         self.image1_positions: list[int] = []
         self.text_positions: list[int] = []
         self.image2_positions: list[int] = []
+        self.attention_return_arity = qwen_attention_return_arity(transformers_version)
 
     def configure_sample(
         self,
@@ -679,6 +689,8 @@ class QwenTransformPairFlowTracer:
                     effective_i2_causal_block = key_contract.view(1, -1) > query_contract.view(-1, 1)
                     tracer.runtime_contract = {
                         "captured_layer": int(_layer_idx),
+                        "transformers_version": transformers_version,
+                        "attention_forward_return_arity": tracer.attention_return_arity,
                         "incoming_attention_mask_present": isinstance(attention_mask, torch.Tensor),
                         "incoming_attention_mask_shape": (
                             list(attention_mask.shape) if isinstance(attention_mask, torch.Tensor) else None
@@ -858,6 +870,8 @@ class QwenTransformPairFlowTracer:
                 attn_output = module.o_proj(attn_output)
                 if not output_attentions:
                     attn_weights = None
+                if tracer.attention_return_arity == 3:
+                    return attn_output, attn_weights, past_key_value
                 return attn_output, attn_weights
 
             attn_module.forward = types.MethodType(instrumented_forward, attn_module)
@@ -903,6 +917,7 @@ def main() -> int:
     if args.dump_mode == "scalar" and args.scalar_raw_dump_limit > 0:
         scalar_npz_dir.mkdir(parents=True, exist_ok=True)
     visual_sequence_dump_dir = output_dir / "visual_sequence_npz"
+    processor_pair_dump_dir = output_dir / "processor_pair_npz"
 
     processor, model = load_model_and_processor(args.model_path, args.device)
     input_device = resolve_input_device(model, args.device)
@@ -926,6 +941,7 @@ def main() -> int:
     records_out: list[dict[str, Any]] = []
     run_start = time.perf_counter()
     dataset_cache: dict[str, Any] = {}
+    processor_pair_dump_count = 0
 
     try:
         for case_idx, case in enumerate(manifest):
@@ -982,6 +998,31 @@ def main() -> int:
                     topology_record = validate_iqi_modal_topology(transformed)
                 _, prompt_text, model_inputs = build_inputs(processor, transformed)
                 input_fingerprint = tensor_input_fingerprint(model_inputs)
+                image_pair_contract = processed_image_pair_contract(
+                    model_inputs,
+                    spatial_merge_size=spatial_merge_size,
+                )
+                if (sequence_roll_enabled or sequence_control_enabled or transform == "baseline") and not image_pair_contract[
+                    "validated"
+                ]:
+                    raise RuntimeError(
+                        "visual-sequence flow requires exact repeated processed-image inputs: "
+                        f"case={case['id']} transform={transform} contract={image_pair_contract}"
+                    )
+                if sequence_roll_enabled and processor_pair_dump_count < args.processor_pair_raw_dump_limit:
+                    processor_pair_dump_dir.mkdir(parents=True, exist_ok=True)
+                    processor_pair_raw_path = (
+                        processor_pair_dump_dir / f"{case['id']}__{VISUAL_SEQUENCE_ROLL_RIGHT_1}.npz"
+                    )
+                    np.savez_compressed(
+                        processor_pair_raw_path,
+                        pixel_values=model_inputs["pixel_values"].detach().cpu().numpy(),
+                        image_grid_thw=model_inputs["image_grid_thw"].detach().cpu().numpy(),
+                    )
+                    image_pair_contract["raw_npz_path"] = str(
+                        processor_pair_raw_path.relative_to(output_dir)
+                    )
+                    processor_pair_dump_count += 1
                 input_ids = model_inputs["input_ids"][0].tolist()
                 image_spans = find_image_spans(input_ids, image_token_id)
                 if len(image_spans) != 2:
@@ -1141,6 +1182,7 @@ def main() -> int:
                 transform_records[transform] = {
                     "prompt_text": prompt_text,
                     "model_input_fingerprint": input_fingerprint,
+                    "processed_image_pair_contract": image_pair_contract,
                     "attention_runtime_contract": attention_runtime_contract,
                     "transform_record": transform_record,
                     "intervention": {
@@ -1389,6 +1431,7 @@ def main() -> int:
         "scalar_raw_dump_limit": int(args.scalar_raw_dump_limit),
         "scalar_query_chunk_size": int(args.scalar_query_chunk_size),
         "visual_sequence_raw_dump_limit": int(args.visual_sequence_raw_dump_limit),
+        "processor_pair_raw_dump_limit": int(args.processor_pair_raw_dump_limit),
         "band_radius": args.band_radius,
         "qwen_min_pixels": args.qwen_min_pixels,
         "qwen_max_pixels": args.qwen_max_pixels,

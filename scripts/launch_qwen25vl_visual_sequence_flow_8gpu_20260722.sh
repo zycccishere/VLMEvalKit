@@ -11,14 +11,18 @@ EXPECTED_GPUS=${EXPECTED_GPUS:-0,1,2,3,4,5,6,7}
 ATTN_LAYERS=${ATTN_LAYERS:-last4}
 MODE=${MODE:-image_text_image}
 POLICY=${POLICY:-identity}
+TEXT_SCOPE=${TEXT_SCOPE:-historical_all_non_image_non_special}
 INTERVENTIONS=${INTERVENTIONS:-shift_right_half_vit_token shift_right_one_vit_token shift_right_one_llm_token visual_sequence_roll_right_1}
 DUMP_MODE=${DUMP_MODE:-full}
 SCALAR_RAW_DUMP_LIMIT=${SCALAR_RAW_DUMP_LIMIT:-0}
 SCALAR_QUERY_CHUNK_SIZE=${SCALAR_QUERY_CHUNK_SIZE:-256}
 VISUAL_SEQUENCE_RAW_DUMP_LIMIT=${VISUAL_SEQUENCE_RAW_DUMP_LIMIT:-0}
+PROCESSOR_PAIR_RAW_DUMP_LIMIT=${PROCESSOR_PAIR_RAW_DUMP_LIMIT:-0}
 STRICT_LOGICVISTA100=${STRICT_LOGICVISTA100:-1}
 EXPECTED_MANIFEST_SHA256=aafd53d34e4e01689f0a16473105a67252d1d7deaf386cdd96d289536d98ca0d
 EXPECTED_INTERVENTIONS="shift_right_half_vit_token shift_right_one_vit_token shift_right_one_llm_token visual_sequence_roll_right_1"
+EXPECTED_TORCH_VERSION=${EXPECTED_TORCH_VERSION:-2.7.1+cu126}
+EXPECTED_TRANSFORMERS_VERSION=${EXPECTED_TRANSFORMERS_VERSION:-4.53.3}
 
 if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
   actual_sha=$(sha256sum "${MANIFEST}" | awk '{print $1}')
@@ -31,13 +35,18 @@ if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
     echo "Strict run requires the explicitly pinned GPU set ${EXPECTED_GPUS}" >&2
     exit 2
   }
-  [[ "${ATTN_LAYERS}" == "last4" && "${MODE}" == "image_text_image" && "${POLICY}" == "identity" ]] || {
-    echo "Strict run requires last4, IQI, identity" >&2
+  [[ "${ATTN_LAYERS}" == "last4" && "${MODE}" == "image_text_image" && "${POLICY}" == "identity" && "${TEXT_SCOPE}" == "historical_all_non_image_non_special" ]] || {
+    echo "Strict run requires last4, IQI, identity, and the historical all-non-image text scope" >&2
     exit 2
   }
   [[ "${DUMP_MODE}" == "full" ]] || { echo "Strict run requires full attention dumps" >&2; exit 2; }
   [[ "${INTERVENTIONS}" == "${EXPECTED_INTERVENTIONS}" ]] || {
     echo "Strict run requires the exact canonical intervention list: ${EXPECTED_INTERVENTIONS}" >&2
+    exit 2
+  }
+  runtime_versions=$("${PYTHON_BIN}" -c 'import torch, transformers; print(torch.__version__ + " " + transformers.__version__)')
+  [[ "${runtime_versions}" == "${EXPECTED_TORCH_VERSION} ${EXPECTED_TRANSFORMERS_VERSION}" ]] || {
+    echo "Strict run requires torch=${EXPECTED_TORCH_VERSION} transformers=${EXPECTED_TRANSFORMERS_VERSION}; got ${runtime_versions}" >&2
     exit 2
   }
 fi
@@ -93,13 +102,14 @@ for rank in "${!GPU_LIST[@]}"; do
       --device cuda \
       --mode "${MODE}" \
       --policy "${POLICY}" \
-      --text-scope historical_all_non_image_non_special \
+      --text-scope "${TEXT_SCOPE}" \
       --seed 1234 \
       --attn-layers "${ATTN_LAYERS}" \
       --dump-mode "${DUMP_MODE}" \
       --scalar-raw-dump-limit "${SCALAR_RAW_DUMP_LIMIT}" \
       --scalar-query-chunk-size "${SCALAR_QUERY_CHUNK_SIZE}" \
       --visual-sequence-raw-dump-limit "${VISUAL_SEQUENCE_RAW_DUMP_LIMIT}" \
+      --processor-pair-raw-dump-limit "${PROCESSOR_PAIR_RAW_DUMP_LIMIT}" \
       --transforms ${INTERVENTIONS}
   ) > "${OUTPUT_DIR}/logs/rank_${rank}.log" 2>&1 &
   pid=$!
