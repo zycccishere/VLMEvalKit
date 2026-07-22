@@ -1,5 +1,6 @@
 import warnings
 
+from .babyvision import BabyVision
 from .image_base import img_root_map, ImageBaseDataset
 from .image_caption import ImageCaptionDataset
 from .image_yorn import ImageYORNDataset
@@ -121,7 +122,8 @@ IMAGE_DATASET = [
     ImageCaptionDataset, ImageYORNDataset, ImageMCQDataset, ImageVQADataset, MathVision, MathVerse, Dynamath,
     MMMUDataset, MMMUSingleImageDataset, OCRBench, MathVista, MathVistaSample, MathVistaHalf, LLaVABench, MMVet,
     MTVQADataset, TableVQABench, HallucinationBench, LogicVista, MMLongBench, VCRDataset, MMDUDataset, DUDE,
-    SlideVQA, MUIRDataset, GMAIMMBenchDataset, MMERealWorld, HRBenchDataset, VisuLogic, VisualPuzzles, WeMath
+    SlideVQA, MUIRDataset, GMAIMMBenchDataset, MMERealWorld, HRBenchDataset, VisuLogic, VisualPuzzles, WeMath,
+    BabyVision
 ]
 
 VIDEO_DATASET = [
