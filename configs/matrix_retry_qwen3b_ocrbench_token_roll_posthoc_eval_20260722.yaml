@@ -1,0 +1,54 @@
+name: retry_qwen3b_ocrbench_visual_token_roll_posthoc_eval_20260722
+repo_root: "{repo_root}"
+results_root: runs/three_model_iqiq_image2_visual_token_roll_retries_20260722
+node_gpu_ids: "7"
+scheduler: gpu_pool
+infer_batch_size_override: 16
+max_num_seqs_override: 16
+inference:
+  launch_mode: existing
+  producer_matrix: retry_qwen3b_ocrbench_visual_token_roll_20260722
+datasets:
+  - OCRBench
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text_image_text
+visual_token_shifts:
+  - roll_right_1
+models:
+  - qwen25vl_3b_token_roll
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  strict_batch: 1
+  stage_debug: 1
+  stage_debug_samples: 1
+  prompt_audit: 1
+  prompt_audit_print: 0
+trace:
+  level: summary
+  samples: 1
+  visual_token_raw_dump: 0
+  dump_max_chars: 12000
+  prompt_audit_print: 0
+answer_format:
+  enable: 0
+  require_boxed: 0
+  response_col: prediction
+  fallback_col: detailed_prediction
+  max_fails: 50
+evaluation:
+  launch_mode: fg
+  nproc: 8
+  judge: gpt-4o-mini
+worker_monitor:
+  enable: true
+  interval_seconds: 300
+resume_infer_default: false
+resume_infer_start_delay_seconds: 0
