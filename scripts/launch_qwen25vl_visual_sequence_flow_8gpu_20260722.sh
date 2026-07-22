@@ -135,4 +135,13 @@ done
   --output-dir "${OUTPUT_DIR}/analysis" \
   --input-dirs "${RANK_DIRS[@]}"
 
+stats_args=()
+if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
+  stats_args+=(--expected-cases 100 --strict-canonical)
+fi
+"${PYTHON_BIN}" scripts/analyze_qwen25vl_visual_sequence_flow_stats_20260722.py \
+  --input-csv "${OUTPUT_DIR}/analysis/case_layer_metrics_with_delta.csv" \
+  --output-dir "${OUTPUT_DIR}/analysis/paired_stats" \
+  "${stats_args[@]}"
+
 echo "done: ${OUTPUT_DIR}"
