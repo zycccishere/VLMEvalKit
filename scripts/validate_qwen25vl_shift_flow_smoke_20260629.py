@@ -109,6 +109,20 @@ def is_nan_number(value: Any) -> bool:
         return False
 
 
+def is_probability_number(value: Any, atol: float) -> bool:
+    if not is_finite_number(value):
+        return False
+    numeric = float(value)
+    return -atol <= numeric <= 1.0 + atol
+
+
+def is_signed_mass_difference(value: Any, atol: float) -> bool:
+    if not is_finite_number(value):
+        return False
+    numeric = float(value)
+    return -1.0 - atol <= numeric <= 1.0 + atol
+
+
 def raw_byte_sha256(array: np.ndarray) -> str:
     raw = np.ascontiguousarray(array, dtype=np.uint8)
     return hashlib.sha256(raw.tobytes()).hexdigest()
@@ -1127,16 +1141,22 @@ def validate(
                             checks,
                             failures,
                             f"{layer_name} summary_target_metric_semantics",
-                            is_finite_number(layer.get("target_mass_norm_all_queries"))
-                            and is_finite_number(layer.get("target_mass_norm_target_queries"))
-                            and is_finite_number(layer.get("target_mass_raw_all_queries"))
-                            and is_finite_number(layer.get("target_mass_raw_target_position_queries"))
+                            is_probability_number(layer.get("target_mass_norm_all_queries"), metric_atol)
+                            and is_probability_number(layer.get("target_mass_norm_target_queries"), metric_atol)
+                            and is_probability_number(layer.get("target_mass_raw_all_queries"), metric_atol)
+                            and is_probability_number(
+                                layer.get("target_mass_raw_target_position_queries"), metric_atol
+                            )
                             and (
                                 is_nan_number(layer.get("target_mass_norm_content_shifted_target_queries"))
                                 and (
                                     (
-                                        is_finite_number(layer.get("target_mass_norm_source_target_queries"))
-                                        and is_finite_number(layer.get("target_mass_raw_source_target_queries"))
+                                        is_probability_number(
+                                            layer.get("target_mass_norm_source_target_queries"), metric_atol
+                                        )
+                                        and is_probability_number(
+                                            layer.get("target_mass_raw_source_target_queries"), metric_atol
+                                        )
                                     )
                                     if expected_source_target_queries
                                     else (
@@ -1147,16 +1167,27 @@ def validate(
                                 if is_sequence_roll
                                 else (
                                     bool(expected_shifted_queries)
-                                    and is_finite_number(
-                                        layer.get("target_mass_norm_content_shifted_target_queries")
+                                    and is_probability_number(
+                                        layer.get("target_mass_norm_content_shifted_target_queries"),
+                                        metric_atol,
                                     )
                                     and is_nan_number(layer.get("target_mass_norm_source_target_queries"))
                                     and is_nan_number(layer.get("target_mass_raw_source_target_queries"))
                                 )
                             )
                             and (
-                                is_finite_number(layer.get("distractor_mass_norm_all_queries"))
-                                and is_finite_number(layer.get("target_minus_distractor_mass"))
+                                is_probability_number(
+                                    layer.get("distractor_mass_norm_all_queries"), metric_atol
+                                )
+                                and is_signed_mass_difference(
+                                    layer.get("target_minus_distractor_mass"), metric_atol
+                                )
+                                and metric_matches(
+                                    layer.get("target_minus_distractor_mass"),
+                                    float(layer.get("target_mass_norm_all_queries"))
+                                    - float(layer.get("distractor_mass_norm_all_queries")),
+                                    metric_atol,
+                                )
                                 if expected_distractor_keys
                                 else is_nan_number(layer.get("distractor_mass_norm_all_queries"))
                                 and is_nan_number(layer.get("target_minus_distractor_mass"))
