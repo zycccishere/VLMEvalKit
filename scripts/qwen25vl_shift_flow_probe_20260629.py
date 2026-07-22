@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import json
 import math
 import os
+import platform
 import sys
 import time
 import types
@@ -15,6 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import transformers
 from PIL import Image
 from transformers import __version__ as transformers_version
 
@@ -106,6 +110,14 @@ INTERVENTION_SPECS = {
 }
 
 
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compare pixel-shift and visual-sequence-roll interventions on Qwen2.5-VL I2 flow."
@@ -147,11 +159,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dump-mode",
         default="full",
-        choices=["full", "scalar"],
+        choices=["full", "summary", "scalar"],
         help=(
-            "full preserves the historical matrix npz dump; scalar only records aggregated "
-            "I2->I1/text/I2 mass to keep large runs memory- and disk-light."
+            "full preserves every historical matrix npz dump; summary computes the same metrics "
+            "but persists matrices only for a bounded number of sentinel cases; scalar records "
+            "only aggregated I2->I1/text/I2 mass."
         ),
+    )
+    parser.add_argument(
+        "--full-raw-dump-limit",
+        type=int,
+        default=0,
+        help="In summary mode, preserve full attention matrices for the first N local cases.",
     )
     parser.add_argument(
         "--scalar-raw-dump-limit",
@@ -911,7 +930,7 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_dir = output_dir / "npz"
-    if args.dump_mode == "full":
+    if args.dump_mode == "full" or (args.dump_mode == "summary" and args.full_raw_dump_limit > 0):
         npz_dir.mkdir(parents=True, exist_ok=True)
     scalar_npz_dir = output_dir / "scalar_npz"
     if args.dump_mode == "scalar" and args.scalar_raw_dump_limit > 0:
@@ -926,9 +945,17 @@ def main() -> int:
     spatial_merge_size = int(model.model.visual.spatial_merge_size)
 
     selected_layers = parse_attention_layers(args.attn_layers, len(model.model.language_model.layers))
+    selected_attention = model.model.language_model.layers[selected_layers[0]].self_attn
+    runtime_file_paths = {
+        "torch_package": Path(torch.__file__).resolve(),
+        "transformers_package": Path(transformers.__file__).resolve(),
+        "qwen_model_class": Path(inspect.getfile(model.__class__)).resolve(),
+        "qwen_attention_class": Path(inspect.getfile(selected_attention.__class__)).resolve(),
+        "qwen_processor_class": Path(inspect.getfile(processor.__class__)).resolve(),
+    }
     tracer = QwenTransformPairFlowTracer(
         {layer_idx: model.model.language_model.layers[layer_idx].self_attn for layer_idx in selected_layers},
-        store_blocks=args.dump_mode == "full",
+        store_blocks=args.dump_mode in {"full", "summary"},
         scalar_query_chunk_size=args.scalar_query_chunk_size,
     )
     tracer.patch()
@@ -1212,7 +1239,7 @@ def main() -> int:
                         + np.asarray(image2_mass_raw, dtype=np.float64)
                     )
 
-                    if args.dump_mode == "full":
+                    if args.dump_mode in {"full", "summary"}:
                         raw_block = np.asarray(record["image1_block"], dtype=np.float32)
                         image2_block = np.asarray(record["image2_block"], dtype=np.float32)
                         norm_block = normalize_rows(raw_block)
@@ -1245,25 +1272,38 @@ def main() -> int:
                             if source_cheb_dist is not None
                             else float("nan")
                         )
-                        npz_rel = Path("npz") / f"{case['id']}__{transform}__layer{layer}.npz"
-                        np.savez_compressed(
-                            output_dir / npz_rel,
-                            matrix_raw=safe_float16(raw_block),
-                            matrix_norm=safe_float16(norm_block),
-                            image2_block_raw=safe_float16(image2_block),
-                            image1_mass_raw=safe_float16(image1_mass_raw),
-                            text_mass_raw=safe_float16(text_mass_raw),
-                            image2_mass_raw=safe_float16(image2_mass_raw),
-                            query_rows=query_rows.astype(np.int16),
-                            query_cols=query_cols.astype(np.int16),
-                            key_rows=key_rows.astype(np.int16),
-                            key_cols=key_cols.astype(np.int16),
+                        save_full_raw = args.dump_mode == "full" or (
+                            args.dump_mode == "summary" and case_idx < args.full_raw_dump_limit
+                        )
+                        npz_rel = ""
+                        if save_full_raw:
+                            npz_rel_path = Path("npz") / f"{case['id']}__{transform}__layer{layer}.npz"
+                            np.savez_compressed(
+                                output_dir / npz_rel_path,
+                                matrix_raw=safe_float16(raw_block),
+                                matrix_norm=safe_float16(norm_block),
+                                image2_block_raw=safe_float16(image2_block),
+                                image1_mass_raw=safe_float16(image1_mass_raw),
+                                text_mass_raw=safe_float16(text_mass_raw),
+                                image2_mass_raw=safe_float16(image2_mass_raw),
+                                query_rows=query_rows.astype(np.int16),
+                                query_cols=query_cols.astype(np.int16),
+                                key_rows=key_rows.astype(np.int16),
+                                key_cols=key_cols.astype(np.int16),
+                            )
+                            npz_rel = str(npz_rel_path)
+                        token_ids = np.arange(image2_block.shape[0])
+                        future_mask = token_ids[None, :] > token_ids[:, None]
+                        future_i2_mass_max = (
+                            float(np.max(np.where(future_mask, image2_block, 0.0).sum(axis=-1)))
+                            if image2_block.shape[0]
+                            else 0.0
                         )
                         layer_summaries.append(
                             {
                                 "layer": layer,
-                                "dump_mode": "full",
-                                "npz_path": str(npz_rel),
+                                "dump_mode": "full" if save_full_raw else "summary",
+                                "npz_path": npz_rel,
                                 "query_count": int(record.get("query_count", len(image2_positions))),
                                 "image1_key_count": int(record.get("image1_key_count", len(image1_positions))),
                                 "text_key_count": int(record.get("text_key_count", len(text_positions))),
@@ -1306,6 +1346,7 @@ def main() -> int:
                                 "mean_image2_mass_raw": float(np.asarray(image2_mass_raw, dtype=np.float64).mean()),
                                 "mass_total_mean": float(mass_total.mean()) if mass_total.size else float("nan"),
                                 "mass_total_max": float(mass_total.max()) if mass_total.size else float("nan"),
+                                "future_i2_mass_max": future_i2_mass_max,
                                 **self_summary,
                                 **target_summary,
                                 "distance_profile": profile,
@@ -1428,6 +1469,7 @@ def main() -> int:
         "selected_layers": selected_layers,
         "transforms": args.transforms,
         "dump_mode": args.dump_mode,
+        "full_raw_dump_limit": int(args.full_raw_dump_limit),
         "scalar_raw_dump_limit": int(args.scalar_raw_dump_limit),
         "scalar_query_chunk_size": int(args.scalar_query_chunk_size),
         "visual_sequence_raw_dump_limit": int(args.visual_sequence_raw_dump_limit),
@@ -1437,6 +1479,29 @@ def main() -> int:
         "qwen_max_pixels": args.qwen_max_pixels,
         "case_count": len(records_out),
         "run_seconds": float(time.perf_counter() - run_start),
+        "runtime_identity": {
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+            "torch_version": torch.__version__,
+            "torch_cuda_version": torch.version.cuda,
+            "transformers_version": transformers_version,
+            "attention_forward_return_arity": tracer.attention_return_arity,
+            "attention_implementation": str(
+                getattr(selected_attention.config, "_attn_implementation", "")
+            ),
+            "cuda_device_name": (
+                torch.cuda.get_device_name(input_device) if str(input_device).startswith("cuda") else None
+            ),
+            "cuda_device_capability": (
+                list(torch.cuda.get_device_capability(input_device))
+                if str(input_device).startswith("cuda")
+                else None
+            ),
+            "runtime_files": {
+                name: {"path": str(path), "sha256": file_sha256(path)}
+                for name, path in runtime_file_paths.items()
+            },
+        },
         "cases": records_out,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

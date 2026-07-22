@@ -13,7 +13,8 @@ MODE=${MODE:-image_text_image}
 POLICY=${POLICY:-identity}
 TEXT_SCOPE=${TEXT_SCOPE:-historical_all_non_image_non_special}
 INTERVENTIONS=${INTERVENTIONS:-shift_right_half_vit_token shift_right_one_vit_token shift_right_one_llm_token visual_sequence_roll_right_1}
-DUMP_MODE=${DUMP_MODE:-full}
+DUMP_MODE=${DUMP_MODE:-summary}
+FULL_RAW_DUMP_LIMIT=${FULL_RAW_DUMP_LIMIT:-1}
 SCALAR_RAW_DUMP_LIMIT=${SCALAR_RAW_DUMP_LIMIT:-0}
 SCALAR_QUERY_CHUNK_SIZE=${SCALAR_QUERY_CHUNK_SIZE:-256}
 VISUAL_SEQUENCE_RAW_DUMP_LIMIT=${VISUAL_SEQUENCE_RAW_DUMP_LIMIT:-0}
@@ -21,10 +22,11 @@ PROCESSOR_PAIR_RAW_DUMP_LIMIT=${PROCESSOR_PAIR_RAW_DUMP_LIMIT:-0}
 STRICT_LOGICVISTA100=${STRICT_LOGICVISTA100:-1}
 EXPECTED_MANIFEST_SHA256=aafd53d34e4e01689f0a16473105a67252d1d7deaf386cdd96d289536d98ca0d
 EXPECTED_INTERVENTIONS="shift_right_half_vit_token shift_right_one_vit_token shift_right_one_llm_token visual_sequence_roll_right_1"
-EXPECTED_TORCH_VERSION=${EXPECTED_TORCH_VERSION:-2.7.1+cu126}
-EXPECTED_TRANSFORMERS_VERSION=${EXPECTED_TRANSFORMERS_VERSION:-4.53.3}
+EXPECTED_TORCH_VERSION=2.7.1+cu126
+EXPECTED_TRANSFORMERS_VERSION=4.53.3
 
 if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
+  [[ -z "${PYDEPS}" ]] || { echo "Strict run forbids dependency overlays via PYDEPS" >&2; exit 2; }
   actual_sha=$(sha256sum "${MANIFEST}" | awk '{print $1}')
   [[ "${actual_sha}" == "${EXPECTED_MANIFEST_SHA256}" ]] || {
     echo "Unexpected LogicVista100 manifest sha256: ${actual_sha}" >&2
@@ -39,12 +41,15 @@ if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
     echo "Strict run requires last4, IQI, identity, and the historical all-non-image text scope" >&2
     exit 2
   }
-  [[ "${DUMP_MODE}" == "full" ]] || { echo "Strict run requires full attention dumps" >&2; exit 2; }
+  [[ "${DUMP_MODE}" == "summary" && "${FULL_RAW_DUMP_LIMIT}" == "1" ]] || {
+    echo "Strict run requires online summary metrics and exactly one full-raw sentinel case per rank" >&2
+    exit 2
+  }
   [[ "${INTERVENTIONS}" == "${EXPECTED_INTERVENTIONS}" ]] || {
     echo "Strict run requires the exact canonical intervention list: ${EXPECTED_INTERVENTIONS}" >&2
     exit 2
   }
-  runtime_versions=$("${PYTHON_BIN}" -c 'import torch, transformers; print(torch.__version__ + " " + transformers.__version__)')
+  runtime_versions=$(env -u PYTHONPATH PYTHONNOUSERSITE=1 "${PYTHON_BIN}" -c 'import torch, transformers; print(torch.__version__ + " " + transformers.__version__)')
   [[ "${runtime_versions}" == "${EXPECTED_TORCH_VERSION} ${EXPECTED_TRANSFORMERS_VERSION}" ]] || {
     echo "Strict run requires torch=${EXPECTED_TORCH_VERSION} transformers=${EXPECTED_TRANSFORMERS_VERSION}; got ${runtime_versions}" >&2
     exit 2
@@ -90,7 +95,12 @@ for rank in "${!GPU_LIST[@]}"; do
   RANK_DIRS+=("${rank_dir}")
   (
     export CUDA_VISIBLE_DEVICES="${gpu}"
-    export PYTHONPATH="${PWD}${PYDEPS:+:${PYDEPS}}:${PYTHONPATH:-}"
+    if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
+      export PYTHONPATH="${PWD}"
+      export PYTHONNOUSERSITE=1
+    else
+      export PYTHONPATH="${PWD}${PYDEPS:+:${PYDEPS}}:${PYTHONPATH:-}"
+    fi
     export VLMEVAL_LAZY_INIT=1
     export VLMEVAL_VLM_MINIMAL_IMPORT=1
     export VLMEVAL_API_MINIMAL_IMPORT=1
@@ -106,6 +116,7 @@ for rank in "${!GPU_LIST[@]}"; do
       --seed 1234 \
       --attn-layers "${ATTN_LAYERS}" \
       --dump-mode "${DUMP_MODE}" \
+      --full-raw-dump-limit "${FULL_RAW_DUMP_LIMIT}" \
       --scalar-raw-dump-limit "${SCALAR_RAW_DUMP_LIMIT}" \
       --scalar-query-chunk-size "${SCALAR_QUERY_CHUNK_SIZE}" \
       --visual-sequence-raw-dump-limit "${VISUAL_SEQUENCE_RAW_DUMP_LIMIT}" \

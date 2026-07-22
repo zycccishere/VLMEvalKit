@@ -16,7 +16,11 @@ from vlmeval.vlm.qwen_i2_visual_sequence_roll import (
     qwen_attention_return_arity,
     tensor_sha256,
 )
-from scripts.validate_qwen25vl_shift_flow_smoke_20260629 import validate_processor_pair_raw
+from scripts.validate_qwen25vl_shift_flow_smoke_20260629 import (
+    decode_raw_float_bytes,
+    raw_byte_sha256,
+    validate_processor_pair_raw,
+)
 
 
 class FakeVisual(torch.nn.Module):
@@ -177,6 +181,22 @@ def main() -> int:
         raw_path = dump_dir.parent / str(roll_record["raw_npz_path"])
         raw = np.load(raw_path)
         source = np.asarray(raw["source_index_for_output"], dtype=np.int64)
+        raw_binding_fields = {
+            "image1_before_raw_bytes": ("image1_before_sha256", "image1_before"),
+            "image1_after_raw_bytes": ("image1_after_sha256", "image1_after"),
+            "image2_before_raw_bytes": ("image2_before_sha256", "image2_before"),
+            "image2_after_raw_bytes": ("image2_after_sha256", "image2_after"),
+            "llm_injected_image1_raw_bytes": ("llm_i1_sha256", "llm_injected_image1"),
+            "llm_injected_image2_raw_bytes": ("llm_i2_sha256", "llm_injected_image2"),
+        }
+        raw_hashes_and_values_bound = all(
+            raw_byte_sha256(raw[raw_field]) == roll_record[summary_field]
+            and np.array_equal(
+                decode_raw_float_bytes(raw[raw_field], "torch.float32", tuple(raw[float_field].shape)),
+                raw[float_field],
+            )
+            for raw_field, (summary_field, float_field) in raw_binding_fields.items()
+        )
         checks = {
             "baseline_noop": torch.equal(baseline_visual, sentinel) and baseline_record["apply_count"] == 0,
             "full_output_exact": torch.equal(rolled_visual, expected),
@@ -189,6 +209,7 @@ def main() -> int:
             "raw_i1_exact": np.array_equal(raw["image1_before"], raw["image1_after"]),
             "raw_i2_recomputed": np.array_equal(raw["image2_after"], raw["image2_before"][source]),
             "raw_i2_injected": np.array_equal(raw["llm_injected_image2"], raw["image2_after"]),
+            "raw_hashes_and_values_bound": raw_hashes_and_values_bound,
             "nonidentical_post_merger_supported": roll_record["repeated_image_embeddings_exact"] is False,
             "post_merger_difference_recorded": roll_record["repeated_image_embeddings_max_abs_diff"] == 100.0,
             "post_merger_mean_difference_recorded": roll_record["repeated_image_embeddings_mean_abs_diff"] == 100.0,

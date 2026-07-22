@@ -35,6 +35,28 @@ EXPECTED_SHIFT = {
 }
 VISUAL_SEQUENCE_ROLL_RIGHT_1 = "visual_sequence_roll_right_1"
 VISUAL_SEQUENCE_HOOK_NOOP = "visual_sequence_hook_noop"
+EXPECTED_RUNTIME_FILES = {
+    "torch_package": (
+        "/user/wanzihao/miniconda3/envs/vlmevalkit/lib/python3.10/site-packages/torch/__init__.py",
+        "9801e75447c7f585545f989f8a21940b60e0c4cc888effb2f08e739664b4b904",
+    ),
+    "transformers_package": (
+        "/user/wanzihao/miniconda3/envs/vlmevalkit/lib/python3.10/site-packages/transformers/__init__.py",
+        "a5c7535f1afd63c5c4d43ae7ff2fd4f51d4b3ad1521340a6500946135ba01af1",
+    ),
+    "qwen_model_class": (
+        "/user/wanzihao/miniconda3/envs/vlmevalkit/lib/python3.10/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py",
+        "2d4d5d1fead50d3adf1b2b7a9fb533d7753b3eed8ddbf5cc635bcd1cd7fcd67e",
+    ),
+    "qwen_attention_class": (
+        "/user/wanzihao/miniconda3/envs/vlmevalkit/lib/python3.10/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py",
+        "2d4d5d1fead50d3adf1b2b7a9fb533d7753b3eed8ddbf5cc635bcd1cd7fcd67e",
+    ),
+    "qwen_processor_class": (
+        "/user/wanzihao/miniconda3/envs/vlmevalkit/lib/python3.10/site-packages/transformers/models/qwen2_5_vl/processing_qwen2_5_vl.py",
+        "8b6b31276e18face06fe525b0057d388cd1e21d12603f045865c4d8b58136eb1",
+    ),
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected-cases", type=int, default=0)
     parser.add_argument("--row-sum-atol", type=float, default=2e-3)
-    parser.add_argument("--metric-atol", type=float, default=5e-3)
+    parser.add_argument("--metric-atol", type=float, default=5e-4)
     parser.add_argument(
         "--expected-interventions",
         nargs="*",
@@ -85,6 +107,25 @@ def is_nan_number(value: Any) -> bool:
         return bool(np.isnan(float(value)))
     except Exception:
         return False
+
+
+def raw_byte_sha256(array: np.ndarray) -> str:
+    raw = np.ascontiguousarray(array, dtype=np.uint8)
+    return hashlib.sha256(raw.tobytes()).hexdigest()
+
+
+def decode_raw_float_bytes(array: np.ndarray, dtype_name: str, shape: tuple[int, ...]) -> np.ndarray:
+    raw = np.ascontiguousarray(array, dtype=np.uint8)
+    if dtype_name == "torch.bfloat16":
+        words = np.frombuffer(raw.tobytes(), dtype="<u2").astype(np.uint32)
+        values = (words << 16).view("<f4")
+    elif dtype_name == "torch.float16":
+        values = np.frombuffer(raw.tobytes(), dtype="<f2").astype(np.float32)
+    elif dtype_name == "torch.float32":
+        values = np.frombuffer(raw.tobytes(), dtype="<f4")
+    else:
+        raise ValueError(f"unsupported raw tensor dtype: {dtype_name}")
+    return values.reshape(shape)
 
 
 def bbox_to_token_indices(*, image_size: list[int] | tuple[int, int], grid: dict[str, Any], bbox_xyxy: list[int]) -> list[int]:
@@ -259,6 +300,39 @@ def expected_normalized_distance(matrix_norm: np.ndarray, euclid_dist: np.ndarra
     return float((matrix_norm * (euclid_dist / max_dist)).sum(axis=-1).mean())
 
 
+def normalized_row_entropy(matrix_norm: np.ndarray) -> float:
+    if matrix_norm.size == 0:
+        return float("nan")
+    logs = np.log(np.clip(matrix_norm, 1e-8, 1.0))
+    entropy = -(matrix_norm * logs).sum(axis=-1)
+    denominator = np.log(matrix_norm.shape[1]) if matrix_norm.shape[1] > 1 else 1.0
+    return float((entropy / denominator).mean())
+
+
+def wrapped_distance(values: np.ndarray, centers: np.ndarray, period: int) -> np.ndarray:
+    direct = np.abs(values[None, :] - centers[:, None])
+    return direct if period <= 0 else np.minimum(direct, period - direct)
+
+
+def spatial_content_distances(
+    *,
+    query_rows: np.ndarray,
+    query_cols: np.ndarray,
+    key_rows: np.ndarray,
+    key_cols: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    transform_record: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    shift = transform_record.get("shift") or {}
+    stride = float(shift.get("llm_visual_token_stride") or shift.get("qwen_token_stride") or 28.0)
+    source_cols = (query_cols.astype(np.float64) - float(shift.get("dx", 0.0)) / stride) % max(grid_w, 1)
+    source_rows = (query_rows.astype(np.float64) - float(shift.get("dy", 0.0)) / stride) % max(grid_h, 1)
+    column_distance = wrapped_distance(key_cols.astype(np.float64), source_cols, grid_w)
+    row_distance = wrapped_distance(key_rows.astype(np.float64), source_rows, grid_h)
+    return np.maximum(row_distance, column_distance), np.sqrt(row_distance**2 + column_distance**2)
+
+
 def validate(
     output_dir: Path,
     *,
@@ -278,8 +352,19 @@ def validate(
     failures: list[dict[str, Any]] = []
     raw_sequence_count = 0
     raw_processor_pair_count = 0
+    full_layer_count = 0
+    summary_layer_count = 0
+    seen_sequence_raw_paths: set[str] = set()
+    seen_attention_raw_paths: set[str] = set()
 
     if strict_contract:
+        add_check(
+            checks,
+            failures,
+            "strict_metric_tolerance",
+            0.0 < metric_atol <= 5e-4,
+            metric_atol,
+        )
         add_check(checks, failures, "strict_expected_cases", expected_cases > 0, expected_cases)
         add_check(
             checks,
@@ -287,6 +372,35 @@ def validate(
             "strict_expected_interventions",
             expected_interventions is not None and len(expected_interventions) > 0,
             expected_interventions,
+        )
+        runtime_identity = summary.get("runtime_identity") or {}
+        runtime_files = runtime_identity.get("runtime_files") or {}
+        runtime_files_valid = set(runtime_files) == set(EXPECTED_RUNTIME_FILES) and all(
+            runtime_files[name].get("path") == expected_path
+            and runtime_files[name].get("sha256") == expected_hash
+            for name, (expected_path, expected_hash) in EXPECTED_RUNTIME_FILES.items()
+        )
+        add_check(
+            checks,
+            failures,
+            "strict_runtime_identity",
+            runtime_identity.get("torch_version") == "2.7.1+cu126"
+            and runtime_identity.get("transformers_version") == "4.53.3"
+            and runtime_identity.get("torch_cuda_version") == "12.6"
+            and runtime_identity.get("attention_forward_return_arity") == 3
+            and runtime_identity.get("python_version") == "3.10.18"
+            and runtime_identity.get("python_executable")
+            == "/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python"
+            and runtime_identity.get("attention_implementation") == "sdpa"
+            and bool(runtime_identity.get("cuda_device_name")),
+            runtime_identity,
+        )
+        add_check(
+            checks,
+            failures,
+            "strict_runtime_module_provenance",
+            runtime_files_valid,
+            runtime_files,
         )
     if strict_logicvista100:
         canonical_interventions = {
@@ -323,8 +437,14 @@ def validate(
             checks,
             failures,
             "logicvista100_dump_and_band",
-            summary.get("dump_mode") == "full" and summary.get("band_radius") == 1,
-            {"dump_mode": summary.get("dump_mode"), "band_radius": summary.get("band_radius")},
+            summary.get("dump_mode") == "summary"
+            and summary.get("full_raw_dump_limit") == 1
+            and summary.get("band_radius") == 1,
+            {
+                "dump_mode": summary.get("dump_mode"),
+                "full_raw_dump_limit": summary.get("full_raw_dump_limit"),
+                "band_radius": summary.get("band_radius"),
+            },
         )
         add_check(
             checks,
@@ -359,7 +479,8 @@ def validate(
     )
     expected_transform_set = {"baseline", *expected_non_baseline}
 
-    for case in summary["cases"]:
+    selected_layer_ids = [int(value) for value in summary.get("selected_layers", [])]
+    for case_index, case in enumerate(summary["cases"]):
         transforms = case["transforms"]
         add_check(
             checks,
@@ -399,6 +520,16 @@ def validate(
             is_hook_noop = transform == VISUAL_SEQUENCE_HOOK_NOOP
             attention_runtime = payload.get("attention_runtime_contract") or {}
             image_pair_contract = payload.get("processed_image_pair_contract") or {}
+            payload_layers = payload.get("layers") or []
+            payload_layer_ids = [int(layer.get("layer", -1)) for layer in payload_layers]
+            add_check(
+                checks,
+                failures,
+                f"{case['case_id']} {transform} exact_layer_set",
+                len(payload_layer_ids) == len(selected_layer_ids)
+                and sorted(payload_layer_ids) == sorted(selected_layer_ids),
+                {"observed": payload_layer_ids, "expected": selected_layer_ids},
+            )
             if transform in {"baseline", VISUAL_SEQUENCE_ROLL_RIGHT_1, VISUAL_SEQUENCE_HOOK_NOOP}:
                 add_check(
                     checks,
@@ -543,6 +674,49 @@ def validate(
                     injected_i1 = np.asarray(raw["llm_injected_image1"])
                     injected_i2 = np.asarray(raw["llm_injected_image2"])
                     raw_source = np.asarray(raw["source_index_for_output"], dtype=np.int64)
+                    raw_tensor_bindings = {
+                        "image1_before_raw_bytes": ("image1_before_sha256", i1_before, sequence_record.get("dtype")),
+                        "image1_after_raw_bytes": ("image1_after_sha256", i1_after, sequence_record.get("dtype")),
+                        "image2_before_raw_bytes": ("image2_before_sha256", i2_before, sequence_record.get("dtype")),
+                        "image2_after_raw_bytes": ("image2_after_sha256", i2_after, sequence_record.get("dtype")),
+                        "llm_injected_image1_raw_bytes": (
+                            "llm_i1_sha256",
+                            injected_i1,
+                            sequence_record.get("llm_inputs_embeds_dtype"),
+                        ),
+                        "llm_injected_image2_raw_bytes": (
+                            "llm_i2_sha256",
+                            injected_i2,
+                            sequence_record.get("llm_inputs_embeds_dtype"),
+                        ),
+                    }
+                    raw_hashes: dict[str, str] = {}
+                    raw_hash_binding_ok = raw_npz_rel not in seen_sequence_raw_paths
+                    seen_sequence_raw_paths.add(raw_npz_rel)
+                    for raw_field, (summary_field, float_array, dtype_name) in raw_tensor_bindings.items():
+                        if raw_field not in raw:
+                            raw_hash_binding_ok = False
+                            continue
+                        raw_bytes = np.asarray(raw[raw_field])
+                        if raw_bytes.dtype != np.uint8 or raw_bytes.ndim != 1:
+                            raw_hash_binding_ok = False
+                            continue
+                        observed_hash = raw_byte_sha256(raw_bytes)
+                        raw_hashes[raw_field] = observed_hash
+                        try:
+                            reconstructed = decode_raw_float_bytes(
+                                raw_bytes,
+                                str(dtype_name),
+                                tuple(float_array.shape),
+                            )
+                        except (ValueError, TypeError):
+                            raw_hash_binding_ok = False
+                            continue
+                        raw_hash_binding_ok = (
+                            raw_hash_binding_ok
+                            and observed_hash == sequence_record.get(summary_field)
+                            and np.array_equal(reconstructed, float_array.astype(np.float32, copy=False))
+                        )
                     embedding_exact = np.array_equal(i1_before, i2_before)
                     embedding_difference = np.abs(
                         i1_before.astype(np.float64) - i2_before.astype(np.float64)
@@ -607,6 +781,8 @@ def validate(
                         "repeated_image_embeddings_relative_rms": embedding_relative_rms,
                         "repeated_image_embeddings_mean_cosine": embedding_mean_cosine,
                         "embedding_metrics_match": bool(embedding_metrics_match),
+                        "raw_hash_binding_ok": bool(raw_hash_binding_ok),
+                        "raw_hashes": raw_hashes,
                     }
                     add_check(
                         checks,
@@ -622,6 +798,13 @@ def validate(
                         and np.array_equal(injected_i1, i1_after)
                         and np.array_equal(injected_i2, i2_after)
                         and embedding_metrics_match,
+                        raw_detail,
+                    )
+                    add_check(
+                        checks,
+                        failures,
+                        f"{case['case_id']} {transform} raw_sha256_binding",
+                        raw_hash_binding_ok,
                         raw_detail,
                     )
                 processor_raw_rel = str(image_pair_contract.get("raw_npz_path") or "")
@@ -699,9 +882,288 @@ def validate(
                     False,
                     sorted([*EXPECTED_SHIFT, VISUAL_SEQUENCE_ROLL_RIGHT_1, VISUAL_SEQUENCE_HOOK_NOOP]),
                 )
-            for layer in payload["layers"]:
+            for layer in payload_layers:
                 layer_name = f"{case['case_id']} {transform} L{layer['layer']}"
                 dump_mode = str(layer.get("dump_mode", "full"))
+                if strict_logicvista100:
+                    expected_dump_mode = "full" if case_index == 0 else "summary"
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} strict_dump_layout",
+                        dump_mode == expected_dump_mode,
+                        {"observed": dump_mode, "expected": expected_dump_mode, "case_index": case_index},
+                    )
+                if dump_mode == "summary":
+                    summary_layer_count += 1
+                    query_count = int(layer.get("query_count", 0) or 0)
+                    image1_key_count = int(layer.get("image1_key_count", 0) or 0)
+                    image2_key_count = int(layer.get("image2_key_count", 0) or 0)
+                    text_key_count = int(layer.get("text_key_count", 0) or 0)
+                    core_metric_names = [
+                        "position_band_mass",
+                        "exact_position_mass",
+                        "local_correspondence_band_mass",
+                        "expected_position_distance",
+                        "expected_distance_from_diagonal",
+                        "row_entropy",
+                        "mean_image1_mass_raw",
+                        "mean_text_mass_raw",
+                        "mean_image2_mass_raw",
+                        "mass_total_mean",
+                        "mass_total_max",
+                        "future_i2_mass_max",
+                        "i2_total_self_mass_raw",
+                        "i2_past_self_mass_raw",
+                        "i2_diag_self_mass_raw",
+                        "i2_local_self_mass_raw",
+                        "i2_local_self_ratio",
+                    ]
+                    summary_detail = {
+                        "query_count": query_count,
+                        "image1_key_count": image1_key_count,
+                        "text_key_count": text_key_count,
+                        "image2_key_count": image2_key_count,
+                        "npz_path": layer.get("npz_path"),
+                        "core_metrics": {name: layer.get(name) for name in core_metric_names},
+                    }
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} summary_counts",
+                        query_count == image2_tokens
+                        and image1_key_count == image1_tokens
+                        and image2_key_count == image2_tokens
+                        and text_key_count >= 0,
+                        summary_detail,
+                    )
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} summary_finite",
+                        all(is_finite_number(layer.get(name)) for name in core_metric_names),
+                        summary_detail,
+                    )
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} summary_causal_and_mass",
+                        float(layer.get("future_i2_mass_max", 9.0)) < row_sum_atol
+                        and float(layer.get("mass_total_max", 9.0)) <= 1.0 + row_sum_atol,
+                        summary_detail,
+                    )
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} summary_has_no_matrix_path",
+                        not layer.get("npz_path"),
+                        summary_detail,
+                    )
+                    if is_sequence_roll:
+                        source_metric_names = [
+                            "source_index_band_mass",
+                            "source_index_exact_mass",
+                            "expected_source_index_distance",
+                            "source_minus_position_exact_mass",
+                        ]
+                        source_minus_expected = float(layer.get("source_index_exact_mass", float("nan"))) - float(
+                            layer.get("exact_position_mass", float("nan"))
+                        )
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} summary_sequence_metric_semantics",
+                            all(is_finite_number(layer.get(name)) for name in source_metric_names)
+                            and is_nan_number(layer.get("content_band_mass"))
+                            and is_nan_number(layer.get("expected_content_distance"))
+                            and metric_matches(
+                                layer.get("source_minus_position_exact_mass"),
+                                source_minus_expected,
+                                1e-10,
+                            ),
+                            {
+                                "source_metrics": {name: layer.get(name) for name in source_metric_names},
+                                "content_band_mass": layer.get("content_band_mass"),
+                                "expected_content_distance": layer.get("expected_content_distance"),
+                                "source_minus_expected": source_minus_expected,
+                            },
+                        )
+                    else:
+                        source_metric_names = [
+                            "source_index_band_mass",
+                            "source_index_exact_mass",
+                            "expected_source_index_distance",
+                            "source_minus_position_exact_mass",
+                        ]
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} summary_spatial_metric_semantics",
+                            is_finite_number(layer.get("content_band_mass"))
+                            and is_finite_number(layer.get("expected_content_distance"))
+                            and all(is_nan_number(layer.get(name)) for name in source_metric_names),
+                            {
+                                "content_band_mass": layer.get("content_band_mass"),
+                                "expected_content_distance": layer.get("expected_content_distance"),
+                                "source_metrics": {name: layer.get(name) for name in source_metric_names},
+                            },
+                        )
+                    target_metric_names = [
+                        "target_mass_norm_all_queries",
+                        "target_mass_norm_target_queries",
+                        "target_mass_norm_content_shifted_target_queries",
+                        "target_mass_raw_all_queries",
+                        "target_mass_raw_target_position_queries",
+                        "target_mass_norm_source_target_queries",
+                        "target_mass_raw_source_target_queries",
+                        "distractor_mass_norm_all_queries",
+                        "target_minus_distractor_mass",
+                    ]
+                    if case.get("target_box_xyxy") is None:
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} summary_no_target_semantics",
+                            not layer.get("target_key_token_indices")
+                            and not layer.get("target_query_token_indices")
+                            and not layer.get("content_shifted_target_query_token_indices")
+                            and not layer.get("source_target_query_token_indices")
+                            and not layer.get("distractor_key_token_indices")
+                            and all(is_nan_number(layer.get(name)) for name in target_metric_names),
+                            {name: layer.get(name) for name in target_metric_names},
+                        )
+                    else:
+                        target_box = [int(value) for value in case["target_box_xyxy"]]
+                        image_size = case.get("image_size")
+                        target_keys = [int(value) for value in layer.get("target_key_token_indices", [])]
+                        target_queries = [int(value) for value in layer.get("target_query_token_indices", [])]
+                        shifted_queries = [
+                            int(value) for value in layer.get("content_shifted_target_query_token_indices", [])
+                        ]
+                        source_target_queries = [
+                            int(value) for value in layer.get("source_target_query_token_indices", [])
+                        ]
+                        distractor_keys = [int(value) for value in layer.get("distractor_key_token_indices", [])]
+                        expected_target_keys = (
+                            bbox_to_token_indices(
+                                image_size=image_size,
+                                grid=payload["image1_grid"],
+                                bbox_xyxy=target_box,
+                            )
+                            if image_size
+                            else []
+                        )
+                        expected_target_queries = (
+                            bbox_to_token_indices(
+                                image_size=image_size,
+                                grid=payload["image2_grid"],
+                                bbox_xyxy=target_box,
+                            )
+                            if image_size
+                            else []
+                        )
+                        expected_shifted_queries = (
+                            []
+                            if is_sequence_roll
+                            else content_shifted_bbox_token_indices(
+                                image_size=image_size,
+                                grid=payload["image2_grid"],
+                                bbox_xyxy=target_box,
+                                transform_record=record,
+                            ) if image_size else []
+                        )
+                        expected_source_target_queries = (
+                            [
+                                query_index
+                                for query_index, source_index in enumerate(source_indices)
+                                if int(source_index) in set(expected_target_keys)
+                            ]
+                            if is_sequence_roll
+                            else []
+                        )
+                        distractor_box = case.get("distractor_box_xyxy")
+                        expected_distractor_keys = (
+                            bbox_to_token_indices(
+                                image_size=image_size,
+                                grid=payload["image1_grid"],
+                                bbox_xyxy=[int(value) for value in distractor_box],
+                            )
+                            if distractor_box and image_size
+                            else []
+                        )
+                        target_detail = {
+                            "target_keys": target_keys,
+                            "expected_target_keys": expected_target_keys,
+                            "target_queries": target_queries,
+                            "expected_target_queries": expected_target_queries,
+                            "shifted_queries": shifted_queries,
+                            "expected_shifted_queries": expected_shifted_queries,
+                            "source_target_queries": source_target_queries,
+                            "expected_source_target_queries": expected_source_target_queries,
+                            "distractor_keys": distractor_keys,
+                            "expected_distractor_keys": expected_distractor_keys,
+                            "metrics": {name: layer.get(name) for name in target_metric_names},
+                        }
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} summary_target_indices",
+                            bool(image_size)
+                            and bool(expected_target_keys)
+                            and bool(expected_target_queries)
+                            and target_keys == expected_target_keys
+                            and target_queries == expected_target_queries
+                            and shifted_queries == expected_shifted_queries
+                            and source_target_queries == expected_source_target_queries
+                            and distractor_keys == expected_distractor_keys
+                            and indices_valid(target_keys, image1_tokens)
+                            and indices_valid(target_queries, image2_tokens)
+                            and indices_valid(shifted_queries, image2_tokens)
+                            and indices_valid(source_target_queries, image2_tokens)
+                            and indices_valid(distractor_keys, image1_tokens),
+                            target_detail,
+                        )
+                        add_check(
+                            checks,
+                            failures,
+                            f"{layer_name} summary_target_metric_semantics",
+                            is_finite_number(layer.get("target_mass_norm_all_queries"))
+                            and is_finite_number(layer.get("target_mass_norm_target_queries"))
+                            and is_finite_number(layer.get("target_mass_raw_all_queries"))
+                            and is_finite_number(layer.get("target_mass_raw_target_position_queries"))
+                            and (
+                                is_nan_number(layer.get("target_mass_norm_content_shifted_target_queries"))
+                                and (
+                                    (
+                                        is_finite_number(layer.get("target_mass_norm_source_target_queries"))
+                                        and is_finite_number(layer.get("target_mass_raw_source_target_queries"))
+                                    )
+                                    if expected_source_target_queries
+                                    else (
+                                        is_nan_number(layer.get("target_mass_norm_source_target_queries"))
+                                        and is_nan_number(layer.get("target_mass_raw_source_target_queries"))
+                                    )
+                                )
+                                if is_sequence_roll
+                                else (
+                                    bool(expected_shifted_queries)
+                                    and is_finite_number(
+                                        layer.get("target_mass_norm_content_shifted_target_queries")
+                                    )
+                                    and is_nan_number(layer.get("target_mass_norm_source_target_queries"))
+                                    and is_nan_number(layer.get("target_mass_raw_source_target_queries"))
+                                )
+                            )
+                            and (
+                                is_finite_number(layer.get("distractor_mass_norm_all_queries"))
+                                and is_finite_number(layer.get("target_minus_distractor_mass"))
+                                if expected_distractor_keys
+                                else is_nan_number(layer.get("distractor_mass_norm_all_queries"))
+                                and is_nan_number(layer.get("target_minus_distractor_mass"))
+                            ),
+                            target_detail,
+                        )
+                    continue
                 if dump_mode == "scalar":
                     query_count = int(layer.get("query_count", 0) or 0)
                     image1_key_count = int(layer.get("image1_key_count", 0) or 0)
@@ -812,7 +1274,17 @@ def validate(
                         )
                     continue
 
-                npz_path = output_dir / layer["npz_path"]
+                full_layer_count += 1
+                npz_rel = str(layer["npz_path"])
+                add_check(
+                    checks,
+                    failures,
+                    f"{layer_name} unique_matrix_path",
+                    bool(npz_rel) and npz_rel not in seen_attention_raw_paths,
+                    npz_rel,
+                )
+                seen_attention_raw_paths.add(npz_rel)
+                npz_path = output_dir / npz_rel
                 data = np.load(npz_path)
                 matrix_norm = np.asarray(data["matrix_norm"], dtype=np.float32)
                 matrix_raw = np.asarray(data["matrix_raw"], dtype=np.float32)
@@ -831,6 +1303,38 @@ def validate(
                     else 0.0
                 )
                 mass_total_max = float(np.max(image1_mass + text_mass + image2_mass))
+                mass_total_mean = float(np.mean(image1_mass + text_mass + image2_mass))
+                query_rows = np.asarray(data["query_rows"], dtype=np.int64)
+                query_cols = np.asarray(data["query_cols"], dtype=np.int64)
+                key_rows = np.asarray(data["key_rows"], dtype=np.int64)
+                key_cols = np.asarray(data["key_cols"], dtype=np.int64)
+                position_cheb = np.maximum(
+                    np.abs(query_rows[:, None] - key_rows[None, :]),
+                    np.abs(query_cols[:, None] - key_cols[None, :]),
+                )
+                position_euclid = np.sqrt(
+                    (query_rows[:, None] - key_rows[None, :]) ** 2
+                    + (query_cols[:, None] - key_cols[None, :]) ** 2
+                )
+                exact_position = correspondence_band_mass(matrix_norm, position_cheb, 0)
+                position_band = correspondence_band_mass(
+                    matrix_norm,
+                    position_cheb,
+                    int(summary.get("band_radius", 1)),
+                )
+                token_index = np.arange(image2_block.shape[0])
+                past_mask = token_index[None, :] < token_index[:, None]
+                diagonal_mask = token_index[None, :] == token_index[:, None]
+                self_cheb = np.maximum(
+                    np.abs(query_rows[:, None] - query_rows[None, :]),
+                    np.abs(query_cols[:, None] - query_cols[None, :]),
+                )
+                local_past_mask = past_mask & (self_cheb <= int(summary.get("band_radius", 1)))
+                i2_total_self = float(image2_block.sum(axis=-1).mean())
+                i2_past_self = float(image2_block[past_mask].sum() / max(image2_block.shape[0], 1))
+                i2_diag_self = float(image2_block[diagonal_mask].sum() / max(image2_block.shape[0], 1))
+                i2_local_self = float(image2_block[local_past_mask].sum() / max(image2_block.shape[0], 1))
+                i2_local_ratio = float(i2_local_self / max(i2_past_self, 1e-8))
                 add_check(
                     checks,
                     failures,
@@ -849,6 +1353,13 @@ def validate(
                 add_check(checks, failures, f"{layer_name} raw_mass", raw_mass_error < row_sum_atol, raw_mass_error)
                 add_check(checks, failures, f"{layer_name} image2_mass", image2_mass_error < row_sum_atol, image2_mass_error)
                 add_check(checks, failures, f"{layer_name} future_i2_mass", future_mass_max < row_sum_atol, future_mass_max)
+                add_check(
+                    checks,
+                    failures,
+                    f"{layer_name} future_i2_mass_summary_match",
+                    metric_matches(layer.get("future_i2_mass_max"), future_mass_max, metric_atol),
+                    {"summary": layer.get("future_i2_mass_max"), "raw": future_mass_max},
+                )
                 add_check(checks, failures, f"{layer_name} mass_leq_one", mass_total_max <= 1.0 + row_sum_atol, mass_total_max)
                 finite = (
                     np.isfinite(matrix_norm).all()
@@ -857,6 +1368,38 @@ def validate(
                     and np.isfinite(image1_mass).all()
                 )
                 add_check(checks, failures, f"{layer_name} finite", bool(finite), str(npz_path))
+                paper_metric_detail = {
+                    "mean_image1_mass_raw": float(image1_mass.mean()),
+                    "mean_text_mass_raw": float(text_mass.mean()),
+                    "mean_image2_mass_raw": float(image2_mass.mean()),
+                    "mass_total_mean": mass_total_mean,
+                    "mass_total_max": mass_total_max,
+                    "position_band_mass": position_band,
+                    "exact_position_mass": exact_position,
+                    "expected_position_distance": expected_normalized_distance(matrix_norm, position_euclid),
+                    "row_entropy": normalized_row_entropy(matrix_norm),
+                    "i2_total_self_mass_raw": i2_total_self,
+                    "i2_past_self_mass_raw": i2_past_self,
+                    "i2_diag_self_mass_raw": i2_diag_self,
+                    "i2_local_self_mass_raw": i2_local_self,
+                    "i2_local_self_ratio": i2_local_ratio,
+                }
+                add_check(
+                    checks,
+                    failures,
+                    f"{layer_name} paper_metrics_recomputed",
+                    all(
+                        metric_matches(layer.get(name), recomputed, metric_atol)
+                        for name, recomputed in paper_metric_detail.items()
+                    )
+                    and metric_matches(layer.get("local_correspondence_band_mass"), position_band, metric_atol)
+                    and metric_matches(
+                        layer.get("expected_distance_from_diagonal"),
+                        paper_metric_detail["expected_position_distance"],
+                        metric_atol,
+                    ),
+                    paper_metric_detail,
+                )
                 if is_hook_noop:
                     baseline_layers = {
                         int(item["layer"]): item for item in transforms["baseline"]["layers"]
@@ -898,8 +1441,6 @@ def validate(
                         },
                     )
                     source = np.asarray(source_indices, dtype=np.int64)
-                    key_rows = np.asarray(data["key_rows"], dtype=np.int64)
-                    key_cols = np.asarray(data["key_cols"], dtype=np.int64)
                     source_rows = key_rows[source]
                     source_cols = key_cols[source]
                     cheb = np.maximum(
@@ -910,7 +1451,6 @@ def validate(
                         (source_rows[:, None] - key_rows[None, :]) ** 2
                         + (source_cols[:, None] - key_cols[None, :]) ** 2
                     )
-                    exact_position = float(np.diag(matrix_norm).sum() / max(matrix_norm.shape[0], 1))
                     exact_source = correspondence_band_mass(matrix_norm, cheb, 0)
                     source_detail = {
                         "source_index_band_mass": layer.get("source_index_band_mass"),
@@ -940,15 +1480,47 @@ def validate(
                         ),
                         source_detail,
                     )
+                else:
+                    content_cheb, content_euclid = spatial_content_distances(
+                        query_rows=query_rows,
+                        query_cols=query_cols,
+                        key_rows=key_rows,
+                        key_cols=key_cols,
+                        grid_h=int(payload["image1_grid"]["llm_grid_h"]),
+                        grid_w=int(payload["image1_grid"]["llm_grid_w"]),
+                        transform_record=record,
+                    )
+                    content_detail = {
+                        "content_band_mass": correspondence_band_mass(
+                            matrix_norm,
+                            content_cheb,
+                            int(summary.get("band_radius", 1)),
+                        ),
+                        "expected_content_distance": expected_normalized_distance(matrix_norm, content_euclid),
+                    }
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} content_metrics_recomputed",
+                        all(
+                            metric_matches(layer.get(name), recomputed, metric_atol)
+                            for name, recomputed in content_detail.items()
+                        ),
+                        content_detail,
+                    )
                 if require_target_box or case.get("target_box_xyxy"):
                     target_keys = layer.get("target_key_token_indices", [])
                     target_queries = layer.get("target_query_token_indices", [])
                     shifted_queries = layer.get("content_shifted_target_query_token_indices", [])
+                    source_target_queries = layer.get("source_target_query_token_indices", [])
+                    distractor_keys = layer.get("distractor_key_token_indices", [])
                     target_box = case.get("target_box_xyxy")
                     image_size = case.get("image_size")
                     expected_target_keys: list[int] = []
                     expected_target_queries: list[int] = []
                     expected_shifted_queries: list[int] = []
+                    expected_source_target_queries: list[int] = []
+                    expected_distractor_keys: list[int] = []
                     if target_box and image_size:
                         expected_target_keys = bbox_to_token_indices(
                             image_size=image_size,
@@ -967,12 +1539,44 @@ def validate(
                                 bbox_xyxy=[int(v) for v in target_box],
                                 transform_record=record,
                             )
+                        else:
+                            target_key_set = set(expected_target_keys)
+                            expected_source_target_queries = [
+                                query_index
+                                for query_index, source_index in enumerate(source_indices)
+                                if int(source_index) in target_key_set
+                            ]
+                        if case.get("distractor_box_xyxy"):
+                            expected_distractor_keys = bbox_to_token_indices(
+                                image_size=image_size,
+                                grid=payload["image1_grid"],
+                                bbox_xyxy=[int(v) for v in case["distractor_box_xyxy"]],
+                            )
                     recomputed_all = mean_target_mass(matrix_norm, None, [int(v) for v in target_keys])
                     recomputed_target = mean_target_mass(
                         matrix_norm, [int(v) for v in target_queries], [int(v) for v in target_keys]
                     )
                     recomputed_shifted = mean_target_mass(
                         matrix_norm, [int(v) for v in shifted_queries], [int(v) for v in target_keys]
+                    )
+                    recomputed_raw_all = mean_target_mass(matrix_raw, None, [int(v) for v in target_keys])
+                    recomputed_raw_target = mean_target_mass(
+                        matrix_raw, [int(v) for v in target_queries], [int(v) for v in target_keys]
+                    )
+                    recomputed_source_norm = mean_target_mass(
+                        matrix_norm,
+                        [int(v) for v in source_target_queries],
+                        [int(v) for v in target_keys],
+                    )
+                    recomputed_source_raw = mean_target_mass(
+                        matrix_raw,
+                        [int(v) for v in source_target_queries],
+                        [int(v) for v in target_keys],
+                    )
+                    recomputed_distractor = mean_target_mass(
+                        matrix_norm,
+                        None,
+                        [int(v) for v in distractor_keys],
                     )
                     target_detail = {
                         "target_key_count": len(target_keys),
@@ -981,6 +1585,10 @@ def validate(
                         "expected_target_key_count": len(expected_target_keys),
                         "expected_target_query_count": len(expected_target_queries),
                         "expected_content_shifted_target_query_count": len(expected_shifted_queries),
+                        "source_target_query_count": len(source_target_queries),
+                        "expected_source_target_query_count": len(expected_source_target_queries),
+                        "distractor_key_count": len(distractor_keys),
+                        "expected_distractor_key_count": len(expected_distractor_keys),
                         "target_mass_norm_all_queries": layer.get("target_mass_norm_all_queries"),
                         "target_mass_norm_target_queries": layer.get("target_mass_norm_target_queries"),
                         "target_mass_norm_content_shifted_target_queries": layer.get(
@@ -989,6 +1597,11 @@ def validate(
                         "recomputed_target_mass_norm_all_queries": recomputed_all,
                         "recomputed_target_mass_norm_target_queries": recomputed_target,
                         "recomputed_target_mass_norm_content_shifted_target_queries": recomputed_shifted,
+                        "recomputed_target_mass_raw_all_queries": recomputed_raw_all,
+                        "recomputed_target_mass_raw_target_position_queries": recomputed_raw_target,
+                        "recomputed_target_mass_norm_source_target_queries": recomputed_source_norm,
+                        "recomputed_target_mass_raw_source_target_queries": recomputed_source_raw,
+                        "recomputed_distractor_mass_norm_all_queries": recomputed_distractor,
                     }
                     add_check(
                         checks,
@@ -1038,7 +1651,9 @@ def validate(
                         f"{layer_name} target_indices_in_range_unique",
                         indices_valid([int(v) for v in target_keys], matrix_norm.shape[1])
                         and indices_valid([int(v) for v in target_queries], matrix_norm.shape[0])
-                        and indices_valid([int(v) for v in shifted_queries], matrix_norm.shape[0]),
+                        and indices_valid([int(v) for v in shifted_queries], matrix_norm.shape[0])
+                        and indices_valid([int(v) for v in source_target_queries], matrix_norm.shape[0])
+                        and indices_valid([int(v) for v in distractor_keys], matrix_norm.shape[1]),
                         target_detail,
                     )
                     add_check(
@@ -1047,7 +1662,51 @@ def validate(
                         f"{layer_name} target_indices_recomputed",
                         [int(v) for v in target_keys] == expected_target_keys
                         and [int(v) for v in target_queries] == expected_target_queries
-                        and [int(v) for v in shifted_queries] == expected_shifted_queries,
+                        and [int(v) for v in shifted_queries] == expected_shifted_queries
+                        and [int(v) for v in source_target_queries] == expected_source_target_queries
+                        and [int(v) for v in distractor_keys] == expected_distractor_keys,
+                        target_detail,
+                    )
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} target_raw_source_metrics_match_npz",
+                        metric_matches(layer.get("target_mass_raw_all_queries"), recomputed_raw_all, metric_atol)
+                        and metric_matches(
+                            layer.get("target_mass_raw_target_position_queries"),
+                            recomputed_raw_target,
+                            metric_atol,
+                        )
+                        and (
+                            metric_matches(
+                                layer.get("target_mass_norm_source_target_queries"),
+                                recomputed_source_norm,
+                                metric_atol,
+                            )
+                            and metric_matches(
+                                layer.get("target_mass_raw_source_target_queries"),
+                                recomputed_source_raw,
+                                metric_atol,
+                            )
+                            if expected_source_target_queries
+                            else is_nan_number(layer.get("target_mass_norm_source_target_queries"))
+                            and is_nan_number(layer.get("target_mass_raw_source_target_queries"))
+                        )
+                        and (
+                            metric_matches(
+                                layer.get("distractor_mass_norm_all_queries"),
+                                recomputed_distractor,
+                                metric_atol,
+                            )
+                            and metric_matches(
+                                layer.get("target_minus_distractor_mass"),
+                                recomputed_all - recomputed_distractor,
+                                metric_atol,
+                            )
+                            if expected_distractor_keys
+                            else is_nan_number(layer.get("distractor_mass_norm_all_queries"))
+                            and is_nan_number(layer.get("target_minus_distractor_mass"))
+                        ),
                         target_detail,
                     )
                     add_check(
@@ -1067,6 +1726,30 @@ def validate(
                         ),
                         target_detail,
                     )
+                else:
+                    no_target_metric_names = [
+                        "target_mass_norm_all_queries",
+                        "target_mass_norm_target_queries",
+                        "target_mass_norm_content_shifted_target_queries",
+                        "target_mass_raw_all_queries",
+                        "target_mass_raw_target_position_queries",
+                        "target_mass_norm_source_target_queries",
+                        "target_mass_raw_source_target_queries",
+                        "distractor_mass_norm_all_queries",
+                        "target_minus_distractor_mass",
+                    ]
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} full_no_target_semantics",
+                        not layer.get("target_key_token_indices")
+                        and not layer.get("target_query_token_indices")
+                        and not layer.get("content_shifted_target_query_token_indices")
+                        and not layer.get("source_target_query_token_indices")
+                        and not layer.get("distractor_key_token_indices")
+                        and all(is_nan_number(layer.get(name)) for name in no_target_metric_names),
+                        {name: layer.get(name) for name in no_target_metric_names},
+                    )
 
     if require_visual_sequence_raw:
         add_check(
@@ -1084,11 +1767,47 @@ def validate(
             raw_processor_pair_count > 0,
             raw_processor_pair_count,
         )
+    if strict_logicvista100:
+        expected_cells_per_case = len(expected_transform_set) * len(selected_layer_ids)
+        expected_full_layers = expected_cells_per_case
+        expected_summary_layers = max(0, len(summary.get("cases", [])) - 1) * expected_cells_per_case
+        actual_npz_paths = {
+            str(path.relative_to(output_dir))
+            for path in (output_dir / "npz").rglob("*.npz")
+        }
+        add_check(
+            checks,
+            failures,
+            "logicvista100_bounded_full_raw_layers",
+            full_layer_count == expected_full_layers and summary_layer_count == expected_summary_layers,
+            {
+                "full_layer_count": full_layer_count,
+                "expected_full_layers": expected_full_layers,
+                "summary_layer_count": summary_layer_count,
+                "expected_summary_layers": expected_summary_layers,
+            },
+        )
+        add_check(
+            checks,
+            failures,
+            "logicvista100_exact_matrix_files",
+            actual_npz_paths == seen_attention_raw_paths
+            and len(actual_npz_paths) == expected_full_layers,
+            {
+                "actual_count": len(actual_npz_paths),
+                "referenced_count": len(seen_attention_raw_paths),
+                "expected_count": expected_full_layers,
+                "extra": sorted(actual_npz_paths - seen_attention_raw_paths),
+                "missing": sorted(seen_attention_raw_paths - actual_npz_paths),
+            },
+        )
 
     return {
         "ok": not failures,
         "check_count": len(checks),
         "failure_count": len(failures),
+        "row_sum_atol": float(row_sum_atol),
+        "metric_atol": float(metric_atol),
         "failures": failures,
         "checks_preview": checks[:40],
     }

@@ -23,6 +23,10 @@ def tensor_sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def tensor_raw_bytes(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.detach().contiguous().view(torch.uint8).cpu().numpy().reshape(-1)
+
+
 def qwen_attention_return_arity(version: str) -> int:
     normalized = str(version).strip()
     try:
@@ -398,6 +402,12 @@ class QwenI2VisualSequenceRoll:
                 image2_after=state["_image2_after"].float().cpu().numpy(),
                 llm_injected_image1=state["_injected_i1"].float().cpu().numpy(),
                 llm_injected_image2=state["_injected_i2"].float().cpu().numpy(),
+                image1_before_raw_bytes=tensor_raw_bytes(state["_image1_before"]),
+                image1_after_raw_bytes=tensor_raw_bytes(state["_image1_after"]),
+                image2_before_raw_bytes=tensor_raw_bytes(state["_image2_before"]),
+                image2_after_raw_bytes=tensor_raw_bytes(state["_image2_after"]),
+                llm_injected_image1_raw_bytes=tensor_raw_bytes(state["_injected_i1"]),
+                llm_injected_image2_raw_bytes=tensor_raw_bytes(state["_injected_i2"]),
                 source_index_for_output=np.asarray(state["source_index_for_output"], dtype=np.int64),
             )
             state["raw_npz_path"] = str(raw_path.relative_to(self.dump_dir.parent))
