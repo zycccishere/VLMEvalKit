@@ -56,11 +56,56 @@ from vlmeval.vlm.replay_image_transform import (  # noqa: E402
     QWEN_DEFAULT_MIN_PIXELS,
     apply_image_transform_to_content,
 )
+from vlmeval.vlm.qwen_i2_visual_sequence_roll import (  # noqa: E402
+    VISUAL_SEQUENCE_ROLL_RIGHT_1,
+    QwenI2VisualSequenceRoll,
+    tensor_sha256,
+)
+
+
+INTERVENTION_SPECS = {
+    "baseline": {
+        "family": "baseline",
+        "paper_name": "baseline",
+        "pixel_transform": "baseline",
+        "pixel_equivalent": 0,
+    },
+    "shift_right_half_vit_token": {
+        "family": "pixel_translation",
+        "paper_name": "pixel_shift_half_vit_patch",
+        "pixel_transform": "shift_right_half_vit_token",
+        "pixel_equivalent": 7,
+    },
+    "shift_right_one_vit_token": {
+        "family": "pixel_translation",
+        "paper_name": "pixel_shift_one_vit_patch",
+        "pixel_transform": "shift_right_one_vit_token",
+        "pixel_equivalent": 14,
+    },
+    "shift_right_one_llm_token": {
+        "family": "pixel_translation",
+        "paper_name": "pixel_shift_projected_token_scale",
+        "pixel_transform": "shift_right_one_llm_token",
+        "pixel_equivalent": 28,
+    },
+    VISUAL_SEQUENCE_ROLL_RIGHT_1: {
+        "family": "visual_sequence_roll",
+        "paper_name": VISUAL_SEQUENCE_ROLL_RIGHT_1,
+        "pixel_transform": "baseline",
+        "pixel_equivalent": None,
+    },
+    "visual_sequence_hook_noop": {
+        "family": "visual_sequence_control",
+        "paper_name": "matched_visual_sequence_hook_noop",
+        "pixel_transform": "baseline",
+        "pixel_equivalent": None,
+    },
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compare baseline vs shifted image2 prefill flow on Qwen2.5-VL."
+        description="Compare pixel-shift and visual-sequence-roll interventions on Qwen2.5-VL I2 flow."
     )
     parser.add_argument("--model-path", default="/user/zyc1781/models/Qwen2.5-VL-32B-Instruct")
     parser.add_argument("--manifest", required=True)
@@ -76,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
             "shift_right_one_vit_token",
             "shift_right_one_llm_token",
         ],
-        help="Image2 transforms to compare against baseline. Baseline is always included once.",
+        help="Image2 interventions to compare against baseline. Baseline is always included once.",
     )
     parser.add_argument(
         "--policy",
@@ -85,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--template-on-last-replay-text", action="store_true")
     parser.add_argument("--attn-layers", default="last4")
+    parser.add_argument(
+        "--text-scope",
+        default="historical_all_non_image_non_special",
+        choices=["historical_all_non_image_non_special", "q1_between_images"],
+        help="Which non-image tokens are included in the historical I2-to-Q/text mass metric.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--band-radius", type=int, default=1)
@@ -117,7 +168,61 @@ def build_parser() -> argparse.ArgumentParser:
             "Use <=0 to process all I2 queries at once."
         ),
     )
+    parser.add_argument(
+        "--visual-sequence-raw-dump-limit",
+        type=int,
+        default=0,
+        help="Save raw pre/post I1 and I2 post-merger embeddings for the first N sequence-roll cases.",
+    )
     return parser
+
+
+def intervention_spec(name: str) -> dict[str, Any]:
+    try:
+        return dict(INTERVENTION_SPECS[name])
+    except KeyError as exc:
+        raise ValueError(f"Unsupported flow intervention: {name}") from exc
+
+
+def tensor_input_fingerprint(model_inputs: dict[str, Any]) -> dict[str, Any]:
+    fingerprint: dict[str, Any] = {}
+    for key, value in sorted(model_inputs.items()):
+        if not isinstance(value, torch.Tensor):
+            continue
+        fingerprint[str(key)] = {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "sha256": tensor_sha256(value),
+        }
+    return fingerprint
+
+
+def validate_iqi_modal_topology(content: list[dict[str, Any]]) -> dict[str, Any]:
+    modal = [item for item in content if item.get("type") in {"image", "text", "video"}]
+    types = [str(item.get("type")) for item in modal]
+    if types != ["image", "text", "image"]:
+        raise ValueError(f"visual-sequence flow requires exact IQI modal topology, got {types}")
+    image1 = str(modal[0].get("image") or modal[0].get("image_url") or "").removeprefix("file://")
+    image2 = str(modal[2].get("image") or modal[2].get("image_url") or "").removeprefix("file://")
+    if not image1 or image1 != image2:
+        raise ValueError("visual-sequence flow requires I1 and I2 to reference the same image")
+    return {
+        "validated": True,
+        "modal_sequence": types,
+        "same_image_reference": True,
+        "question_count": 1,
+    }
+
+
+def resolve_mrope_section(attn_module: Any) -> list[int]:
+    for owner in (attn_module, getattr(attn_module, "config", None)):
+        if owner is None:
+            continue
+        for name in ("rope_scaling", "rope_parameters"):
+            value = getattr(owner, name, None)
+            if isinstance(value, dict) and value.get("mrope_section"):
+                return [int(item) for item in value["mrope_section"]]
+    raise AttributeError("cannot resolve Qwen mrope_section from attention module or config")
 
 
 def load_manifest(path: str | Path) -> list[dict[str, Any]]:
@@ -264,6 +369,7 @@ def target_mass_summary(
     transform_record: dict[str, Any],
     target_box_xyxy: list[int] | None,
     distractor_box_xyxy: list[int] | None,
+    content_mapping_valid: bool = True,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "target_key_token_indices": [],
@@ -288,12 +394,14 @@ def target_mass_summary(
         grid_meta=query_grid_meta,
         bbox_xyxy=[int(x) for x in target_box_xyxy],
     )
-    shifted_target_query_indices = content_shifted_bbox_token_indices(
-        image_size=image_size,
-        grid_meta=query_grid_meta,
-        bbox_xyxy=[int(x) for x in target_box_xyxy],
-        transform_record=transform_record,
-    )
+    shifted_target_query_indices = []
+    if content_mapping_valid:
+        shifted_target_query_indices = content_shifted_bbox_token_indices(
+            image_size=image_size,
+            grid_meta=query_grid_meta,
+            bbox_xyxy=[int(x) for x in target_box_xyxy],
+            transform_record=transform_record,
+        )
     out["target_key_token_indices"] = [int(x) for x in target_indices]
     out["target_query_token_indices"] = [int(x) for x in target_query_indices]
     out["content_shifted_target_query_token_indices"] = [int(x) for x in shifted_target_query_indices]
@@ -388,6 +496,67 @@ def content_correspondence_distances(
     return cheb, euclid, meta
 
 
+def source_index_correspondence_distances(
+    *,
+    source_indices: list[int],
+    key_rows: np.ndarray,
+    key_cols: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    source = np.asarray(source_indices, dtype=np.int64)
+    if source.ndim != 1 or source.shape[0] != key_rows.shape[0]:
+        raise ValueError(
+            f"source-index mapping must have one entry per query: source={source.shape} keys={key_rows.shape}"
+        )
+    if source.size and (source.min() < 0 or source.max() >= key_rows.shape[0]):
+        raise ValueError("source-index mapping contains an out-of-range key index")
+    source_rows = key_rows[source]
+    source_cols = key_cols[source]
+    cheb = build_chebyshev_distance(source_rows, source_cols, key_rows, key_cols)
+    euclid = build_euclidean_distance(source_rows, source_cols, key_rows, key_cols)
+    return cheb, euclid
+
+
+def add_raw_and_source_target_metrics(
+    target_summary: dict[str, Any],
+    *,
+    matrix_raw: np.ndarray,
+    matrix_norm: np.ndarray,
+    source_indices: list[int] | None,
+) -> None:
+    target_keys = [int(item) for item in target_summary.get("target_key_token_indices", [])]
+    target_queries = [int(item) for item in target_summary.get("target_query_token_indices", [])]
+    target_summary.update(
+        {
+            "target_mass_raw_all_queries": float("nan"),
+            "target_mass_raw_target_position_queries": float("nan"),
+            "source_target_query_token_indices": [],
+            "target_mass_norm_source_target_queries": float("nan"),
+            "target_mass_raw_source_target_queries": float("nan"),
+        }
+    )
+    if not target_keys:
+        return
+    target_summary["target_mass_raw_all_queries"] = float(
+        matrix_raw[:, target_keys].sum(axis=-1).mean()
+    )
+    if target_queries:
+        target_summary["target_mass_raw_target_position_queries"] = float(
+            matrix_raw[target_queries][:, target_keys].sum(axis=-1).mean()
+        )
+    if source_indices is None:
+        return
+    target_key_set = set(target_keys)
+    source_queries = [index for index, source in enumerate(source_indices) if int(source) in target_key_set]
+    target_summary["source_target_query_token_indices"] = source_queries
+    if source_queries:
+        target_summary["target_mass_norm_source_target_queries"] = float(
+            matrix_norm[source_queries][:, target_keys].sum(axis=-1).mean()
+        )
+        target_summary["target_mass_raw_source_target_queries"] = float(
+            matrix_raw[source_queries][:, target_keys].sum(axis=-1).mean()
+        )
+
+
 def i2_self_flow_summary(image2_block: np.ndarray, query_rows: np.ndarray, query_cols: np.ndarray, radius: int) -> dict[str, float]:
     if image2_block.size == 0:
         return {
@@ -448,6 +617,7 @@ class QwenTransformPairFlowTracer:
         self.scalar_query_chunk_size = int(scalar_query_chunk_size)
         self.original_forward: dict[int, Any] = {}
         self.records: list[dict[str, Any]] = []
+        self.runtime_contract: dict[str, Any] = {}
         self.query_positions: list[int] = []
         self.image1_positions: list[int] = []
         self.text_positions: list[int] = []
@@ -485,6 +655,8 @@ class QwenTransformPairFlowTracer:
                 **kwargs,
             ):
                 bsz, q_len, _ = hidden_states.size()
+                if bsz != 1:
+                    raise ValueError(f"Qwen flow tracer supports batch size 1 only, got bsz={bsz}")
 
                 query_states = module.q_proj(hidden_states)
                 key_states = module.k_proj(hidden_states)
@@ -497,12 +669,43 @@ class QwenTransformPairFlowTracer:
                 if position_embeddings is None:
                     raise ValueError("position_embeddings is required for transform-pair flow tracing.")
                 cos, sin = position_embeddings
+                if not tracer.runtime_contract:
+                    query_contract = torch.as_tensor(
+                        tracer.query_positions,
+                        device=hidden_states.device,
+                        dtype=torch.long,
+                    )
+                    key_contract = torch.arange(q_len, device=hidden_states.device, dtype=torch.long)
+                    effective_i2_causal_block = key_contract.view(1, -1) > query_contract.view(-1, 1)
+                    tracer.runtime_contract = {
+                        "captured_layer": int(_layer_idx),
+                        "incoming_attention_mask_present": isinstance(attention_mask, torch.Tensor),
+                        "incoming_attention_mask_shape": (
+                            list(attention_mask.shape) if isinstance(attention_mask, torch.Tensor) else None
+                        ),
+                        "incoming_attention_mask_dtype": (
+                            str(attention_mask.dtype) if isinstance(attention_mask, torch.Tensor) else None
+                        ),
+                        "incoming_attention_mask_sha256": (
+                            tensor_sha256(attention_mask) if isinstance(attention_mask, torch.Tensor) else None
+                        ),
+                        "effective_i2_causal_block_shape": list(effective_i2_causal_block.shape),
+                        "effective_i2_causal_block_dtype": str(effective_i2_causal_block.dtype),
+                        "effective_i2_causal_block_sha256": tensor_sha256(effective_i2_causal_block),
+                        "effective_i2_causal_future_count": int(effective_i2_causal_block.sum().item()),
+                        "mrope_cos_shape": list(cos.shape),
+                        "mrope_cos_dtype": str(cos.dtype),
+                        "mrope_cos_sha256": tensor_sha256(cos),
+                        "mrope_sin_shape": list(sin.shape),
+                        "mrope_sin_dtype": str(sin.dtype),
+                        "mrope_sin_sha256": tensor_sha256(sin),
+                    }
                 query_states, key_states = apply_multimodal_rotary_pos_emb(
                     query_states,
                     key_states,
                     cos,
                     sin,
-                    module.rope_scaling["mrope_section"],
+                    resolve_mrope_section(module),
                 )
 
                 if past_key_value is not None:
@@ -665,6 +868,7 @@ class QwenTransformPairFlowTracer:
 
     def reset(self) -> None:
         self.records.clear()
+        self.runtime_contract.clear()
 
 
 def main() -> int:
@@ -680,6 +884,15 @@ def main() -> int:
         manifest = manifest[: args.max_cases]
     if not manifest:
         raise ValueError("No cases selected from manifest.")
+    requested_interventions = {str(item) for item in args.transforms}
+    uses_visual_sequence_runtime = bool(
+        requested_interventions & {VISUAL_SEQUENCE_ROLL_RIGHT_1, "visual_sequence_hook_noop"}
+    )
+    if uses_visual_sequence_runtime and (args.mode != "image_text_image" or args.policy != PROMPT_TEMPLATE_IDENTITY):
+        raise ValueError(
+            "visual-sequence flow is registered only for IQI/image_text_image with identity policy, "
+            f"got mode={args.mode!r} policy={args.policy!r}"
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -689,6 +902,7 @@ def main() -> int:
     scalar_npz_dir = output_dir / "scalar_npz"
     if args.dump_mode == "scalar" and args.scalar_raw_dump_limit > 0:
         scalar_npz_dir.mkdir(parents=True, exist_ok=True)
+    visual_sequence_dump_dir = output_dir / "visual_sequence_npz"
 
     processor, model = load_model_and_processor(args.model_path, args.device)
     input_device = resolve_input_device(model, args.device)
@@ -703,6 +917,11 @@ def main() -> int:
         scalar_query_chunk_size=args.scalar_query_chunk_size,
     )
     tracer.patch()
+    sequence_roll = QwenI2VisualSequenceRoll(
+        model,
+        dump_dir=visual_sequence_dump_dir,
+        raw_dump_limit=args.visual_sequence_raw_dump_limit,
+    )
 
     records_out: list[dict[str, Any]] = []
     run_start = time.perf_counter()
@@ -730,9 +949,18 @@ def main() -> int:
 
             transform_records: dict[str, Any] = {}
             layer_results: dict[str, list[dict[str, Any]]] = {}
+            baseline_input_fingerprint: dict[str, Any] | None = None
+            baseline_prompt_text: str | None = None
+            baseline_runtime_contract: dict[str, Any] | None = None
+            baseline_attention_runtime_contract: dict[str, Any] | None = None
             transforms_for_case = unique_transforms(case, args.transforms)
+            hook_noop_requested = "visual_sequence_hook_noop" in transforms_for_case
             for transform in transforms_for_case:
                 sample_start = time.perf_counter()
+                spec = intervention_spec(transform)
+                pixel_transform = str(spec["pixel_transform"])
+                sequence_roll_enabled = spec["family"] == "visual_sequence_roll"
+                sequence_control_enabled = spec["family"] == "visual_sequence_control"
                 replayed = build_replayed_content(
                     base_content,
                     dataset_name=dataset_name,
@@ -742,14 +970,18 @@ def main() -> int:
                 )
                 transformed, transform_record = apply_image_transform_to_content(
                     replayed,
-                    transform_name=transform,
+                    transform_name=pixel_transform,
                     sample_meta={"sample_index": sample_index},
                     cache_dir=output_dir / "_transform_cache" / transform / dataset_name,
                     dataset_name=dataset_name,
                     image_position=2,
                     model_family="qwen2_5_vl",
                 )
+                topology_record = None
+                if sequence_roll_enabled or sequence_control_enabled:
+                    topology_record = validate_iqi_modal_topology(transformed)
                 _, prompt_text, model_inputs = build_inputs(processor, transformed)
+                input_fingerprint = tensor_input_fingerprint(model_inputs)
                 input_ids = model_inputs["input_ids"][0].tolist()
                 image_spans = find_image_spans(input_ids, image_token_id)
                 if len(image_spans) != 2:
@@ -758,13 +990,21 @@ def main() -> int:
                     )
                 image1_positions = list(range(image_spans[0].start, image_spans[0].end + 1))
                 image2_positions = list(range(image_spans[1].start, image_spans[1].end + 1))
-                text_positions = find_mid_text_positions(input_ids, image_spans, special_token_ids)
-                if not text_positions:
+                if args.text_scope == "historical_all_non_image_non_special":
+                    image_position_set = set(image1_positions) | set(image2_positions)
                     text_positions = [
                         pos
-                        for pos in range(image_spans[0].end + 1, image_spans[1].start)
-                        if input_ids[pos] not in special_token_ids
+                        for pos in range(len(input_ids))
+                        if pos not in image_position_set and input_ids[pos] not in special_token_ids
                     ]
+                else:
+                    text_positions = find_mid_text_positions(input_ids, image_spans, special_token_ids)
+                    if not text_positions:
+                        text_positions = [
+                            pos
+                            for pos in range(image_spans[0].end + 1, image_spans[1].start)
+                            if input_ids[pos] not in special_token_ids
+                        ]
 
                 grid_metas = extract_image_grid_meta(model_inputs["image_grid_thw"], spatial_merge_size=spatial_merge_size)
                 if len(grid_metas) != 2:
@@ -781,15 +1021,27 @@ def main() -> int:
                 key_rows, key_cols = token_rows_and_cols(grid_metas[0])
                 cheb_dist = build_chebyshev_distance(query_rows, query_cols, key_rows, key_cols)
                 euclid_dist = build_euclidean_distance(query_rows, query_cols, key_rows, key_cols)
-                content_cheb_dist, content_euclid_dist, content_shift_meta = content_correspondence_distances(
-                    query_rows=query_rows,
-                    query_cols=query_cols,
-                    key_rows=key_rows,
-                    key_cols=key_cols,
-                    grid_h=grid_metas[0].llm_grid_h,
-                    grid_w=grid_metas[0].llm_grid_w,
-                    transform_record=transform_record,
-                )
+                content_mapping_valid = not sequence_roll_enabled
+                if content_mapping_valid:
+                    content_cheb_dist, content_euclid_dist, content_shift_meta = content_correspondence_distances(
+                        query_rows=query_rows,
+                        query_cols=query_cols,
+                        key_rows=key_rows,
+                        key_cols=key_cols,
+                        grid_h=grid_metas[0].llm_grid_h,
+                        grid_w=grid_metas[0].llm_grid_w,
+                        transform_record=transform_record,
+                    )
+                else:
+                    content_cheb_dist = None
+                    content_euclid_dist = None
+                    content_shift_meta = {
+                        "mapping_kind": "visual_sequence_index_roll",
+                        "pixel_equivalent": None,
+                        "dx_tokens": None,
+                        "dy_tokens": None,
+                        "spatial_content_metrics_valid": False,
+                    }
 
                 tracer.configure_sample(
                     query_positions=image2_positions,
@@ -800,17 +1052,106 @@ def main() -> int:
                 tracer.reset()
 
                 model_inputs = tensor_to_device(model_inputs, input_device)
-                with torch.inference_mode():
-                    outputs = model(**model_inputs, use_cache=False, return_dict=True)
+                runtime_capture_enabled = (
+                    sequence_roll_enabled
+                    or sequence_control_enabled
+                    or (transform == "baseline" and not hook_noop_requested)
+                )
+                with sequence_roll.sample(
+                    case_id=str(case["id"]),
+                    intervention=transform,
+                    enabled=runtime_capture_enabled,
+                    roll_enabled=sequence_roll_enabled,
+                    image1_positions=image1_positions,
+                    image2_positions=image2_positions,
+                ) as sequence_roll_record:
+                    with torch.inference_mode():
+                        outputs = model(**model_inputs, use_cache=False, return_dict=True)
                 del outputs
                 torch.cuda.empty_cache()
 
                 if not tracer.records:
                     raise RuntimeError(f"No flow records captured for {case['id']} transform={transform}.")
+                attention_runtime_contract = dict(tracer.runtime_contract)
+                source_cheb_dist = None
+                source_euclid_dist = None
+                sequence_source_indices = None
+                if sequence_roll_enabled:
+                    sequence_source_indices = [
+                        int(item) for item in sequence_roll_record["source_index_for_output"]
+                    ]
+                    source_cheb_dist, source_euclid_dist = source_index_correspondence_distances(
+                        source_indices=sequence_source_indices,
+                        key_rows=key_rows,
+                        key_cols=key_cols,
+                    )
+
+                if transform == "baseline":
+                    baseline_input_fingerprint = input_fingerprint
+                    baseline_prompt_text = prompt_text
+                    baseline_runtime_contract = dict(sequence_roll_record)
+                    baseline_attention_runtime_contract = attention_runtime_contract
+                    matched_baseline_exact = True
+                elif sequence_control_enabled:
+                    if baseline_input_fingerprint is None or baseline_attention_runtime_contract is None:
+                        raise RuntimeError("matched hook-noop control requires unhooked baseline first")
+                    matched_baseline_exact = (
+                        prompt_text == baseline_prompt_text
+                        and input_fingerprint == baseline_input_fingerprint
+                        and attention_runtime_contract == baseline_attention_runtime_contract
+                    )
+                    if not matched_baseline_exact:
+                        raise RuntimeError(f"unhooked baseline and hook-noop differ for case={case['id']}")
+                    baseline_runtime_contract = dict(sequence_roll_record)
+                elif sequence_roll_enabled:
+                    if baseline_input_fingerprint is None or baseline_runtime_contract is None:
+                        raise RuntimeError("visual sequence roll requires baseline to run first in the same case")
+                    runtime_match_fields = [
+                        "image1_before_sha256",
+                        "image2_before_sha256",
+                        "qwen_grid_thw",
+                        "image_token_counts",
+                        "position_ids_sha256",
+                        "attention_mask_sha256",
+                        "position_ids_shape",
+                        "position_ids_dtype",
+                        "attention_mask_shape",
+                        "attention_mask_dtype",
+                        "llm_non_i2_shape",
+                        "llm_non_i2_dtype",
+                        "llm_non_i2_sha256",
+                    ]
+                    matched_baseline_exact = (
+                        prompt_text == baseline_prompt_text
+                        and input_fingerprint == baseline_input_fingerprint
+                        and attention_runtime_contract == baseline_attention_runtime_contract
+                        and all(
+                            sequence_roll_record.get(field) == baseline_runtime_contract.get(field)
+                            for field in runtime_match_fields
+                        )
+                    )
+                    if not matched_baseline_exact:
+                        raise RuntimeError(
+                            "baseline and visual-sequence-roll runtime inputs differ for "
+                            f"case={case['id']}"
+                        )
+                else:
+                    matched_baseline_exact = False
 
                 transform_records[transform] = {
                     "prompt_text": prompt_text,
+                    "model_input_fingerprint": input_fingerprint,
+                    "attention_runtime_contract": attention_runtime_contract,
                     "transform_record": transform_record,
+                    "intervention": {
+                        "name": transform,
+                        "family": spec["family"],
+                        "paper_name": spec["paper_name"],
+                        "pixel_equivalent": spec["pixel_equivalent"],
+                        "matched_baseline_exact": matched_baseline_exact,
+                        "visual_sequence_roll": dict(sequence_roll_record),
+                    },
+                    "topology_record": topology_record,
                     "content_shift_meta": content_shift_meta,
                     "seconds": float(time.perf_counter() - sample_start),
                     "image1_grid": grid_metas[0].to_dict(),
@@ -834,7 +1175,11 @@ def main() -> int:
                         image2_block = np.asarray(record["image2_block"], dtype=np.float32)
                         norm_block = normalize_rows(raw_block)
                         profile = distance_profile(norm_block, cheb_dist)
-                        content_profile = distance_profile(norm_block, content_cheb_dist)
+                        content_profile = (
+                            distance_profile(norm_block, content_cheb_dist)
+                            if content_cheb_dist is not None
+                            else []
+                        )
                         self_summary = i2_self_flow_summary(image2_block, query_rows, query_cols, args.band_radius)
                         target_summary = target_mass_summary(
                             matrix_norm=norm_block,
@@ -844,6 +1189,19 @@ def main() -> int:
                             transform_record=transform_record,
                             target_box_xyxy=case.get("target_box_xyxy"),
                             distractor_box_xyxy=case.get("distractor_box_xyxy"),
+                            content_mapping_valid=content_mapping_valid,
+                        )
+                        add_raw_and_source_target_metrics(
+                            target_summary,
+                            matrix_raw=raw_block,
+                            matrix_norm=norm_block,
+                            source_indices=sequence_source_indices,
+                        )
+                        exact_position_mass = local_correspondence_band_mass(norm_block, cheb_dist, 0)
+                        source_index_exact_mass = (
+                            local_correspondence_band_mass(norm_block, source_cheb_dist, 0)
+                            if source_cheb_dist is not None
+                            else float("nan")
                         )
                         npz_rel = Path("npz") / f"{case['id']}__{transform}__layer{layer}.npz"
                         np.savez_compressed(
@@ -870,10 +1228,35 @@ def main() -> int:
                                 "image2_key_count": int(record.get("image2_key_count", len(image2_positions))),
                                 "scalar_query_chunk_size": int(record.get("scalar_query_chunk_size", 0)),
                                 "position_band_mass": local_correspondence_band_mass(norm_block, cheb_dist, args.band_radius),
+                                "exact_position_mass": exact_position_mass,
                                 "local_correspondence_band_mass": local_correspondence_band_mass(norm_block, cheb_dist, args.band_radius),
-                                "content_band_mass": local_correspondence_band_mass(norm_block, content_cheb_dist, args.band_radius),
+                                "content_band_mass": (
+                                    local_correspondence_band_mass(norm_block, content_cheb_dist, args.band_radius)
+                                    if content_cheb_dist is not None
+                                    else float("nan")
+                                ),
                                 "expected_position_distance": expected_distance_from_diagonal(norm_block, euclid_dist),
-                                "expected_content_distance": expected_distance_from_diagonal(norm_block, content_euclid_dist),
+                                "expected_content_distance": (
+                                    expected_distance_from_diagonal(norm_block, content_euclid_dist)
+                                    if content_euclid_dist is not None
+                                    else float("nan")
+                                ),
+                                "source_index_band_mass": (
+                                    local_correspondence_band_mass(norm_block, source_cheb_dist, args.band_radius)
+                                    if source_cheb_dist is not None
+                                    else float("nan")
+                                ),
+                                "source_index_exact_mass": source_index_exact_mass,
+                                "expected_source_index_distance": (
+                                    expected_distance_from_diagonal(norm_block, source_euclid_dist)
+                                    if source_euclid_dist is not None
+                                    else float("nan")
+                                ),
+                                "source_minus_position_exact_mass": (
+                                    source_index_exact_mass - exact_position_mass
+                                    if np.isfinite(source_index_exact_mass)
+                                    else float("nan")
+                                ),
                                 "expected_distance_from_diagonal": expected_distance_from_diagonal(norm_block, euclid_dist),
                                 "row_entropy": row_entropy(norm_block),
                                 "mean_image1_mass_raw": float(np.asarray(image1_mass_raw, dtype=np.float64).mean()),
@@ -912,10 +1295,15 @@ def main() -> int:
                                 "image2_key_count": int(record.get("image2_key_count", len(image2_positions))),
                                 "scalar_query_chunk_size": int(record.get("scalar_query_chunk_size", 0)),
                                 "position_band_mass": float("nan"),
+                                "exact_position_mass": float("nan"),
                                 "local_correspondence_band_mass": float("nan"),
                                 "content_band_mass": float("nan"),
                                 "expected_position_distance": float("nan"),
                                 "expected_content_distance": float("nan"),
+                                "source_index_band_mass": float("nan"),
+                                "source_index_exact_mass": float("nan"),
+                                "expected_source_index_distance": float("nan"),
+                                "source_minus_position_exact_mass": float("nan"),
                                 "expected_distance_from_diagonal": float("nan"),
                                 "row_entropy": float("nan"),
                                 "mean_image1_mass_raw": float(np.asarray(image1_mass_raw, dtype=np.float64).mean()),
@@ -937,6 +1325,11 @@ def main() -> int:
                                 "target_mass_norm_content_shifted_target_queries": float("nan"),
                                 "distractor_mass_norm_all_queries": float("nan"),
                                 "target_minus_distractor_mass": float("nan"),
+                                "target_mass_raw_all_queries": float("nan"),
+                                "target_mass_raw_target_position_queries": float("nan"),
+                                "source_target_query_token_indices": [],
+                                "target_mass_norm_source_target_queries": float("nan"),
+                                "target_mass_raw_source_target_queries": float("nan"),
                                 "distance_profile": [],
                                 "content_distance_profile": [],
                             }
@@ -959,6 +1352,7 @@ def main() -> int:
                 "distractor_box_xyxy": case.get("distractor_box_xyxy"),
                 "mode": args.mode,
                 "policy": args.policy,
+                "text_scope": args.text_scope,
                 "selected_layers": selected_layers,
                 "transforms": {
                     transform: {**transform_records[transform], "layers": layer_results[transform]}
@@ -979,18 +1373,22 @@ def main() -> int:
             )
     finally:
         tracer.restore()
+        sequence_roll.close()
 
     summary = {
         "manifest": str(Path(args.manifest).resolve()),
         "model_path": args.model_path,
         "mode": args.mode,
         "policy": args.policy,
+        "text_scope": args.text_scope,
+        "seed": int(args.seed),
         "attn_layers": args.attn_layers,
         "selected_layers": selected_layers,
         "transforms": args.transforms,
         "dump_mode": args.dump_mode,
         "scalar_raw_dump_limit": int(args.scalar_raw_dump_limit),
         "scalar_query_chunk_size": int(args.scalar_query_chunk_size),
+        "visual_sequence_raw_dump_limit": int(args.visual_sequence_raw_dump_limit),
         "band_radius": args.band_radius,
         "qwen_min_pixels": args.qwen_min_pixels,
         "qwen_max_pixels": args.qwen_max_pixels,

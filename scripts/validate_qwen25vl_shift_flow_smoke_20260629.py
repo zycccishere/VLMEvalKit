@@ -32,6 +32,8 @@ EXPECTED_SHIFT = {
         "dx_tokens": 1.0,
     },
 }
+VISUAL_SEQUENCE_ROLL_RIGHT_1 = "visual_sequence_roll_right_1"
+VISUAL_SEQUENCE_HOOK_NOOP = "visual_sequence_hook_noop"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-cases", type=int, default=0)
     parser.add_argument("--row-sum-atol", type=float, default=2e-3)
     parser.add_argument("--metric-atol", type=float, default=5e-3)
+    parser.add_argument(
+        "--expected-interventions",
+        nargs="*",
+        default=None,
+        help="Exact non-baseline intervention set. Defaults to the run summary for backward compatibility.",
+    )
+    parser.add_argument("--strict-contract", action="store_true")
+    parser.add_argument("--strict-logicvista100", action="store_true")
+    parser.add_argument("--require-visual-sequence-raw", action="store_true")
     parser.add_argument(
         "--require-target-box",
         action="store_true",
@@ -63,6 +74,13 @@ def add_check(checks: list[dict[str, Any]], failures: list[dict[str, Any]], name
 def is_finite_number(value: Any) -> bool:
     try:
         return bool(np.isfinite(float(value)))
+    except Exception:
+        return False
+
+
+def is_nan_number(value: Any) -> bool:
+    try:
+        return bool(np.isnan(float(value)))
     except Exception:
         return False
 
@@ -148,6 +166,18 @@ def scalar_mean_matches(observed: Any, values: np.ndarray, atol: float) -> bool:
     return metric_matches(observed, float(np.asarray(values, dtype=np.float64).mean()), atol)
 
 
+def correspondence_band_mass(matrix_norm: np.ndarray, cheb_dist: np.ndarray, radius: int) -> float:
+    mask = cheb_dist <= radius
+    return float(matrix_norm[mask].sum() / max(matrix_norm.shape[0], 1))
+
+
+def expected_normalized_distance(matrix_norm: np.ndarray, euclid_dist: np.ndarray) -> float:
+    max_dist = float(np.max(euclid_dist)) if euclid_dist.size else 0.0
+    if max_dist <= 0:
+        return 0.0
+    return float((matrix_norm * (euclid_dist / max_dist)).sum(axis=-1).mean())
+
+
 def validate(
     output_dir: Path,
     *,
@@ -156,13 +186,95 @@ def validate(
     metric_atol: float,
     require_target_box: bool,
     require_scalar_raw: bool,
+    expected_interventions: list[str] | None,
+    strict_contract: bool,
+    strict_logicvista100: bool,
+    require_visual_sequence_raw: bool,
 ) -> dict[str, Any]:
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     checks: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    raw_sequence_count = 0
+
+    if strict_contract:
+        add_check(checks, failures, "strict_expected_cases", expected_cases > 0, expected_cases)
+        add_check(
+            checks,
+            failures,
+            "strict_expected_interventions",
+            expected_interventions is not None and len(expected_interventions) > 0,
+            expected_interventions,
+        )
+    if strict_logicvista100:
+        canonical_interventions = {
+            "shift_right_half_vit_token",
+            "shift_right_one_vit_token",
+            "shift_right_one_llm_token",
+            VISUAL_SEQUENCE_ROLL_RIGHT_1,
+        }
+        add_check(
+            checks,
+            failures,
+            "logicvista100_exact_interventions",
+            expected_interventions is not None
+            and len(expected_interventions) == len(canonical_interventions)
+            and set(expected_interventions) == canonical_interventions,
+            expected_interventions,
+        )
+        add_check(
+            checks,
+            failures,
+            "logicvista100_model",
+            str(summary.get("model_path", "")).rstrip("/").endswith("/Qwen2.5-VL-32B-Instruct"),
+            summary.get("model_path"),
+        )
+        add_check(checks, failures, "logicvista100_seed", summary.get("seed") == 1234, summary.get("seed"))
+        add_check(
+            checks,
+            failures,
+            "logicvista100_last4",
+            summary.get("attn_layers") == "last4" and summary.get("selected_layers") == [60, 61, 62, 63],
+            {"attn_layers": summary.get("attn_layers"), "selected_layers": summary.get("selected_layers")},
+        )
+        add_check(
+            checks,
+            failures,
+            "logicvista100_dump_and_band",
+            summary.get("dump_mode") == "full" and summary.get("band_radius") == 1,
+            {"dump_mode": summary.get("dump_mode"), "band_radius": summary.get("band_radius")},
+        )
+        add_check(
+            checks,
+            failures,
+            "logicvista100_pixel_budget",
+            summary.get("qwen_min_pixels") == 1003520 and summary.get("qwen_max_pixels") == 12845056,
+            {
+                "qwen_min_pixels": summary.get("qwen_min_pixels"),
+                "qwen_max_pixels": summary.get("qwen_max_pixels"),
+            },
+        )
+        add_check(checks, failures, "strict_nonempty_cases", bool(summary.get("cases")), summary.get("case_count"))
+        add_check(
+            checks,
+            failures,
+            "strict_iqi_identity_contract",
+            summary.get("mode") == "image_text_image"
+            and summary.get("policy") == "identity"
+            and summary.get("text_scope") == "historical_all_non_image_non_special",
+            {
+                "mode": summary.get("mode"),
+                "policy": summary.get("policy"),
+                "text_scope": summary.get("text_scope"),
+            },
+        )
 
     if expected_cases:
         add_check(checks, failures, "case_count", summary.get("case_count") == expected_cases, summary.get("case_count"))
+
+    expected_non_baseline = list(
+        expected_interventions if expected_interventions is not None else summary.get("transforms", [])
+    )
+    expected_transform_set = {"baseline", *expected_non_baseline}
 
     for case in summary["cases"]:
         transforms = case["transforms"]
@@ -170,7 +282,7 @@ def validate(
             checks,
             failures,
             f"{case['case_id']} transform_set",
-            set(transforms) == {"baseline", *EXPECTED_SHIFT.keys()},
+            set(transforms) == expected_transform_set,
             sorted(transforms),
         )
         baseline_tokens = None
@@ -198,6 +310,22 @@ def validate(
                     {"baseline": baseline_tokens, "current": (image1_tokens, image2_tokens)},
                 )
             record = payload["transform_record"]
+            intervention = payload.get("intervention") or {}
+            sequence_record = intervention.get("visual_sequence_roll") or {}
+            is_sequence_roll = transform == VISUAL_SEQUENCE_ROLL_RIGHT_1
+            is_hook_noop = transform == VISUAL_SEQUENCE_HOOK_NOOP
+            attention_runtime = payload.get("attention_runtime_contract") or {}
+            if strict_contract:
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} attention_runtime_contract",
+                    bool(attention_runtime.get("effective_i2_causal_block_sha256"))
+                    and int(attention_runtime.get("effective_i2_causal_future_count", 0)) > 0
+                    and bool(attention_runtime.get("mrope_cos_sha256"))
+                    and bool(attention_runtime.get("mrope_sin_sha256")),
+                    attention_runtime,
+                )
             if transform == "baseline":
                 add_check(
                     checks,
@@ -206,7 +334,7 @@ def validate(
                     record.get("applied") is False,
                     record,
                 )
-            else:
+            elif transform in EXPECTED_SHIFT:
                 shift = record.get("shift") or {}
                 expected = EXPECTED_SHIFT[transform]
                 detail = {
@@ -238,6 +366,156 @@ def validate(
                     f"{case['case_id']} {transform} dx_tokens",
                     abs(float(meta.get("dx_tokens", -999.0)) - expected["dx_tokens"]) < 1e-8,
                     meta,
+                )
+            elif is_sequence_roll:
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} baseline_pixels",
+                    record.get("applied") is False,
+                    record,
+                )
+                sequence_detail = {
+                    "family": intervention.get("family"),
+                    "pixel_equivalent": intervention.get("pixel_equivalent"),
+                    "stage": sequence_record.get("stage"),
+                    "apply_count": sequence_record.get("apply_count"),
+                    "roll_tokens": sequence_record.get("roll_tokens"),
+                    "source_index_for_output": sequence_record.get("source_index_for_output"),
+                    "raw_npz_path": sequence_record.get("raw_npz_path"),
+                }
+                source_indices = [int(v) for v in sequence_record.get("source_index_for_output", [])]
+                expected_source = [image2_tokens - 1, *range(image2_tokens - 1)]
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} sequence_contract",
+                    intervention.get("family") == "visual_sequence_roll"
+                    and intervention.get("pixel_equivalent") is None
+                    and sequence_record.get("applied") is True
+                    and sequence_record.get("apply_count") == 1
+                    and sequence_record.get("stage") == "qwen_post_spatial_merger_pre_llm_injection"
+                    and sequence_record.get("roll_tokens") == 1
+                    and sequence_record.get("token_axis") == 1
+                    and sequence_record.get("exact_roll_verified") is True
+                    and sequence_record.get("image1_unchanged_exact") is True
+                    and sequence_record.get("image2_final_exact") is True
+                    and sequence_record.get("repeated_image_embeddings_exact") is True
+                    and sequence_record.get("visual_hook_count") == 1
+                    and sequence_record.get("language_injection_hook_count") == 1
+                    and sequence_record.get("llm_i1_injection_exact") is True
+                    and sequence_record.get("llm_i2_injection_exact") is True
+                    and sequence_record.get("llm_injection_dtype_exact") is True
+                    and sequence_record.get("llm_injection_shape_exact") is True
+                    and sequence_record.get("position_ids_sha256")
+                    and sequence_record.get("attention_mask_sha256")
+                    and sequence_record.get("image1_before_sha256") == sequence_record.get("image1_after_sha256")
+                    and intervention.get("matched_baseline_exact") is True
+                    and source_indices == expected_source,
+                    sequence_detail,
+                )
+                content_meta = payload.get("content_shift_meta") or {}
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} spatial_metrics_not_applicable",
+                    content_meta.get("mapping_kind") == "visual_sequence_index_roll"
+                    and content_meta.get("pixel_equivalent") is None
+                    and content_meta.get("spatial_content_metrics_valid") is False,
+                    content_meta,
+                )
+                raw_npz_rel = str(sequence_record.get("raw_npz_path") or "")
+                if raw_npz_rel:
+                    raw_sequence_count += 1
+                    raw_path = output_dir / raw_npz_rel
+                    raw = np.load(raw_path)
+                    i1_before = np.asarray(raw["image1_before"])
+                    i1_after = np.asarray(raw["image1_after"])
+                    i2_before = np.asarray(raw["image2_before"])
+                    i2_after = np.asarray(raw["image2_after"])
+                    injected_i1 = np.asarray(raw["llm_injected_image1"])
+                    injected_i2 = np.asarray(raw["llm_injected_image2"])
+                    raw_source = np.asarray(raw["source_index_for_output"], dtype=np.int64)
+                    raw_detail = {
+                        "path": str(raw_path),
+                        "i1_shape": list(i1_before.shape),
+                        "i2_shape": list(i2_before.shape),
+                        "source_head": raw_source[:8].tolist(),
+                        "source_tail": raw_source[-8:].tolist(),
+                    }
+                    add_check(
+                        checks,
+                        failures,
+                        f"{case['case_id']} {transform} raw_embedding_dump",
+                        i1_before.shape == i1_after.shape
+                        and i2_before.shape == i2_after.shape
+                        and i1_before.shape[0] == image1_tokens
+                        and i2_before.shape[0] == image2_tokens
+                        and np.array_equal(raw_source, np.asarray(expected_source, dtype=np.int64))
+                        and np.array_equal(i1_before, i1_after)
+                        and np.array_equal(i2_after, i2_before[raw_source])
+                        and np.array_equal(injected_i1, i1_after)
+                        and np.array_equal(injected_i2, i2_after),
+                        raw_detail,
+                    )
+                baseline_payload = transforms.get(VISUAL_SEQUENCE_HOOK_NOOP) or transforms.get("baseline")
+                baseline_sequence = (
+                    (baseline_payload.get("intervention") or {}).get("visual_sequence_roll") or {}
+                    if baseline_payload
+                    else {}
+                )
+                runtime_fields = [
+                    "image1_before_sha256",
+                    "image2_before_sha256",
+                    "qwen_grid_thw",
+                    "image_token_counts",
+                    "position_ids_sha256",
+                    "position_ids_shape",
+                    "position_ids_dtype",
+                    "attention_mask_sha256",
+                    "attention_mask_shape",
+                    "attention_mask_dtype",
+                    "llm_non_i2_sha256",
+                    "llm_non_i2_shape",
+                    "llm_non_i2_dtype",
+                ]
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} independent_baseline_match",
+                    bool(baseline_payload)
+                    and payload.get("prompt_text") == baseline_payload.get("prompt_text")
+                    and payload.get("model_input_fingerprint") == baseline_payload.get("model_input_fingerprint")
+                    and payload.get("attention_runtime_contract") == baseline_payload.get("attention_runtime_contract")
+                    and all(sequence_record.get(field) == baseline_sequence.get(field) for field in runtime_fields),
+                    {"runtime_fields": runtime_fields, "baseline_transform": VISUAL_SEQUENCE_HOOK_NOOP if VISUAL_SEQUENCE_HOOK_NOOP in transforms else "baseline"},
+                )
+            elif is_hook_noop:
+                baseline_payload = transforms.get("baseline") or {}
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} matched_noop_contract",
+                    record.get("applied") is False
+                    and intervention.get("family") == "visual_sequence_control"
+                    and intervention.get("matched_baseline_exact") is True
+                    and sequence_record.get("applied") is False
+                    and sequence_record.get("apply_count") == 0
+                    and sequence_record.get("visual_hook_count") == 1
+                    and sequence_record.get("language_injection_hook_count") == 1
+                    and sequence_record.get("llm_i1_injection_exact") is True
+                    and sequence_record.get("llm_i2_injection_exact") is True
+                    and payload.get("model_input_fingerprint") == baseline_payload.get("model_input_fingerprint")
+                    and payload.get("attention_runtime_contract") == baseline_payload.get("attention_runtime_contract"),
+                    sequence_record,
+                )
+            else:
+                add_check(
+                    checks,
+                    failures,
+                    f"{case['case_id']} {transform} recognized_intervention",
+                    False,
+                    sorted([*EXPECTED_SHIFT, VISUAL_SEQUENCE_ROLL_RIGHT_1, VISUAL_SEQUENCE_HOOK_NOOP]),
                 )
             for layer in payload["layers"]:
                 layer_name = f"{case['case_id']} {transform} L{layer['layer']}"
@@ -397,6 +675,89 @@ def validate(
                     and np.isfinite(image1_mass).all()
                 )
                 add_check(checks, failures, f"{layer_name} finite", bool(finite), str(npz_path))
+                if is_hook_noop:
+                    baseline_layers = {
+                        int(item["layer"]): item for item in transforms["baseline"]["layers"]
+                    }
+                    baseline_layer = baseline_layers.get(int(layer["layer"]))
+                    baseline_npz = (
+                        np.load(output_dir / baseline_layer["npz_path"])
+                        if baseline_layer and baseline_layer.get("npz_path")
+                        else None
+                    )
+                    compared_arrays = [
+                        "matrix_raw",
+                        "matrix_norm",
+                        "image2_block_raw",
+                        "image1_mass_raw",
+                        "text_mass_raw",
+                        "image2_mass_raw",
+                    ]
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} unhooked_vs_hook_noop_raw_exact",
+                        baseline_npz is not None
+                        and all(np.array_equal(data[name], baseline_npz[name]) for name in compared_arrays),
+                        {"arrays": compared_arrays},
+                    )
+                if is_sequence_roll:
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} sequence_spatial_content_metrics_nan",
+                        is_nan_number(layer.get("content_band_mass"))
+                        and is_nan_number(layer.get("expected_content_distance"))
+                        and not layer.get("content_distance_profile"),
+                        {
+                            "content_band_mass": layer.get("content_band_mass"),
+                            "expected_content_distance": layer.get("expected_content_distance"),
+                            "content_distance_profile": layer.get("content_distance_profile"),
+                        },
+                    )
+                    source = np.asarray(source_indices, dtype=np.int64)
+                    key_rows = np.asarray(data["key_rows"], dtype=np.int64)
+                    key_cols = np.asarray(data["key_cols"], dtype=np.int64)
+                    source_rows = key_rows[source]
+                    source_cols = key_cols[source]
+                    cheb = np.maximum(
+                        np.abs(source_rows[:, None] - key_rows[None, :]),
+                        np.abs(source_cols[:, None] - key_cols[None, :]),
+                    )
+                    euclid = np.sqrt(
+                        (source_rows[:, None] - key_rows[None, :]) ** 2
+                        + (source_cols[:, None] - key_cols[None, :]) ** 2
+                    )
+                    exact_position = float(np.diag(matrix_norm).sum() / max(matrix_norm.shape[0], 1))
+                    exact_source = correspondence_band_mass(matrix_norm, cheb, 0)
+                    source_detail = {
+                        "source_index_band_mass": layer.get("source_index_band_mass"),
+                        "source_index_exact_mass": layer.get("source_index_exact_mass"),
+                        "expected_source_index_distance": layer.get("expected_source_index_distance"),
+                        "source_minus_position_exact_mass": layer.get("source_minus_position_exact_mass"),
+                    }
+                    add_check(
+                        checks,
+                        failures,
+                        f"{layer_name} source_index_metrics_recomputed",
+                        metric_matches(
+                            layer.get("source_index_band_mass"),
+                            correspondence_band_mass(matrix_norm, cheb, int(summary.get("band_radius", 1))),
+                            metric_atol,
+                        )
+                        and metric_matches(layer.get("source_index_exact_mass"), exact_source, metric_atol)
+                        and metric_matches(
+                            layer.get("expected_source_index_distance"),
+                            expected_normalized_distance(matrix_norm, euclid),
+                            metric_atol,
+                        )
+                        and metric_matches(
+                            layer.get("source_minus_position_exact_mass"),
+                            exact_source - exact_position,
+                            metric_atol,
+                        ),
+                        source_detail,
+                    )
                 if require_target_box or case.get("target_box_xyxy"):
                     target_keys = layer.get("target_key_token_indices", [])
                     target_queries = layer.get("target_query_token_indices", [])
@@ -417,12 +778,13 @@ def validate(
                             grid=payload["image2_grid"],
                             bbox_xyxy=[int(v) for v in target_box],
                         )
-                        expected_shifted_queries = content_shifted_bbox_token_indices(
-                            image_size=image_size,
-                            grid=payload["image2_grid"],
-                            bbox_xyxy=[int(v) for v in target_box],
-                            transform_record=record,
-                        )
+                        if not is_sequence_roll:
+                            expected_shifted_queries = content_shifted_bbox_token_indices(
+                                image_size=image_size,
+                                grid=payload["image2_grid"],
+                                bbox_xyxy=[int(v) for v in target_box],
+                                transform_record=record,
+                            )
                     recomputed_all = mean_target_mass(matrix_norm, None, [int(v) for v in target_keys])
                     recomputed_target = mean_target_mass(
                         matrix_norm, [int(v) for v in target_queries], [int(v) for v in target_keys]
@@ -470,8 +832,9 @@ def validate(
                     add_check(
                         checks,
                         failures,
-                        f"{layer_name} content_shifted_target_query_nonempty",
-                        len(shifted_queries) > 0,
+                        f"{layer_name} content_shifted_target_query_semantics",
+                        (not is_sequence_roll and len(shifted_queries) > 0)
+                        or (is_sequence_roll and len(shifted_queries) == 0),
                         target_detail,
                     )
                     add_check(
@@ -480,7 +843,11 @@ def validate(
                         f"{layer_name} target_metrics_finite",
                         is_finite_number(layer.get("target_mass_norm_all_queries"))
                         and is_finite_number(layer.get("target_mass_norm_target_queries"))
-                        and is_finite_number(layer.get("target_mass_norm_content_shifted_target_queries")),
+                        and (
+                            is_finite_number(layer.get("target_mass_norm_content_shifted_target_queries"))
+                            if not is_sequence_roll
+                            else is_nan_number(layer.get("target_mass_norm_content_shifted_target_queries"))
+                        ),
                         target_detail,
                     )
                     add_check(
@@ -507,13 +874,26 @@ def validate(
                         f"{layer_name} target_metrics_match_npz",
                         metric_matches(layer.get("target_mass_norm_all_queries"), recomputed_all, metric_atol)
                         and metric_matches(layer.get("target_mass_norm_target_queries"), recomputed_target, metric_atol)
-                        and metric_matches(
-                            layer.get("target_mass_norm_content_shifted_target_queries"),
-                            recomputed_shifted,
-                            metric_atol,
+                        and (
+                            metric_matches(
+                                layer.get("target_mass_norm_content_shifted_target_queries"),
+                                recomputed_shifted,
+                                metric_atol,
+                            )
+                            if not is_sequence_roll
+                            else is_nan_number(layer.get("target_mass_norm_content_shifted_target_queries"))
                         ),
                         target_detail,
                     )
+
+    if require_visual_sequence_raw:
+        add_check(
+            checks,
+            failures,
+            "visual_sequence_raw_present",
+            raw_sequence_count > 0,
+            raw_sequence_count,
+        )
 
     return {
         "ok": not failures,
@@ -534,6 +914,10 @@ def main() -> int:
         metric_atol=args.metric_atol,
         require_target_box=args.require_target_box,
         require_scalar_raw=args.require_scalar_raw,
+        expected_interventions=args.expected_interventions,
+        strict_contract=args.strict_contract,
+        strict_logicvista100=args.strict_logicvista100,
+        require_visual_sequence_raw=args.require_visual_sequence_raw,
     )
     (output_dir / "smoke_validation.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",

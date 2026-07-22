@@ -17,9 +17,14 @@ METRIC_COLUMNS = [
     "mass_total_mean",
     "mass_total_max",
     "position_band_mass",
+    "exact_position_mass",
     "content_band_mass",
+    "source_index_band_mass",
+    "source_index_exact_mass",
+    "source_minus_position_exact_mass",
     "expected_position_distance",
     "expected_content_distance",
+    "expected_source_index_distance",
     "row_entropy",
     "i2_total_self_mass_raw",
     "i2_past_self_mass_raw",
@@ -31,6 +36,10 @@ METRIC_COLUMNS = [
     "target_mass_norm_content_shifted_target_queries",
     "distractor_mass_norm_all_queries",
     "target_minus_distractor_mass",
+    "target_mass_raw_all_queries",
+    "target_mass_raw_target_position_queries",
+    "target_mass_norm_source_target_queries",
+    "target_mass_raw_source_target_queries",
 ]
 
 
@@ -62,6 +71,7 @@ def flatten_rows(input_dir: Path, summary: dict[str, Any]) -> list[dict[str, Any
     for case in summary.get("cases", []):
         for transform, transform_payload in case.get("transforms", {}).items():
             shift = (transform_payload.get("transform_record") or {}).get("shift") or {}
+            intervention = transform_payload.get("intervention") or {}
             for layer_payload in transform_payload.get("layers", []):
                 row: dict[str, Any] = {
                     "input_dir": str(input_dir),
@@ -78,6 +88,9 @@ def flatten_rows(input_dir: Path, summary: dict[str, Any]) -> list[dict[str, Any
                     "mode": case.get("mode"),
                     "policy": case.get("policy"),
                     "transform": transform,
+                    "intervention_family": intervention.get("family", "pixel_translation" if transform != "baseline" else "baseline"),
+                    "paper_name": intervention.get("paper_name", transform),
+                    "pixel_equivalent": finite_float(intervention.get("pixel_equivalent")),
                     "layer": int(layer_payload["layer"]),
                     "dump_mode": layer_payload.get("dump_mode", summary.get("dump_mode", "full")),
                     "npz_path": (
@@ -95,9 +108,9 @@ def flatten_rows(input_dir: Path, summary: dict[str, Any]) -> list[dict[str, Any
                     "text_key_count": int(layer_payload.get("text_key_count", 0) or 0),
                     "image2_key_count": int(layer_payload.get("image2_key_count", 0) or 0),
                     "scalar_query_chunk_size": int(layer_payload.get("scalar_query_chunk_size", 0) or 0),
-                    "processed_shift_pixels": finite_float(shift.get("processed_shift_pixels", 0.0)),
-                    "dx": finite_float(shift.get("dx", 0.0)),
-                    "dy": finite_float(shift.get("dy", 0.0)),
+                    "processed_shift_pixels": finite_float(shift.get("processed_shift_pixels")),
+                    "dx": finite_float(shift.get("dx")),
+                    "dy": finite_float(shift.get("dy")),
                     "semantic_unit": shift.get("semantic_unit", ""),
                     "pixel_shift_kind": shift.get("pixel_shift_kind", ""),
                 }
@@ -107,6 +120,9 @@ def flatten_rows(input_dir: Path, summary: dict[str, Any]) -> list[dict[str, Any
                 row["target_query_token_count"] = len(layer_payload.get("target_query_token_indices", []))
                 row["content_shifted_target_query_token_count"] = len(
                     layer_payload.get("content_shifted_target_query_token_indices", [])
+                )
+                row["source_target_query_token_count"] = len(
+                    layer_payload.get("source_target_query_token_indices", [])
                 )
                 rows.append(row)
     return rows
