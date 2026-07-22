@@ -7,6 +7,7 @@ MODEL_PATH=${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-32B-Instruct}
 PYTHON_BIN=${PYTHON_BIN:-python}
 PYDEPS=${PYDEPS:-}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
+EXPECTED_GPUS=${EXPECTED_GPUS:-0,1,2,3,4,5,6,7}
 ATTN_LAYERS=${ATTN_LAYERS:-last4}
 MODE=${MODE:-image_text_image}
 POLICY=${POLICY:-identity}
@@ -26,7 +27,10 @@ if [[ "${STRICT_LOGICVISTA100}" == "1" ]]; then
     exit 2
   }
   [[ "${MODEL_PATH}" == */Qwen2.5-VL-32B-Instruct ]] || { echo "Strict run requires Qwen2.5-VL-32B-Instruct" >&2; exit 2; }
-  [[ "${GPUS}" == "0,1,2,3,4,5,6,7" ]] || { echo "Strict run requires GPUs 0-7" >&2; exit 2; }
+  [[ "${GPUS}" == "${EXPECTED_GPUS}" ]] || {
+    echo "Strict run requires the explicitly pinned GPU set ${EXPECTED_GPUS}" >&2
+    exit 2
+  }
   [[ "${ATTN_LAYERS}" == "last4" && "${MODE}" == "image_text_image" && "${POLICY}" == "identity" ]] || {
     echo "Strict run requires last4, IQI, identity" >&2
     exit 2
