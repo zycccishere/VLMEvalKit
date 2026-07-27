@@ -28,6 +28,10 @@ TOKEN_UNIT_IMAGE_TRANSFORMS = {
     f"shift_{direction}_one_llm_token"
     for direction in SHIFT_DIRECTIONS
 }
+FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS = {
+    f"shift_{direction}_fixed_28px"
+    for direction in SHIFT_DIRECTIONS
+}
 IMAGE_TRANSFORM_ALIASES = {
     f"shift_{direction}_vit_token": f"shift_{direction}_one_vit_token"
     for direction in SHIFT_DIRECTIONS
@@ -113,6 +117,7 @@ SUPPORTED_IMAGE_TRANSFORMS = {
     "shift_left_real_half_patch_wrap",
     "shift_right_real_half_patch_wrap",
     *PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS,
+    *FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS,
     "zoom_1p5_uncropped",
 }
 
@@ -509,6 +514,39 @@ def _processed_token_shift_spec(transform: str, *, profile: dict[str, Any]) -> d
     }
 
 
+def _fixed_processed_pixel_shift_spec(transform: str) -> dict[str, Any] | None:
+    parts = transform.split("_")
+    if len(parts) != 4 or parts[0] != "shift" or parts[2:] != ["fixed", "28px"]:
+        return None
+    direction = parts[1]
+    if direction not in SHIFT_DIRECTIONS:
+        return None
+    dx = 0
+    dy = 0
+    if direction == "up":
+        dy = -28
+    elif direction == "down":
+        dy = 28
+    elif direction == "left":
+        dx = -28
+    else:
+        dx = 28
+    return {
+        "direction": direction,
+        "magnitude_name": "28px",
+        "semantic_unit": "fixed_processed_pixels",
+        "transform_unit_name": "fixed_28px",
+        "legacy_vit_patch_name": False,
+        "pixel_shift_kind": "processed_fixed_pixels",
+        "base_pixels": 28,
+        "fraction": 1.0,
+        "vit_patch_fraction": None,
+        "processed_shift_pixels": 28,
+        "dx": dx,
+        "dy": dy,
+    }
+
+
 def _wrap_border_verified(original: Image.Image, transformed: Image.Image, *, dx: int, dy: int) -> bool:
     source = np.asarray(original.convert("RGB"))
     shifted = np.asarray(transformed.convert("RGB"))
@@ -620,8 +658,11 @@ def apply_image_transform_to_content(
                 (max(1, round(width * 1.5)), max(1, round(height * 1.5))),
                 resample=Image.Resampling.BICUBIC,
             )
-    elif transform in PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS:
-        shift_spec = _processed_token_shift_spec(transform, profile=profile)
+    elif transform in PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS | FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS:
+        if transform in FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS:
+            shift_spec = _fixed_processed_pixel_shift_spec(transform)
+        else:
+            shift_spec = _processed_token_shift_spec(transform, profile=profile)
         if shift_spec is None:
             raise ValueError(f"Unsupported processed token shift transform: {transform}")
         processed_image, process_info = _resize_to_profile_processed_size(
