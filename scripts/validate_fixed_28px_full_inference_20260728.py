@@ -113,7 +113,10 @@ def main() -> int:
                 continue
             manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
             prediction_file = Path(manifest.get("prediction_file", ""))
-            frame = pd.read_excel(prediction_file)
+            # OCR/VQA models may legitimately answer with the literal string
+            # "None". Preserve strings instead of letting pandas coerce them
+            # into missing values.
+            frame = pd.read_excel(prediction_file, keep_default_na=False)
             expected_rows = int(manifest.get("expected_rows", -1))
             outputs = nonblank_outputs(frame)
             index_values = frame["index"].astype(str).tolist() if "index" in frame.columns else []
