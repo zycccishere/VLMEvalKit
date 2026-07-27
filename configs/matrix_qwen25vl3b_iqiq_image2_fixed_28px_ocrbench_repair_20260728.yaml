@@ -1,0 +1,51 @@
+name: qwen25vl3b_iqiq_image2_fixed_28px_ocrbench_repair_20260728
+repo_root: "{repo_root}"
+results_root: runs/qwen25vl3b_iqiq_image2_fixed_28px_ocrbench_repair_20260728
+node_gpu_ids: "7"
+scheduler: gpu_pool
+datasets:
+  - OCRBench
+dataset_index_allowlists:
+  OCRBench: "{repo_root}/configs/index_allowlists/fixed_28px_repair_ocrbench_785_20260728.txt"
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text_image_text
+image_transforms:
+  - shift_right_fixed_28px
+models:
+  - qwen25vl_3b
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  strict_batch: 1
+  stage_debug: 1
+  stage_debug_samples: 1
+  prompt_audit: 1
+  prompt_audit_print: 1
+  image_transform_strict: 1
+trace:
+  level: full
+  samples: 1
+  dump_max_chars: 24000
+  prompt_audit_print: 1
+answer_format:
+  enable: 0
+  require_boxed: 0
+  response_col: prediction
+  fallback_col: detailed_prediction
+  max_fails: 50
+evaluation:
+  launch_mode: skip
+  nproc: 1
+  judge: gpt-4o-mini
+worker_monitor:
+  enable: true
+  interval_seconds: 30
+resume_infer_default: false
+resume_infer_start_delay_seconds: 0
