@@ -16,6 +16,46 @@ from ..smp import load, dump, d2df, toliststr
 from ..smp.file import get_intermediate_file_path
 
 
+def _embedded_choice_labels(question):
+    text = str(question or '')
+    markers = re.findall(r'(?:^|\n)\s*\(?([A-Z])\)?[\.)\:]\s*', text)
+    if not markers:
+        markers = re.findall(r'\(([A-Z])\)', text)
+    found = set(markers)
+    labels = []
+    for code in range(ord('A'), ord('Z') + 1):
+        label = chr(code)
+        if label not in found:
+            break
+        labels.append(label)
+    return labels
+
+
+def _format_choice_option_examples(labels):
+    labels = list(labels) or list('ABCD')
+    quoted = [f"'{label}'" for label in labels]
+    if len(quoted) == 1:
+        return quoted[0]
+    if len(quoted) == 2:
+        return f'{quoted[0]} or {quoted[1]}'
+    return f"{', '.join(quoted[:-1])}, or {quoted[-1]}"
+
+
+def _choice_option_examples(question):
+    labels = _embedded_choice_labels(question) or list('ABCD')
+    return _format_choice_option_examples(labels)
+
+
+def _multiple_choice_instruction(question, directly_answer=False):
+    choice_examples = _choice_option_examples(question)
+    if directly_answer:
+        return f'Answer with only the corresponding choice option, such as {choice_examples}.'
+    return (
+        "Provide the corresponing choice option in the 'short answer' key, "
+        f'such as {choice_examples}.'
+    )
+
+
 def preprocess(str1):
     str1 = str(str1).strip()
     str1 = str1.replace("\\n", "\n")
@@ -291,7 +331,7 @@ Example of expected JSON response format:
 
         prompt = f"## Question\n {line['question']}"
         if line['answer_type'] == 'multiple choice':
-            inst = "Provide the corresponing choice option in the 'short answer' key, such as 'A', 'B', 'C', or 'D'."
+            inst = _multiple_choice_instruction(line['question'])
         elif line['answer_type'] == 'float':
             inst = "Format the answer as a three-digit floating-point number and provide it in the 'short answer' key."
         else:
@@ -302,7 +342,8 @@ Example of expected JSON response format:
             # This keeps dataset prompt compatible with global answer-only templating.
             if os.environ.get('REPLAY_PROMPT_TEMPLATE_NAME', '').strip().lower() == 'directly_answer':
                 if line['answer_type'] == 'multiple choice':
-                    direct_inst = "Answer with only the corresponding choice option, such as 'A', 'B', 'C', or 'D'."
+                    direct_inst = _multiple_choice_instruction(
+                        line['question'], directly_answer=True)
                 elif line['answer_type'] == 'float':
                     direct_inst = "Answer with only a three-digit floating-point number."
                 else:

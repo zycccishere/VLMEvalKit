@@ -18,6 +18,7 @@ GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-30}"
 IFS=',' read -r -a GPU_ARRAY <<<"${GPU_IDS}"
 NUM_SHARDS="${#GPU_ARRAY[@]}"
 MANIFEST="${OUT_ROOT}/manifest.json"
+RUNTIME_ATTESTATION="${OUT_ROOT}/runtime_attestation.json"
 
 export PYTHONPATH="${ROOT}"
 export PYTHONNOUSERSITE=1
@@ -42,6 +43,15 @@ mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/predictions" "${OUT_ROOT}/smoke/raw" "$
   --matrix-config "${MATRIX_CONFIG}" \
   --num-shards "${NUM_SHARDS}"
 
+"${PYTHON_BIN}" -m vlmeval.probes.step8_readout_v2 attest-runtime \
+  --repo-root "${ROOT}" \
+  --manifest "${MANIFEST}" \
+  --output "${RUNTIME_ATTESTATION}" \
+  --datasets "${DATASETS}" \
+  --model-path "${MODEL_PATH}" \
+  --lmu-data "${LMU_DATA}" \
+  --matrix-config "${MATRIX_CONFIG}"
+
 if [[ "${SKIP_SMOKE}" != "1" ]]; then
   if [[ "${RESUME}" != "1" ]]; then
     rm -rf "${OUT_ROOT}/smoke"
@@ -53,6 +63,7 @@ if [[ "${SKIP_SMOKE}" != "1" ]]; then
     --manifest "${MANIFEST}" \
     --output-jsonl "${OUT_ROOT}/smoke/smoke.jsonl" \
     --runtime-root "${OUT_ROOT}/runtime/smoke" \
+    --runtime-attestation "${RUNTIME_ATTESTATION}" \
     --datasets "${DATASETS}" \
     --model-path "${MODEL_PATH}" \
     --lmu-data "${LMU_DATA}" \
@@ -64,6 +75,8 @@ if [[ "${SKIP_SMOKE}" != "1" ]]; then
 
   "${PYTHON_BIN}" -m vlmeval.probes.step8_readout_v2 validate-smoke \
     --raw-root "${OUT_ROOT}/smoke/raw" \
+    --manifest "${MANIFEST}" \
+    --smoke-jsonl "${OUT_ROOT}/smoke/smoke.jsonl" \
     --datasets "${DATASETS}" \
     --output "${OUT_ROOT}/smoke/validation.json"
 fi
@@ -101,6 +114,7 @@ for rank in "${!GPU_ARRAY[@]}"; do
       --manifest "${MANIFEST}" \
       --output-jsonl "${OUT_ROOT}/predictions/shard${rank}.jsonl" \
       --runtime-root "${OUT_ROOT}/runtime/shard${rank}" \
+      --runtime-attestation "${RUNTIME_ATTESTATION}" \
       --datasets "${DATASETS}" \
       --model-path "${MODEL_PATH}" \
       --lmu-data "${LMU_DATA}" \
