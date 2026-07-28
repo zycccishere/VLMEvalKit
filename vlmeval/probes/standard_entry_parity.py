@@ -264,9 +264,25 @@ def write_probe_matrix(repo_root: Path, matrix_path: Path, result_root: Path, mo
     matrix_path.write_text(yaml.safe_dump(matrix, sort_keys=False), encoding="utf-8")
 
 
-def runtime_env(repo_root: Path, output_root: Path, model_key: str, dataset: str, mode: str, policy: str, gpu_id: str, model_path_override: str = "", lmu_data: str = "") -> tuple[dict[str, str], Any, Any]:
-    matrix_path = output_root / "_tmp" / f"matrix_{model_key}_{dataset}_{mode}_{policy}.yaml"
-    write_probe_matrix(repo_root, matrix_path, output_root / "_runner_results", model_key, dataset, mode, policy)
+def runtime_env(
+    repo_root: Path,
+    output_root: Path,
+    model_key: str,
+    dataset: str,
+    mode: str,
+    policy: str,
+    gpu_id: str,
+    model_path_override: str = "",
+    lmu_data: str = "",
+    matrix_config: str | Path = "",
+) -> tuple[dict[str, str], Any, Any]:
+    if matrix_config:
+        matrix_path = Path(matrix_config).resolve()
+        if not matrix_path.is_file():
+            raise FileNotFoundError(f"matrix config not found: {matrix_path}")
+    else:
+        matrix_path = output_root / "_tmp" / f"matrix_{model_key}_{dataset}_{mode}_{policy}.yaml"
+        write_probe_matrix(repo_root, matrix_path, output_root / "_runner_results", model_key, dataset, mode, policy)
     sys.path.insert(0, str(repo_root))
     from vlmeval.cli.run_benchmark import BenchmarkRunner
 
