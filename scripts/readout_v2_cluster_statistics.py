@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import random
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -27,6 +28,45 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle, delimiter="\t"))
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def aggregate_file_hashes(paths: list[Path]) -> tuple[str, dict[str, str]]:
+    aggregate = hashlib.sha256()
+    file_hashes: dict[str, str] = {}
+    for path in paths:
+        digest = sha256_file(path)
+        file_hashes[path.name] = digest
+        aggregate.update(path.name.encode())
+        aggregate.update(b"\0")
+        aggregate.update(digest.encode())
+        aggregate.update(b"\n")
+    return aggregate.hexdigest(), file_hashes
+
+
+def git_provenance(repo_root: Path) -> dict[str, str]:
+    def git(*args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(repo_root), *args],
+            text=True,
+        ).strip()
+
+    status = git("status", "--short")
+    if status:
+        raise ValueError(f"Analysis repository must be clean; status={status!r}")
+    return {
+        "head": git("rev-parse", "HEAD"),
+        "tree": git("rev-parse", "HEAD^{tree}"),
+        "branch": git("branch", "--show-current"),
+        "status_short": status,
+    }
+
+
 def percentile(sorted_values: list[float], probability: float) -> float:
     position = probability * (len(sorted_values) - 1)
     lower = math.floor(position)
@@ -35,6 +75,14 @@ def percentile(sorted_values: list[float], probability: float) -> float:
         return sorted_values[lower]
     weight = position - lower
     return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def pooled_cluster_mean(cluster_sums_and_sizes: list[tuple[int, int]]) -> float:
+    delta_sum = sum(cluster_sum for cluster_sum, _ in cluster_sums_and_sizes)
+    row_count = sum(cluster_size for _, cluster_size in cluster_sums_and_sizes)
+    if row_count == 0:
+        raise ValueError("Cannot compute a pooled mean over zero rows")
+    return delta_sum / row_count
 
 
 def bootstrap_cluster_mean(
@@ -76,13 +124,42 @@ def dataset_seed(seed: int, dataset: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
+def resolve_cluster(
+    dataset: str,
+    record: dict,
+    source_rows: dict[str, list[dict[str, str]]],
+) -> str:
+    _, cluster_key = CLUSTER_SPECS[dataset]
+    position = record["row_position"]
+    if cluster_key == "row_position":
+        return str(position)
+
+    rows = source_rows[dataset]
+    if not 0 <= position < len(rows):
+        raise ValueError(f"{dataset} row_position out of range: {position}")
+    source_row = rows[position]
+    source_index = str(source_row.get("index", "")).strip()
+    manifest_index = str(record["sample_index"]).strip()
+    if source_index != manifest_index:
+        raise ValueError(
+            f"{dataset} row join mismatch at position {position}: "
+            f"TSV index={source_index!r}, manifest sample_index={manifest_index!r}"
+        )
+    cluster = str(source_row.get(cluster_key, "")).strip()
+    if not cluster:
+        raise ValueError(
+            f"{dataset} has an empty {cluster_key!r} at row_position {position}"
+        )
+    return cluster
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--predictions-dir", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--resamples", type=int, default=20_000)
+    parser.add_argument("--resamples", type=int, default=100_000)
     parser.add_argument("--seed", type=int, default=20_260_728)
     args = parser.parse_args()
 
@@ -94,8 +171,11 @@ def main() -> None:
     if len(records) != len(manifest["records"]):
         raise ValueError("Manifest contains duplicate dataset/row_position keys")
 
+    prediction_paths = sorted(args.predictions_dir.glob("shard*.jsonl"))
+    if not prediction_paths:
+        raise ValueError(f"No prediction shards found in {args.predictions_dir}")
     predictions: dict[tuple[str, int], dict] = {}
-    for path in sorted(args.predictions_dir.glob("shard*.jsonl")):
+    for path in prediction_paths:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
                 prediction = json.loads(line)
@@ -107,11 +187,25 @@ def main() -> None:
         missing = sorted(records.keys() - predictions.keys())[:10]
         unexpected = sorted(predictions.keys() - records.keys())[:10]
         raise ValueError(f"Prediction key mismatch: missing={missing}, unexpected={unexpected}")
+    for key, prediction in predictions.items():
+        record = records[key]
+        if str(prediction["sample_index"]).strip() != str(record["sample_index"]).strip():
+            raise ValueError(f"Prediction sample_index mismatch for {key}")
+        if prediction["answer_key"] != record["answer_key"]:
+            raise ValueError(f"Prediction answer_key mismatch for {key}")
 
     source_rows: dict[str, list[dict[str, str]]] = {}
+    source_paths: dict[str, Path] = {}
     for dataset, (filename, _) in CLUSTER_SPECS.items():
         if filename is not None:
-            source_rows[dataset] = read_tsv(args.data_root / filename)
+            source_path = args.data_root / filename
+            source_paths[dataset] = source_path
+            source_rows[dataset] = read_tsv(source_path)
+
+    prediction_aggregate_sha256, prediction_shard_hashes = aggregate_file_hashes(
+        prediction_paths
+    )
+    repo_root = Path(__file__).resolve().parents[1]
 
     output = {
         "schema": "topic-image-replay/readout-v2-cluster-statistics/v1",
@@ -132,11 +226,19 @@ def main() -> None:
         },
         "provenance": {
             "records_sha256": manifest["records_sha256"],
+            "manifest_file_sha256": sha256_file(args.manifest),
             "implementation_sha256": manifest["implementation_sha256"],
             "repo_head": manifest["repo_snapshot"]["head"],
             "analysis_script_sha256": hashlib.sha256(
                 Path(__file__).read_bytes()
             ).hexdigest(),
+            "analysis_git": git_provenance(repo_root),
+            "source_tsv_sha256": {
+                dataset: sha256_file(path)
+                for dataset, path in sorted(source_paths.items())
+            },
+            "prediction_aggregate_sha256": prediction_aggregate_sha256,
+            "prediction_shard_sha256": prediction_shard_hashes,
         },
         "datasets": {},
     }
@@ -158,10 +260,8 @@ def main() -> None:
         lost = 0
         for prediction in dataset_predictions:
             position = prediction["row_position"]
-            if cluster_key == "row_position":
-                cluster = str(position)
-            else:
-                cluster = source_rows[dataset][position][cluster_key]
+            record = records[(dataset, position)]
+            cluster = resolve_cluster(dataset, record, source_rows)
             baseline = int(prediction["conditions"]["baseline"]["hit"])
             readout = int(prediction["conditions"]["readout_v2"]["hit"])
             full = int(prediction["conditions"]["full"]["hit"])
@@ -186,6 +286,13 @@ def main() -> None:
         baseline_accuracy = baseline_hits / row_count
         readout_accuracy = readout_hits / row_count
         full_accuracy = full_hits / row_count
+        clustered_delta = pooled_cluster_mean(cluster_sums_and_sizes)
+        if not math.isclose(
+            clustered_delta,
+            readout_accuracy - baseline_accuracy,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(f"Cluster aggregation changed the point estimate for {dataset}")
         full_gap = full_accuracy - baseline_accuracy
         group_size_histogram = Counter(
             len(differences) for differences in by_cluster.values()
