@@ -196,6 +196,17 @@ def checkpoint_file_stats(model_path: str) -> list[dict[str, Any]]:
     ]
 
 
+def checkpoint_identity_with_stable_stats(
+    model_path: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    stats_before = checkpoint_file_stats(model_path)
+    identity = checkpoint_identity(model_path)
+    stats_after = checkpoint_file_stats(model_path)
+    if stats_before != stats_after:
+        raise RuntimeError("Checkpoint files changed during full runtime attestation")
+    return identity, stats_after
+
+
 def verify_checkpoint_identity_quick(model_path: str, identity: dict[str, Any]) -> None:
     root, base, files = checkpoint_files(model_path)
     if str(root) != identity["resolved_path"]:
@@ -1411,7 +1422,7 @@ def make_runtime_attestation(args: argparse.Namespace) -> dict[str, Any]:
         require_attestation=False,
     )
     runtime_model_path = args.model_path or manifest["model_identity"]["resolved_path"]
-    current_identity = checkpoint_identity(runtime_model_path)
+    current_identity, stable_stats = checkpoint_identity_with_stable_stats(runtime_model_path)
     if current_identity != manifest["model_identity"]:
         raise RuntimeError("Full checkpoint hash differs from the manifest identity")
     payload = {
@@ -1423,7 +1434,7 @@ def make_runtime_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "implementation_sha256": manifest["implementation_sha256"],
         "model_identity_sha256": manifest["model_identity_sha256"],
         "source_data_sha256": manifest["source_data_sha256"],
-        "checkpoint_file_stats": checkpoint_file_stats(runtime_model_path),
+        "checkpoint_file_stats": stable_stats,
     }
     write_json(Path(args.output).resolve(), payload)
     return payload
@@ -1784,17 +1795,23 @@ def historical_checkpoint_evidence(
             "Checkpoint files were modified after the accepted manifest was created"
         )
     cache_root = Path(model_path) / ".cache" / "huggingface" / "download"
-    cache_content_hashes = set()
+    cache_incomplete_hashes = set()
+    cache_lfs_etag_hashes = set()
     revisions = set()
     if cache_root.is_dir():
         for path in cache_root.iterdir():
             match = re.search(r"\.([0-9a-f]{64})\.incomplete$", path.name)
             if match:
-                cache_content_hashes.add(match.group(1))
+                cache_incomplete_hashes.add(match.group(1))
         for path in cache_root.glob("*.metadata"):
             lines = path.read_text(encoding="utf-8").splitlines()
             if lines:
-                revisions.add(lines[0])
+                revisions.add(lines[0].strip())
+            if len(lines) >= 2:
+                etag = lines[1].strip().strip('"')
+                if re.fullmatch(r"[0-9a-f]{64}", etag):
+                    cache_lfs_etag_hashes.add(etag)
+    cache_content_hashes = cache_incomplete_hashes | cache_lfs_etag_hashes
     large_weight_hashes = {
         item["sha256"]
         for item in model_identity["files"]
@@ -1803,6 +1820,7 @@ def historical_checkpoint_evidence(
     }
     if cache_content_hashes and not large_weight_hashes <= cache_content_hashes:
         raise RuntimeError("Current weight hashes do not match the local snapshot cache evidence")
+    cache_weight_hashes_complete = large_weight_hashes <= cache_content_hashes
     return {
         "accepted_manifest_created_at": accepted_created_at,
         "latest_checkpoint_mtime": latest_mtime,
@@ -1811,6 +1829,9 @@ def historical_checkpoint_evidence(
         "current_model_identity_sha256": model_identity["content_sha256"],
         "large_weight_sha256": sorted(large_weight_hashes),
         "cache_content_sha256": sorted(cache_content_hashes),
+        "cache_incomplete_name_sha256": sorted(cache_incomplete_hashes),
+        "cache_lfs_etag_sha256": sorted(cache_lfs_etag_hashes),
+        "cache_weight_hashes_complete": cache_weight_hashes_complete,
         "snapshot_revisions": sorted(revisions),
         "limitation": (
             "The accepted run did not record a checkpoint content hash; path, pre-run mtimes, "

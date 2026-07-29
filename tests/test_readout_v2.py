@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -15,9 +16,11 @@ from vlmeval.probes.readout_v2 import (
     aggregate_combined,
     allowed_masks,
     checkpoint_identity,
+    checkpoint_identity_with_stable_stats,
     current_scoring_contract_sha256,
     embedded_choice_labels,
     expected_provenance,
+    historical_checkpoint_evidence,
     independent_expected_masks,
     mask_checks,
     scoring_contract_sha256_from_source,
@@ -354,6 +357,70 @@ class ReadoutV2MaskTest(unittest.TestCase):
             (first / "config.json").write_text('{"model": 2}', encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "metadata file changed"):
                 verify_checkpoint_identity_quick(str(first), identity)
+
+    def test_runtime_attestation_binds_hash_to_stable_file_stats(self):
+        stable = [{"relative_path": "weights.bin", "size": 4, "mtime_ns": 10}]
+        identity = {
+            "resolved_path": "/checkpoint",
+            "file_count": 1,
+            "files": [{"relative_path": "weights.bin", "size": 4, "sha256": "abc"}],
+            "content_sha256": "def",
+        }
+        with patch(
+            "vlmeval.probes.readout_v2.checkpoint_file_stats",
+            side_effect=[stable, stable],
+        ), patch(
+            "vlmeval.probes.readout_v2.checkpoint_identity",
+            return_value=identity,
+        ):
+            actual_identity, actual_stats = checkpoint_identity_with_stable_stats("/checkpoint")
+        self.assertEqual(actual_identity, identity)
+        self.assertEqual(actual_stats, stable)
+
+    def test_runtime_attestation_rejects_checkpoint_change_during_hash(self):
+        before = [{"relative_path": "weights.bin", "size": 4, "mtime_ns": 10}]
+        after = [{"relative_path": "weights.bin", "size": 4, "mtime_ns": 11}]
+        with patch(
+            "vlmeval.probes.readout_v2.checkpoint_file_stats",
+            side_effect=[before, after],
+        ), patch(
+            "vlmeval.probes.readout_v2.checkpoint_identity",
+            return_value={"content_sha256": "def"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed during full runtime attestation"):
+                checkpoint_identity_with_stable_stats("/checkpoint")
+
+    def test_historical_checkpoint_evidence_reads_lfs_etag(self):
+        weight_sha256 = "a" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / ".cache" / "huggingface" / "download"
+            cache.mkdir(parents=True)
+            (cache / "model.safetensors.metadata").write_text(
+                f"revision\n{weight_sha256}\n123.0\n",
+                encoding="utf-8",
+            )
+            identity = {
+                "resolved_path": str(root),
+                "content_sha256": "identity",
+                "files": [
+                    {
+                        "relative_path": "model.safetensors",
+                        "size": 17 * 1024 * 1024,
+                        "sha256": weight_sha256,
+                    }
+                ],
+            }
+            with patch(
+                "vlmeval.probes.readout_v2.checkpoint_file_stats",
+                return_value=[{"mtime_ns": 1_000_000_000}],
+            ):
+                evidence = historical_checkpoint_evidence(
+                    identity,
+                    {"created_at": 100.0},
+                )
+        self.assertEqual(evidence["cache_lfs_etag_sha256"], [weight_sha256])
+        self.assertTrue(evidence["cache_weight_hashes_complete"])
 
     def test_prediction_payload_rejects_tampered_hit(self):
         manifest_record = {
