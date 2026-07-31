@@ -19,8 +19,8 @@ from .slidevqa import SlideVQA
 
 from .dynamath import Dynamath
 from .countqa import CountQADataset
-from .spatialmqa import SpatialMQA
-from .ref_l4 import RefL4Dataset
+from .spatialmqa import SpatialMQADataset
+from .refcoco import RefCOCODataset
 
 from .mmbench_video import MMBenchVideo
 from .text_mcq import CustomTextMCQDataset, TextMCQDataset
@@ -125,7 +125,7 @@ IMAGE_DATASET = [
     MMMUDataset, MMMUSingleImageDataset, OCRBench, MathVista, MathVistaSample, MathVistaHalf, LLaVABench, MMVet,
     MTVQADataset, TableVQABench, HallucinationBench, LogicVista, MMLongBench, VCRDataset, MMDUDataset, DUDE,
     SlideVQA, MUIRDataset, GMAIMMBenchDataset, MMERealWorld, HRBenchDataset, VisuLogic, VisualPuzzles, WeMath,
-    CountQADataset, SpatialMQA, RefL4Dataset
+    CountQADataset, SpatialMQADataset, RefCOCODataset
 ]
 
 VIDEO_DATASET = [

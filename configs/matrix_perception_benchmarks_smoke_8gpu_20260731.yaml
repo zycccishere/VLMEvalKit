@@ -4,13 +4,22 @@ results_root: runs/perception_benchmarks_smoke_8gpu_20260731
 node_gpu_ids: "0,1,2,3,4,5,6,7"
 scheduler: gpu_pool
 datasets:
-  - CountQA
   - SpatialMQA
-  - RefL4-val
+  - CountQA
+  - RefCOCO
 dataset_index_allowlists:
-  CountQA: "{repo_root}/configs/index_allowlists/countqa_smoke_20260731.txt"
   SpatialMQA: "{repo_root}/configs/index_allowlists/spatialmqa_smoke_20260731.txt"
-  RefL4-val: "{repo_root}/configs/index_allowlists/refl4_val_smoke_20260731.txt"
+  CountQA: "{repo_root}/configs/index_allowlists/countqa_smoke_20260731.txt"
+  RefCOCO: "{repo_root}/configs/index_allowlists/refcocog_test_smoke_20260731.txt"
+dataset_task_env:
+  CountQA:
+    QWEN2VL_VLLM_TEMPERATURE: "0"
+    QWEN2VL_VLLM_TOP_P: "1"
+    QWEN2VL_VLLM_MAX_TOKENS: "32"
+    GEMMA3_VLLM_TEMPERATURE: "0"
+    GEMMA3_VLLM_TOP_P: "1"
+    GEMMA3_MAX_NEW_TOKENS: "32"
+    MINICPM45_MAX_NEW_TOKENS: "32"
 policies:
   default:
     replay_prompt_template_name: identity

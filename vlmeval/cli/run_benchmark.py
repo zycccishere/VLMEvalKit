@@ -304,6 +304,13 @@ class BenchmarkRunner:
         self.dataset_index_allowlists = {
             canonical_dataset_name(str(dataset)): path for dataset, path in raw_allowlists.items()
         }
+        raw_dataset_task_env = format_value(matrix.get("dataset_task_env", {}), self.repo_root)
+        self.dataset_task_env = {
+            canonical_dataset_name(str(dataset)): {
+                str(key): str(value) for key, value in task_env.items()
+            }
+            for dataset, task_env in raw_dataset_task_env.items()
+        }
         self.explicit_transform_axis = "image_transforms" in matrix
         self.worker_monitor_cfg = matrix.get("worker_monitor", {})
         self.worker_monitor_enabled = truthy(self.worker_monitor_cfg.get("enable", True))
@@ -811,6 +818,7 @@ class BenchmarkRunner:
         env = self._base_env_for_profile(profile)
         env.update(model.task_env)
         self._apply_qwen25vl_sampling_defaults(env, model, task)
+        env.update(self.dataset_task_env.get(task.dataset, {}))
         judge_api_key = str(
             os.environ.get("OPENAI_API_KEY_JUDGE")
             or os.environ.get("OPENAI_API_KEY")
