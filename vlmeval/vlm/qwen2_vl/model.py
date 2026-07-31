@@ -21,6 +21,14 @@ from ..replay_policy import (
     maybe_debug_print_replay,
     read_replay_config_from_env,
 )
+from ..final_model_input_dump import (
+    dump_final_model_input,
+    extract_replay_meta,
+    final_input_dump_enabled,
+    new_call_id,
+    summarize_content_sequence,
+    visual_spec,
+)
 from ..replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
@@ -516,10 +524,64 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             print(f"[replay-dump] write failed: {e}", flush=True)
 
     def _extract_replay_meta(self, inputs: list[dict[str, Any]]) -> dict[str, Any]:
-        for item in inputs:
-            if isinstance(item, dict) and isinstance(item.get("replay_meta"), dict):
-                return dict(item["replay_meta"])
-        return {}
+        return extract_replay_meta(inputs)
+
+    def _dump_final_vllm_request(
+        self,
+        *,
+        message,
+        consumer_content,
+        request,
+        dataset,
+        call_id,
+        parent_call_id=None,
+        batch_position=None,
+    ):
+        if not final_input_dump_enabled():
+            return
+        multi_modal_data = request.get("multi_modal_data", {}) if isinstance(request, dict) else {}
+        source_refs = [
+            str(item.get("image"))
+            for item in consumer_content
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        visual_inputs = []
+        if isinstance(multi_modal_data, dict):
+            for modality, values in multi_modal_data.items():
+                values = values if isinstance(values, (list, tuple)) else [values]
+                for value in values:
+                    position = len(visual_inputs)
+                    source_ref = (
+                        source_refs[position]
+                        if str(modality) == "image" and position < len(source_refs)
+                        else None
+                    )
+                    visual_inputs.append(
+                        visual_spec(value, modality=str(modality), source_ref=source_ref)
+                    )
+        dump_final_model_input(
+            model_family="qwen2.5-vl",
+            backend="vllm",
+            consumer_api="vllm.LLM.generate",
+            text_chat_representation={
+                "kind": "vllm_request_prompt",
+                "value": request.get("prompt") if isinstance(request, dict) else request,
+            },
+            visual_inputs=visual_inputs,
+            content_sequence=summarize_content_sequence(consumer_content),
+            processor_inputs=request,
+            dataset=str(dataset) if dataset is not None else None,
+            model_key=self.model_path,
+            condition=getattr(self, "replay_cfg", {}).get("mode"),
+            sample_meta=self._extract_replay_meta(message),
+            call_id=call_id,
+            parent_call_id=parent_call_id,
+            batch_position=batch_position,
+            observability={
+                "boundary": "direct_vllm_generate_request",
+                "post_dump_internal_processing": ["vLLM multimodal processor and model execution"],
+            },
+        )
 
     def _find_image_token_spans(self, input_ids: list[int]) -> list[dict[str, int]]:
         image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
@@ -816,6 +878,40 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')  # noqa: E501
         inputs = inputs.to('cuda')
 
+        if final_input_dump_enabled():
+            replay_meta = self._extract_replay_meta(message)
+            image_refs = [
+                item.get("image")
+                for item in messages[-1].get("content", [])
+                if isinstance(item, dict) and item.get("type") == "image"
+            ]
+            visual_inputs = [
+                visual_spec(
+                    image,
+                    modality="image",
+                    source_ref=image_refs[idx] if idx < len(image_refs) else None,
+                )
+                for idx, image in enumerate(images or [])
+            ]
+            visual_inputs.extend(visual_spec(video, modality="video") for video in (videos or []))
+            dump_final_model_input(
+                model_family="qwen2.5-vl",
+                backend="transformers",
+                consumer_api="transformers.PreTrainedModel.generate",
+                text_chat_representation={"kind": "processor_chat_template", "value": text},
+                visual_inputs=visual_inputs,
+                content_sequence=summarize_content_sequence(message),
+                processor_inputs=inputs,
+                dataset=str(dataset) if dataset is not None else None,
+                model_key=self.model_path,
+                condition=getattr(self, "replay_cfg", {}).get("mode"),
+                sample_meta=replay_meta,
+                observability={
+                    "boundary": "post_processor_device_inputs",
+                    "post_dump_internal_processing": [],
+                },
+            )
+
         if listinstr(['omni'], self.model_path.lower()):
             self.generate_kwargs['use_audio_in_video'] = self.use_audio_in_video
             self.generate_kwargs['return_audio'] = False
@@ -864,6 +960,27 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         gen_config.random_seed = None
         messages_list = self.message_to_lmdeploy(message, system_prompt=self.system_prompt)
         assert len(messages_list) == 1
+        if final_input_dump_enabled():
+            dump_final_model_input(
+                model_family="qwen2.5-vl",
+                backend="lmdeploy",
+                consumer_api="lmdeploy.pipeline.__call__",
+                text_chat_representation={"kind": "lmdeploy_messages", "value": messages_list},
+                visual_inputs=[
+                    visual_spec(item.get("value"), modality=item.get("type", "image"))
+                    for item in message
+                    if isinstance(item, dict) and item.get("type") in {"image", "video"}
+                ],
+                content_sequence=summarize_content_sequence(message),
+                dataset=str(dataset) if dataset is not None else None,
+                model_key=self.model_path,
+                condition=getattr(self, "replay_cfg", {}).get("mode"),
+                sample_meta=self._extract_replay_meta(message),
+                observability={
+                    "boundary": "lmdeploy_pipeline_call_arguments",
+                    "post_dump_internal_processing": ["LMDeploy media loading and model preprocessing"],
+                },
+            )
         response = self.model(messages_list, gen_config=gen_config)[0]
         response = response.text
         return response
@@ -902,7 +1019,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             stop_token_ids=None,
         )
 
-    def _build_vllm_request(self, message, dataset=None):
+    def _build_vllm_request(self, message, dataset=None, include_replayed_content=False):
         from vllm import SamplingParams
 
         if listinstr(['omni'], self.model_path.lower()):
@@ -1019,6 +1136,8 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             req = {
                 "prompt": text,
             }
+        if include_replayed_content:
+            return req, replayed_content
         return req
 
     def _finalize_vllm_generated_text(self, generated_text, dataset=None):
@@ -1057,7 +1176,24 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
 
     def generate_inner_vllm(self, message, dataset=None):
         sampling_params = self._build_vllm_sampling_params()
-        req = self._build_vllm_request(message, dataset=dataset)
+        if final_input_dump_enabled():
+            req, consumer_content = self._build_vllm_request(
+                message,
+                dataset=dataset,
+                include_replayed_content=True,
+            )
+            parent_call_id = new_call_id()
+            self._dump_final_vllm_request(
+                message=message,
+                consumer_content=consumer_content,
+                request=req,
+                dataset=dataset,
+                call_id=f"{parent_call_id}:0",
+                parent_call_id=parent_call_id,
+                batch_position=0,
+            )
+        else:
+            req = self._build_vllm_request(message, dataset=dataset)
         outputs = self.llm.generate(req, sampling_params=sampling_params)
         generated_text = ''
         for o in outputs:
@@ -1080,7 +1216,33 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 if DATASET_MODALITY(dataset) == 'VIDEO' and 'megabench' not in dataset.lower():
                     return [self.generate_inner_vllm(msg, dataset=dataset) for msg in messages]
                 sampling_params = self._build_vllm_sampling_params()
-                reqs = [self._build_vllm_request(msg, dataset=dataset) for msg in messages]
+                if final_input_dump_enabled():
+                    built_requests = [
+                        self._build_vllm_request(
+                            msg,
+                            dataset=dataset,
+                            include_replayed_content=True,
+                        )
+                        for msg in messages
+                    ]
+                    reqs = [item[0] for item in built_requests]
+                    consumer_contents = [item[1] for item in built_requests]
+                else:
+                    reqs = [self._build_vllm_request(msg, dataset=dataset) for msg in messages]
+                    consumer_contents = [None] * len(messages)
+                parent_call_id = new_call_id()
+                for batch_position, (message, req, consumer_content) in enumerate(
+                    zip(messages, reqs, consumer_contents)
+                ):
+                    self._dump_final_vllm_request(
+                        message=message,
+                        consumer_content=consumer_content,
+                        request=req,
+                        dataset=dataset,
+                        call_id=f"{parent_call_id}:{batch_position}",
+                        parent_call_id=parent_call_id,
+                        batch_position=batch_position,
+                    )
                 outputs = self.llm.generate(reqs, sampling_params=sampling_params)
                 results = []
                 for output in outputs:

@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import random
@@ -22,6 +23,14 @@ from .replay_policy import (
     is_noop_replay_mode,
     maybe_debug_print_replay,
     read_replay_config_from_env,
+)
+from .final_model_input_dump import (
+    dump_final_model_input,
+    extract_replay_meta,
+    final_input_dump_enabled,
+    new_call_id,
+    summarize_content_sequence,
+    visual_spec,
 )
 from ..smp import *
 
@@ -167,6 +176,35 @@ class MiniCPM_V_4_5(BaseModel):
             tp_size = int(env_tp) if env_tp.isdigit() else 1
         tp_size = max(1, min(int(tp_size), gpu_count))
         return tp_size
+
+    def _extract_replay_meta(self, message):
+        return extract_replay_meta(message)
+
+    @staticmethod
+    def _visual_specs_from_chat_messages(messages, source_refs=None):
+        visual_inputs = []
+        source_refs = list(source_refs or [])
+        for chat_message in messages:
+            content = chat_message.get("content", []) if isinstance(chat_message, dict) else []
+            content = content if isinstance(content, list) else [content]
+            for item in content:
+                if isinstance(item, Image.Image):
+                    source_ref = source_refs[len(visual_inputs)] if len(visual_inputs) < len(source_refs) else None
+                    visual_inputs.append(visual_spec(item, modality="image", source_ref=source_ref))
+                elif isinstance(item, dict) and isinstance(item.get("image_pil"), Image.Image):
+                    source_ref = source_refs[len(visual_inputs)] if len(visual_inputs) < len(source_refs) else None
+                    visual_inputs.append(
+                        visual_spec(item["image_pil"], modality="image", source_ref=source_ref)
+                    )
+        return visual_inputs
+
+    @staticmethod
+    def _image_refs(message):
+        return [
+            str(item.get("value"))
+            for item in message
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
 
     def _strip_empty_think_stub(self, chat_template):
         pattern = (
@@ -604,14 +642,57 @@ class MiniCPM_V_4_5(BaseModel):
             [{"role": "user", "content": self._message_to_vllm_content(message, dataset=dataset)}]
             for message in messages
         ]
-        outputs = self.llm.chat(
-            conversations,
-            sampling_params=sampling_params,
-            use_tqdm=False,
-            chat_template=chat_template,
-            chat_template_content_format="string",
-            chat_template_kwargs=chat_template_kwargs,
-        )
+
+        def call_chat():
+            return self.llm.chat(
+                conversations,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+                chat_template=chat_template,
+                chat_template_content_format="string",
+                chat_template_kwargs=chat_template_kwargs,
+            )
+
+        if final_input_dump_enabled():
+            parent_call_id = new_call_id()
+            for batch_position, (message, conversation) in enumerate(zip(messages, conversations)):
+                content = conversation[-1].get("content", [])
+                dump_final_model_input(
+                    model_family="minicpm-v/o-4.5",
+                    backend="vllm",
+                    consumer_api="vllm.LLM.chat",
+                    text_chat_representation={
+                        "kind": "vllm_chat_conversation",
+                        "value": conversation,
+                    },
+                    visual_inputs=self._visual_specs_from_chat_messages(
+                        conversation,
+                        source_refs=self._image_refs(message),
+                    ),
+                    content_sequence=summarize_content_sequence(content),
+                    processor_inputs={
+                        "conversation": conversation,
+                        "chat_template": chat_template,
+                        "chat_template_content_format": "string",
+                        "chat_template_kwargs": chat_template_kwargs,
+                    },
+                    dataset=str(dataset) if dataset is not None else None,
+                    model_key=self.model_path,
+                    condition=getattr(self, "replay_cfg", {}).get("mode"),
+                    sample_meta=self._extract_replay_meta(message),
+                    call_id=f"{parent_call_id}:{batch_position}",
+                    parent_call_id=parent_call_id,
+                    batch_position=batch_position,
+                    observability={
+                        "boundary": "direct_vllm_chat_request",
+                        "post_dump_internal_processing": [
+                            "vLLM chat-template rendering",
+                            "vLLM multimodal processing",
+                            "vLLM model execution",
+                        ],
+                    },
+                )
+        outputs = call_chat()
         results = []
         for message, output in zip(messages, outputs):
             full_output = self._extract_vllm_output(output)
@@ -707,15 +788,55 @@ class MiniCPM_V_4_5(BaseModel):
 
         msgs = [{"role": "user", "content": self._message_to_content(message, dataset=dataset)}]
         self.processor.tokenizer = self.tokenizer
-        res = self.model.chat(
-            image=None,
-            msgs=msgs,
-            context=None,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            max_inp_length=8192,
-            **default_kwargs,
-        )
+
+        def call_chat():
+            return self.model.chat(
+                image=None,
+                msgs=msgs,
+                context=None,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                max_inp_length=8192,
+                **default_kwargs,
+            )
+
+        if final_input_dump_enabled():
+            call_id = new_call_id()
+            content = msgs[-1].get("content", [])
+            dump_final_model_input(
+                model_family="minicpm-v/o-4.5",
+                backend="transformers",
+                consumer_api="MiniCPM.model.chat",
+                text_chat_representation={
+                    "kind": "model_chat_messages",
+                    "value": msgs,
+                },
+                visual_inputs=self._visual_specs_from_chat_messages(
+                    msgs,
+                    source_refs=self._image_refs(message),
+                ),
+                content_sequence=summarize_content_sequence(content),
+                processor_inputs={
+                    "context": None,
+                    "max_inp_length": 8192,
+                    "generate_kwargs": default_kwargs,
+                },
+                dataset=str(dataset) if dataset is not None else None,
+                model_key=self.model_path,
+                condition=getattr(self, "replay_cfg", {}).get("mode"),
+                sample_meta=self._extract_replay_meta(message),
+                call_id=call_id,
+                batch_position=0,
+                observability={
+                    "boundary": "direct_model_chat_request",
+                    "post_dump_internal_processing": [
+                        "MiniCPM chat-template rendering",
+                        "MiniCPM multimodal processing",
+                        "MiniCPM model generation",
+                    ],
+                },
+            )
+        res = call_chat()
 
         if isinstance(res, tuple) and len(res) > 0:
             res = res[0]

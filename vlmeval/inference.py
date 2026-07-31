@@ -6,9 +6,28 @@ from vlmeval.smp import *
 import sys
 import os
 import json
+from contextlib import contextmanager
 from typing import Any
 
 FAIL_MSG = 'Failed to obtain answer via API.'
+
+
+@contextmanager
+def _replay_sample_indices(indices):
+    """Expose the exact batch/index association to opt-in runtime dumps."""
+    key = "REPLAY_SAMPLE_INDICES_JSON"
+    previous = os.environ.get(key)
+    enabled = bool(os.environ.get("REPLAY_RAW_DUMP_PATH", "").strip())
+    if enabled:
+        os.environ[key] = json.dumps([str(index) for index in indices], ensure_ascii=False)
+    try:
+        yield
+    finally:
+        if enabled:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
 
 
 def _is_overlong_prompt_error(err: Exception) -> bool:
@@ -163,6 +182,13 @@ def _build_common_prompt_struct(dataset, dataset_name: str, row) -> list[dict[st
 
 
 def _maybe_build_prompt_struct(model, dataset, dataset_name: str, row) -> list[dict[str, Any]]:
+    # Some benchmark protocols require a dataset-owned output grammar (for
+    # example, an integer-only answer or a specific bounding-box coordinate
+    # system). This opt-in leaves every existing dataset/model prompt path
+    # unchanged while preventing model mixins from silently rewriting those
+    # protocol-critical prompts.
+    if getattr(dataset, "FORCE_DATASET_PROMPT", False):
+        return dataset.build_prompt(row)
     common = _build_common_prompt_struct(dataset, dataset_name, row)
     if common is not None:
         return common
@@ -539,7 +565,8 @@ def infer_data(model_name, work_dir, dataset, out_file, verbose=False, api_nproc
         if batch_size > 1:
             try:
                 print(f"Processing batch {i // batch_size + 1} with {len(prompts)} prompts.", flush=True)
-                responses = model.generate_batch(messages=prompts, dataset=dataset_name)
+                with _replay_sample_indices(indices):
+                    responses = model.generate_batch(messages=prompts, dataset=dataset_name)
             except Exception as e:
                 strict_batch = os.environ.get('VLMEVAL_STRICT_BATCH', '0').strip().lower() in {
                     '1', 'true', 'yes', 'on'
@@ -552,9 +579,10 @@ def infer_data(model_name, work_dir, dataset, out_file, verbose=False, api_nproc
                 print(f"Error during batch generation: {e}. Falling back to single-item generation for this batch.")
                 # Fallback to single-item generation if batch fails
                 responses = []
-                for prompt in prompts:
+                for prompt, prompt_index in zip(prompts, indices):
                     try:
-                        responses.append(model.generate(message=prompt, dataset=dataset_name))
+                        with _replay_sample_indices([prompt_index]):
+                            responses.append(model.generate(message=prompt, dataset=dataset_name))
                     except Exception as e_single:
                         if skip_overlong and _is_overlong_prompt_error(e_single):
                             print(f"[WARN][OVERLONG] single-item fallback skipped due to max length: {e_single}")
@@ -566,7 +594,8 @@ def infer_data(model_name, work_dir, dataset, out_file, verbose=False, api_nproc
 
         else:
             try:
-                responses = [model.generate(message=prompts[0], dataset=dataset_name)]
+                with _replay_sample_indices(indices):
+                    responses = [model.generate(message=prompts[0], dataset=dataset_name)]
             except Exception as e_single:
                 if skip_overlong and _is_overlong_prompt_error(e_single):
                     print(f"[WARN][OVERLONG] skipped due to max length: {e_single}")

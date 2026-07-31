@@ -22,6 +22,14 @@ from .replay_policy import (
     maybe_debug_print_replay,
     read_replay_config_from_env,
 )
+from .final_model_input_dump import (
+    dump_final_model_input,
+    extract_replay_meta,
+    final_input_dump_enabled,
+    new_call_id,
+    summarize_content_sequence,
+    visual_spec,
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -198,6 +206,61 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             tp_size = 1
         return max(1, min(int(tp_size), gpu_count))
 
+    def _extract_replay_meta(self, message) -> dict[str, Any]:
+        return extract_replay_meta(message)
+
+    def _dump_final_vllm_request(
+        self,
+        *,
+        message,
+        request,
+        dataset,
+        call_id,
+        parent_call_id=None,
+        batch_position=None,
+    ) -> None:
+        if not final_input_dump_enabled():
+            return
+        multi_modal_data = request.get("multi_modal_data", {})
+        image_values = multi_modal_data.get("image", []) if isinstance(multi_modal_data, dict) else []
+        image_values = image_values if isinstance(image_values, (list, tuple)) else [image_values]
+        source_refs = [
+            str(item.get("value"))
+            for item in message
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        visual_inputs = [
+            visual_spec(
+                image,
+                modality="image",
+                source_ref=source_refs[idx] if idx < len(source_refs) else None,
+            )
+            for idx, image in enumerate(image_values)
+        ]
+        dump_final_model_input(
+            model_family="gemma3",
+            backend="vllm",
+            consumer_api="vllm.LLM.generate",
+            text_chat_representation={
+                "kind": "vllm_request_prompt",
+                "value": request.get("prompt"),
+            },
+            visual_inputs=visual_inputs,
+            content_sequence=summarize_content_sequence(message),
+            processor_inputs=request,
+            dataset=str(dataset) if dataset is not None else None,
+            model_key=self.model_path,
+            condition=self.replay_cfg.get("mode"),
+            sample_meta=self._extract_replay_meta(message),
+            call_id=call_id,
+            parent_call_id=parent_call_id,
+            batch_position=batch_position,
+            observability={
+                "boundary": "direct_vllm_generate_request",
+                "post_dump_internal_processing": ["vLLM multimodal processor and model execution"],
+            },
+        )
+
     def _apply_prompt_template_to_message(self, message, dataset=None):
         template_text = self.prompt_template_cfg.get("template", "{problem}")
         if template_text == "{problem}":
@@ -373,6 +436,54 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         if self.temperature > 0:
             generate_kwargs["temperature"] = self.temperature
         generate_kwargs.update(self.extra_generate_kwargs)
+        if final_input_dump_enabled():
+            input_ids = inputs.get("input_ids")
+            try:
+                decoded_prompt = self.processor.tokenizer.batch_decode(
+                    input_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except Exception:
+                decoded_prompt = None
+            image_refs = [
+                str(item.get("value"))
+                for item in message
+                if isinstance(item, dict) and item.get("type") == "image"
+            ]
+            pixel_values = inputs.get("pixel_values")
+            if (
+                pixel_values is not None
+                and hasattr(pixel_values, "shape")
+                and len(pixel_values.shape) >= 4
+                and int(pixel_values.shape[0]) == len(image_refs)
+            ):
+                visual_inputs = [
+                    visual_spec(pixel_values[idx], modality="image", source_ref=image_refs[idx])
+                    for idx in range(len(image_refs))
+                ]
+            else:
+                visual_inputs = [visual_spec(ref, modality="image", source_ref=ref) for ref in image_refs]
+            dump_final_model_input(
+                model_family="gemma3",
+                backend="transformers",
+                consumer_api="transformers.PreTrainedModel.generate",
+                text_chat_representation={
+                    "kind": "decoded_processor_input_ids",
+                    "value": decoded_prompt,
+                },
+                visual_inputs=visual_inputs,
+                content_sequence=summarize_content_sequence(message),
+                processor_inputs=inputs,
+                dataset=str(dataset) if dataset is not None else None,
+                model_key=self.model_path,
+                condition=self.replay_cfg.get("mode"),
+                sample_meta=self._extract_replay_meta(message),
+                observability={
+                    "boundary": "post_processor_device_inputs",
+                    "post_dump_internal_processing": [],
+                },
+            )
         with torch.inference_mode():
             generation = self.model.generate(**inputs, **generate_kwargs)
         generation = generation[0][input_len:]
@@ -382,6 +493,16 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
     def _generate_batch_inner_vllm(self, messages, dataset=None):
         sampling_params = self._build_sampling_params()
         requests = [self._message_to_vllm_payload(message) for message in messages]
+        parent_call_id = new_call_id()
+        for batch_position, (message, request) in enumerate(zip(messages, requests)):
+            self._dump_final_vllm_request(
+                message=message,
+                request=request,
+                dataset=dataset,
+                call_id=f"{parent_call_id}:{batch_position}",
+                parent_call_id=parent_call_id,
+                batch_position=batch_position,
+            )
         outputs = self.llm.generate(requests, sampling_params=sampling_params)
         return [
             self._build_result(output.outputs[0].text if getattr(output, "outputs", None) else "", dataset=dataset)
@@ -402,10 +523,18 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         return self._generate_inner_transformers(replayed, dataset=dataset)
 
     def generate_batch_inner(self, messages, dataset=None):
-        replayed_messages = [
-            self._apply_replay_pipeline(message, dataset=dataset)
-            for message in messages
-        ]
+        replayed_messages = []
+        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+        for batch_position, message in enumerate(messages):
+            replayed = self._apply_replay_pipeline(message, dataset=dataset)
+            maybe_debug_print_replay(
+                enabled=self.replay_cfg.get("debug", False),
+                mode=replay_mode,
+                before=message,
+                after=replayed,
+                tag=f"{self.__class__.__name__}[batch={batch_position};dataset={dataset}]",
+            )
+            replayed_messages.append(replayed)
         if self.use_vllm:
             return self._generate_batch_inner_vllm(replayed_messages, dataset=dataset)
         return [self._generate_inner_transformers(message, dataset=dataset) for message in replayed_messages]

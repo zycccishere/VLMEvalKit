@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import time
 from typing import Any
 
 
@@ -158,23 +159,42 @@ def count_modalities(content: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def maybe_debug_print_replay(enabled: bool, mode: str, before: list[dict[str, Any]], after: list[dict[str, Any]], tag: str = "replay") -> None:
-    if not enabled:
+    dump_path = os.environ.get("REPLAY_RAW_DUMP_PATH", "").strip()
+    if not enabled and not dump_path:
         return
 
     before_counts = count_modalities(before)
     after_counts = count_modalities(after)
     payload = {
+        "schema_version": 2,
+        "stage": "replay_policy",
         "tag": tag,
         "mode": canonicalize_replay_mode(mode),
+        "pid": os.getpid(),
+        "time_ns": time.time_ns(),
+        "run_uuid": os.environ.get("REPLAY_RUN_UUID"),
+        "matrix": os.environ.get("REPLAY_MATRIX_NAME"),
+        "task_tag": os.environ.get("REPLAY_TASK_TAG"),
+        "model_key": os.environ.get("REPLAY_MODEL_KEY"),
+        "dataset": os.environ.get("REPLAY_DATASET"),
+        "condition": os.environ.get("REPLAY_CONDITION"),
+        "sample_indices_json": os.environ.get("REPLAY_SAMPLE_INDICES_JSON"),
         "before_counts": before_counts,
         "after_counts": after_counts,
         "before_content": before,
         "after_content": after,
     }
-    try:
-        print(f"[REPLAY_DEBUG] {json.dumps(payload, ensure_ascii=False)}", flush=True)
-    except Exception:
-        print(
-            f"[REPLAY_DEBUG] mode={canonicalize_replay_mode(mode)} before={before_counts} after={after_counts}",
-            flush=True,
-        )
+    if dump_path:
+        parent = os.path.dirname(os.path.abspath(dump_path))
+        os.makedirs(parent, exist_ok=True)
+        with open(dump_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+    if enabled:
+        try:
+            print(f"[REPLAY_DEBUG] {json.dumps(payload, ensure_ascii=False, default=str)}", flush=True)
+        except Exception:
+            print(
+                f"[REPLAY_DEBUG] mode={canonicalize_replay_mode(mode)} before={before_counts} after={after_counts}",
+                flush=True,
+            )

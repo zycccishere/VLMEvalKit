@@ -143,7 +143,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         if idx in res:
             continue
 
-        if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
+        if getattr(dataset, "FORCE_DATASET_PROMPT", False):
+            struct = dataset.build_prompt(data.iloc[i])
+        elif hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
             struct = model.build_prompt(data.iloc[i], dataset=dataset_name)
         else:
             struct = dataset.build_prompt(data.iloc[i])

@@ -13,6 +13,7 @@ import time
 import subprocess
 import sys
 import threading
+import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -835,6 +836,16 @@ class BenchmarkRunner:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
         env["MODEL_PATH"] = model.model_path
         env["REPLAY_MODE"] = task.mode
+        env["REPLAY_RUN_UUID"] = uuid.uuid4().hex
+        env["REPLAY_MATRIX_NAME"] = self.matrix_name
+        env["REPLAY_MATRIX_TAG"] = self.matrix_name
+        env["REPLAY_TASK_TAG"] = task.tag
+        env["REPLAY_MODEL_KEY"] = model.key
+        env["REPLAY_DATASET"] = task.dataset
+        env["REPLAY_CONDITION"] = {
+            "image_text": "iq",
+            "image_text_image_text": "iqiq",
+        }.get(task.mode, task.mode)
         env["REPLAY_IMAGE_TRANSFORM"] = task.transform
         env["REPLAY_IMAGE_TRANSFORM_CACHE_DIR"] = str(self.task_root(task) / "_transform_cache" / task.dataset)
         env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = "2"
@@ -853,6 +864,17 @@ class BenchmarkRunner:
         env["VLMEVAL_STRICT_BATCH"] = str(self.replay_cfg.get("strict_batch", 1))
         if "force_common_prompt" in self.replay_cfg:
             env["REPLAY_FORCE_COMMON_PROMPT"] = str(self.replay_cfg.get("force_common_prompt", 0))
+        for key in (
+            "REPLAY_TRACE_LEVEL",
+            "REPLAY_TRACE_SAMPLES",
+            "REPLAY_TRACE_MAX_CHARS",
+            "REPLAY_TRACE_DIR",
+            "REPLAY_DUMP_DIR",
+            "REPLAY_DUMP_MAX_CHARS",
+            "REPLAY_RAW_DUMP_PATH",
+            "REPLAY_SAMPLE_INDICES_JSON",
+        ):
+            env.pop(key, None)
         trace_level = str(self.trace_cfg.get("level", "")).strip().lower()
         if trace_level:
             env["REPLAY_TRACE_LEVEL"] = trace_level
@@ -861,11 +883,16 @@ class BenchmarkRunner:
             env["REPLAY_TRACE_DIR"] = str(self.task_root(task) / "_trace")
             env["REPLAY_DUMP_DIR"] = str(self.task_root(task) / "_trace")
             env["REPLAY_DUMP_MAX_CHARS"] = str(self.trace_cfg.get("dump_max_chars", 6000))
+            if trace_level in {"raw", "full"}:
+                env["REPLAY_RAW_DUMP_PATH"] = str(
+                    self.task_root(task) / "_trace" / "replay_raw.jsonl"
+                )
             if trace_level in {"summary", "full"}:
                 env["REPLAY_STAGE_DEBUG"] = "1"
                 env["REPLAY_STAGE_DEBUG_SAMPLES"] = str(self.trace_cfg.get("samples", 1))
                 env["REPLAY_PROMPT_AUDIT"] = "1"
                 env["REPLAY_PROMPT_AUDIT_PRINT"] = str(int(truthy(self.trace_cfg.get("prompt_audit_print", False))))
+        env.pop("DATASET_INDEX_ALLOWLIST_FILE", None)
         allowlist_path = self.dataset_index_allowlists.get(task.dataset)
         if allowlist_path:
             env["DATASET_INDEX_ALLOWLIST_FILE"] = str(allowlist_path)
@@ -1371,6 +1398,11 @@ except Exception:
         log_path = self.log_root(task) / "infer" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         ensure_dir(self.model_output_root(task, model))
         ensure_dir(self.prediction_dir(task))
+        raw_dump_path = str(env.get("REPLAY_RAW_DUMP_PATH", "")).strip()
+        if raw_dump_path:
+            raw_path = Path(raw_dump_path)
+            ensure_dir(raw_path.parent)
+            raw_path.unlink(missing_ok=True)
         batch_size = self.infer_batch_size_for_task(model, task)
         cmd = [
             self.env_profiles[model.env_profile].python,
@@ -1449,6 +1481,77 @@ except Exception:
             print(f"[FAIL][EVAL] {task.tag} rc={rc} log={log_path}", flush=True)
         return rc
 
+    @staticmethod
+    def _raw_validation_model_family(model: ModelSpec) -> str:
+        key = model.key.lower()
+        if key.startswith("qwen25vl"):
+            return "qwen2.5-vl"
+        if key.startswith("gemma3"):
+            return "gemma3"
+        if key.startswith("minicpm"):
+            return "minicpm-v/o-4.5"
+        raise ValueError(f"No final-input validation family mapping for model {model.key}")
+
+    def run_raw_validation(
+        self,
+        task: Task,
+        model: ModelSpec,
+        env: dict[str, str],
+        expected_count: int,
+    ) -> int:
+        if not truthy(self.trace_cfg.get("validate_after_infer", False)):
+            return 0
+        raw_path = Path(str(env.get("REPLAY_RAW_DUMP_PATH", "")))
+        allowlist_path = self.dataset_index_allowlists.get(task.dataset)
+        pred_file = self.infer_file_path(task, model)
+        if not raw_path.is_file():
+            raise RuntimeError(f"raw validation dump is missing: {raw_path}")
+        if allowlist_path is None or not Path(allowlist_path).is_file():
+            raise RuntimeError(f"raw validation allowlist is missing for {task.dataset}")
+        if pred_file is None:
+            raise RuntimeError(f"raw validation prediction file is missing for {task.tag}")
+
+        summary_path = raw_path.parent / "replay_raw_validation.json"
+        log_path = self.log_root(task) / "raw_validation" / f"{model.registry_name}_{task.dataset}.log"
+        cmd = [
+            self.env_profiles[model.env_profile].python,
+            "scripts/validate_replay_raw_dump.py",
+            str(raw_path),
+            "--condition",
+            str(env["REPLAY_CONDITION"]),
+            "--expect-records",
+            str(expected_count),
+            "--matrix",
+            self.matrix_name,
+            "--run-uuid",
+            str(env["REPLAY_RUN_UUID"]),
+            "--task-tag",
+            task.tag,
+            "--model-key",
+            model.key,
+            "--dataset",
+            task.dataset,
+            "--model-family",
+            self._raw_validation_model_family(model),
+            "--backend",
+            str(self.trace_cfg.get("backend", "vllm")),
+            "--allowlist-file",
+            str(allowlist_path),
+            "--prediction-file",
+            str(pred_file),
+            "--summary-path",
+            str(summary_path),
+        ]
+        if model.key.lower().startswith("minicpm"):
+            cmd.extend(["--forbid-output-substring", "<think>"])
+        print(f"[START][RAW_VALIDATE] {task.tag}", flush=True)
+        rc = self.run_subprocess(cmd, env, log_path)
+        if rc == 0:
+            print(f"[DONE][RAW_VALIDATE] {task.tag} summary={summary_path}", flush=True)
+        else:
+            print(f"[FAIL][RAW_VALIDATE] {task.tag} rc={rc} log={log_path}", flush=True)
+        return rc
+
     def run_single_task(self, model: ModelSpec, task: Task, gpu_ids: list[str]) -> None:
         env = self.build_env(model, task, gpu_ids)
         expected_count = self.get_expected_count(model, env, task.dataset)
@@ -1489,6 +1592,9 @@ except Exception:
 
         if not self.infer_complete(task, model, expected_count):
             raise RuntimeError("infer incomplete after run")
+        raw_validation_rc = self.run_raw_validation(task, model, env, expected_count)
+        if raw_validation_rc != 0:
+            raise RuntimeError(f"raw input validation failed rc={raw_validation_rc}")
 
         if self.eval_complete(task, model, expected_count):
             print(f"[SKIP][EVAL] {task.tag}: complete", flush=True)

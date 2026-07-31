@@ -1,0 +1,9 @@
+model_key,policy,mode,transform,dataset
+qwen25vl_3b,default,image_text,baseline,CountQA
+qwen25vl_3b,default,image_text_image_text,baseline,CountQA
+gemma3_4b,default,image_text,baseline,SpatialMQA
+gemma3_12b,default,image_text_image_text,baseline,SpatialMQA
+minicpm_o_45_no_reasoning,default,image_text,baseline,CountQA
+minicpm_o_45_no_reasoning,default,image_text_image_text,baseline,RefL4-val
+qwen25vl_3b,default,image_text,baseline,RefL4-val
+gemma3_4b,default,image_text_image_text,baseline,RefL4-val
