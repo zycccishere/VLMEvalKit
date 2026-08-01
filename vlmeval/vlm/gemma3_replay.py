@@ -216,6 +216,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         request,
         dataset,
         call_id,
+        sampling_params=None,
         parent_call_id=None,
         batch_position=None,
     ) -> None:
@@ -248,6 +249,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             visual_inputs=visual_inputs,
             content_sequence=summarize_content_sequence(message),
             processor_inputs=request,
+            generation_config=sampling_params,
             dataset=str(dataset) if dataset is not None else None,
             model_key=self.model_path,
             condition=self.replay_cfg.get("mode"),
@@ -498,6 +500,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             self._dump_final_vllm_request(
                 message=message,
                 request=request,
+                sampling_params=sampling_params,
                 dataset=dataset,
                 call_id=f"{parent_call_id}:{batch_position}",
                 parent_call_id=parent_call_id,

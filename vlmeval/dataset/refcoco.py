@@ -19,6 +19,16 @@ class RefCOCODataset(ImageBaseDataset):
     TYPE = 'GROUNDING'
     MODALITY = 'IMAGE'
     IOU_THRESHOLD = 0.5
+    COORDINATE_MODE_ENV = 'REFCOCO_COORDINATE_MODE'
+    LEGACY_COORDINATE_MODE = 'legacy_auto'
+    NORMALIZED_COORDINATE_MODE = 'normalized_0_1_xyxy'
+    NORMALIZED_PROMPT = (
+        'Bounding box coordinates are specified in the format '
+        '(top-left x, top-left y, bottom-right x, bottom-right y). '
+        'All values are floating point numbers bounded between 0 and 1. '
+        'Return only one box in the exact format [x1, y1, x2, y2]. '
+        'Please provide the bounding box coordinate of the region this sentence describes: {}'
+    )
 
     DATASET_FILES = {
         'RefCOCO': 'RefCOCO',
@@ -262,7 +272,37 @@ class RefCOCODataset(ImageBaseDataset):
         if len(set(self.data['index'])) != len(self.data):
             raise ValueError(f'Dataset {dataset} contains duplicate indices after loading.')
 
+    def coordinate_mode(self) -> str:
+        mode = os.environ.get(self.COORDINATE_MODE_ENV, self.LEGACY_COORDINATE_MODE).strip().lower()
+        supported = {self.LEGACY_COORDINATE_MODE, self.NORMALIZED_COORDINATE_MODE}
+        if mode not in supported:
+            raise ValueError(
+                f'Unsupported {self.COORDINATE_MODE_ENV}={mode!r}; expected one of {sorted(supported)}.'
+            )
+        return mode
+
+    @staticmethod
+    def _reference_expression(question: object) -> str:
+        text = str(question).strip()
+        match = re.search(r'<ref>(.*?)</ref>', text, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        prefix = 'Please provide the bounding box coordinate of the region this sentence describes:'
+        if text.lower().startswith(prefix.lower()):
+            return text[len(prefix):].strip()
+        return text
+
+    def build_prompt(self, line):
+        if isinstance(line, int):
+            line = self.data.iloc[line]
+        messages = super().build_prompt(line)
+        if self.coordinate_mode() == self.NORMALIZED_COORDINATE_MODE:
+            prompt = self.NORMALIZED_PROMPT.format(self._reference_expression(line['question']))
+            messages[-1] = dict(type='text', value=prompt)
+        return messages
+
     def evaluate(self, eval_file, **judge_kwargs):
+        eval_file = os.fspath(eval_file)
         self._ensure_metadata_ready()
         data = load(eval_file)
         if not isinstance(data, pd.DataFrame):
@@ -278,11 +318,13 @@ class RefCOCODataset(ImageBaseDataset):
         data['index'] = data['index'].astype(str)
 
         pred_bboxes: List[str] = []
+        pred_bbox_valid: List[int] = []
         ious: List[float] = []
         hits: List[int] = []
         split_labels: List[str] = []
         split_hits: Dict[str, List[int]] = defaultdict(list)
         split_ious: Dict[str, List[float]] = defaultdict(list)
+        split_valid: Dict[str, List[int]] = defaultdict(list)
 
         for record in data.to_dict('records'):
             idx = record['index']
@@ -297,9 +339,9 @@ class RefCOCODataset(ImageBaseDataset):
             gt_bbox = self._extract_gt_bbox(meta_row)
 
             pred_bbox_abs: Optional[np.ndarray] = None
-            pred_bbox_norm = self._parse_prediction(pred_text)
-            if pred_bbox_norm is not None and not np.isnan(width) and not np.isnan(height):
-                pred_bbox_abs = self._to_absolute(pred_bbox_norm, width, height)
+            pred_bbox = self._parse_model_prediction(pred_text)
+            if pred_bbox is not None and not np.isnan(width) and not np.isnan(height):
+                pred_bbox_abs = self._prediction_to_absolute(pred_bbox, width, height)
 
             if pred_bbox_abs is None or gt_bbox is None:
                 iou = 0.0
@@ -310,13 +352,17 @@ class RefCOCODataset(ImageBaseDataset):
             hits.append(hit)
             ious.append(iou)
             pred_bboxes.append(self._format_bbox(pred_bbox_abs))
+            pred_bbox_valid.append(int(pred_bbox_abs is not None))
 
             split_name = str(meta_row.get('split', self.dataset_name))
             split_labels.append(split_name)
             split_hits[split_name].append(hit)
             split_ious[split_name].append(iou)
+            split_valid[split_name].append(int(pred_bbox_abs is not None))
 
         data['pred_bbox'] = pred_bboxes
+        data['pred_bbox_valid'] = pred_bbox_valid
+        data['coordinate_mode'] = self.coordinate_mode()
         data['iou'] = ious
         data['hit'] = hits
         data['split'] = split_labels
@@ -331,10 +377,12 @@ class RefCOCODataset(ImageBaseDataset):
         for split_name in ordered_splits + unordered_splits:
             hits_list = split_hits[split_name]
             iou_list = split_ious[split_name]
+            valid_list = split_valid[split_name]
             row = {
                 'Split': split_name,
                 'Precision@1': float(np.mean(hits_list)) * 100 if hits_list else 0.0,
                 'Average IoU': float(np.mean(iou_list)) if iou_list else 0.0,
+                'Format Compliance': float(np.mean(valid_list)) * 100 if valid_list else 0.0,
                 'Samples': len(hits_list),
             }
             summary_rows.append(row)
@@ -344,10 +392,12 @@ class RefCOCODataset(ImageBaseDataset):
         if macro_rows:
             precision_values = [row['Precision@1'] for row in macro_rows]
             iou_values = [row['Average IoU'] for row in macro_rows]
+            compliance_values = [row['Format Compliance'] for row in macro_rows]
             overall_row = {
                 'Split': 'Average',
                 'Precision@1': float(np.mean(precision_values)),
                 'Average IoU': float(np.mean(iou_values)),
+                'Format Compliance': float(np.mean(compliance_values)),
                 'Samples': int(sum(row['Samples'] for row in macro_rows)),
             }
         else:
@@ -355,6 +405,7 @@ class RefCOCODataset(ImageBaseDataset):
                 'Split': 'Average',
                 'Precision@1': float(np.mean(hits)) * 100 if hits else 0.0,
                 'Average IoU': float(np.mean(ious)) if ious else 0.0,
+                'Format Compliance': float(np.mean(pred_bbox_valid)) * 100 if pred_bbox_valid else 0.0,
                 'Samples': len(hits),
             }
         summary_rows.append(overall_row)
@@ -362,6 +413,21 @@ class RefCOCODataset(ImageBaseDataset):
         score_file = get_intermediate_file_path(eval_file, '_acc')
         dump(summary_df, score_file)
         return summary_df
+
+    def _prediction_to_absolute(
+        self,
+        coords: np.ndarray,
+        width: float,
+        height: float,
+    ) -> Optional[np.ndarray]:
+        if self.coordinate_mode() == self.NORMALIZED_COORDINATE_MODE:
+            return self._normalized_0_1_to_absolute(coords, width, height)
+        return self._to_absolute(coords, width, height)
+
+    def _parse_model_prediction(self, text: str) -> Optional[np.ndarray]:
+        if self.coordinate_mode() == self.NORMALIZED_COORDINATE_MODE:
+            return self._parse_bracket_prediction(text)
+        return self._parse_prediction(text)
 
     def _ensure_metadata_ready(self) -> None:
         data_root = LMUDataRoot()
@@ -488,7 +554,7 @@ class RefCOCODataset(ImageBaseDataset):
         return None
 
     @staticmethod
-    def _parse_prediction(text: str) -> Optional[np.ndarray]:
+    def _parse_bracket_prediction(text: str) -> Optional[np.ndarray]:
         if not isinstance(text, str):
             return None
 
@@ -501,15 +567,24 @@ class RefCOCODataset(ImageBaseDataset):
             rf'{separator_pattern}({number_pattern})\s*\]'
         )
 
-        for match in bbox_regex.finditer(text):
-            try:
-                coords = np.array([float(match.group(i)) for i in range(1, 5)], dtype=float)
-            except ValueError:
-                continue
+        match = bbox_regex.fullmatch(text.strip())
+        if match is None:
+            return None
+        try:
+            coords = np.array([float(match.group(i)) for i in range(1, 5)], dtype=float)
+        except ValueError:
+            return None
+        return coords if np.isfinite(coords).all() else None
 
-            if not np.isnan(coords).any():
-                return coords
+    @staticmethod
+    def _parse_prediction(text: str) -> Optional[np.ndarray]:
+        bracketed = RefCOCODataset._parse_bracket_prediction(text)
+        if bracketed is not None:
+            return bracketed
+        if not isinstance(text, str):
+            return None
 
+        number_pattern = r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?'
         matches = re.findall(number_pattern, text)
         if len(matches) < 4:
             return None
@@ -542,6 +617,26 @@ class RefCOCODataset(ImageBaseDataset):
             coords[1], coords[3] = coords[3], coords[1]
 
         return coords
+
+    @staticmethod
+    def _normalized_0_1_to_absolute(
+        coords: np.ndarray,
+        width: float,
+        height: float,
+    ) -> Optional[np.ndarray]:
+        if coords is None or width <= 0 or height <= 0:
+            return None
+        coords = np.asarray(coords, dtype=float)[:4]
+        if coords.shape != (4,) or not np.isfinite(coords).all():
+            return None
+        if np.any(coords < 0.0) or np.any(coords > 1.0):
+            return None
+        if coords[2] < coords[0] or coords[3] < coords[1]:
+            return None
+        result = coords.copy()
+        result[0::2] *= width
+        result[1::2] *= height
+        return result
 
     @staticmethod
     def _compute_iou(box1: np.ndarray, box2: np.ndarray) -> float:

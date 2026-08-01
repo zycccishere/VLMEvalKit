@@ -34,6 +34,10 @@ def main():
     spatial_row = spatialmqa.data.iloc[0]
     spatial_message = spatialmqa.build_prompt(spatial_row)
     spatial_text = _single_text(spatial_message)
+    spatial_official_wording_changes = sum(
+        spatialmqa._official_question_text(question) != str(question).strip()
+        for question in spatialmqa.data['question']
+    )
 
     ref_indices = {'RefCOCOg_test_42959', 'RefCOCOg_test_42960'}
     ref_rows = refcoco.data[refcoco.data['index'].isin(ref_indices)]
@@ -44,12 +48,22 @@ def main():
     ref_message = refcoco.build_prompt(ref_row)
     ref_text = _single_text(ref_message)
     pred_norm = refcoco._parse_prediction(str(ref_row['answer']))
-    pred_abs = refcoco._to_absolute(
+    pred_abs = refcoco._prediction_to_absolute(
         pred_norm,
         float(ref_row['width']),
         float(ref_row['height']),
     )
     ref_iou = float(refcoco._compute_iou(pred_abs, refcoco._extract_gt_bbox(ref_row)))
+    invalid_ref_bbox = refcoco._prediction_to_absolute(
+        refcoco._parse_prediction('[768, 142, 1048, 552]'),
+        float(ref_row['width']),
+        float(ref_row['height']),
+    )
+    unbracketed_ref_bbox = refcoco._parse_model_prediction('bbox: 0.1 0.2 0.8 0.9')
+    prefixed_ref_bbox = refcoco._parse_model_prediction('bbox: [0.1, 0.2, 0.8, 0.9]')
+    multiple_ref_bbox = refcoco._parse_model_prediction(
+        '[0.1, 0.2, 0.8, 0.9] [0.1, 0.2, 0.8, 0.9]'
+    )
 
     count_parser_sentinels = {
         '2': parse_countqa_integer('2'),
@@ -71,12 +85,23 @@ def main():
         'spatialmqa_relation_prompt': 'answer the correct spatial relation' in spatial_text,
         'spatialmqa_relation_options': 'Options: ' in spatial_text and '; ' in spatial_text,
         'spatialmqa_no_text_image_marker': '<image>' not in spatial_text,
+        'spatialmqa_official_wording_changes': spatial_official_wording_changes == 748,
         'refcoco_class': type(refcoco).__name__ == 'RefCOCODataset',
         'refcocog_rows_found': len(ref_rows) == 2,
         'refcocog_test_rows': refcocog_test_rows == 9602,
         'refcocog_split': set(ref_rows['split']) == {'RefCOCOg_test'},
-        'refcoco_bbox_prompt': 'bounding box coordinate' in ref_text.lower(),
+        'refcoco_coordinate_mode': refcoco.coordinate_mode() == 'normalized_0_1_xyxy',
+        'refcoco_bbox_prompt': (
+            'All values are floating point numbers bounded between 0 and 1.' in ref_text
+            and 'exact format [x1, y1, x2, y2]' in ref_text
+            and ref_text.endswith('the man in yellow coat')
+            and '<ref>' not in ref_text
+        ),
         'refcoco_gt_roundtrip': abs(ref_iou - 1.0) < 1e-12,
+        'refcoco_out_of_contract_rejected': invalid_ref_bbox is None,
+        'refcoco_unbracketed_output_rejected': unbracketed_ref_bbox is None,
+        'refcoco_prefixed_output_rejected': prefixed_ref_bbox is None,
+        'refcoco_multiple_boxes_rejected': multiple_ref_bbox is None,
     }
     failed = {key: value for key, value in checks.items() if not value}
     if failed:
@@ -100,6 +125,7 @@ def main():
                 'answer_letter': str(spatial_row['answer']),
                 'answer_relation': str(spatial_row['relation']),
                 'message': spatial_message,
+                'official_wording_changes': spatial_official_wording_changes,
             },
             'RefCOCOg_test': {
                 'class': type(refcoco).__name__,
@@ -109,6 +135,7 @@ def main():
                 'selected_splits': sorted(ref_rows['split'].astype(str).unique().tolist()),
                 'answer': str(ref_row['answer']),
                 'message': ref_message,
+                'coordinate_mode': refcoco.coordinate_mode(),
                 'gt_roundtrip_iou': ref_iou,
             },
         },

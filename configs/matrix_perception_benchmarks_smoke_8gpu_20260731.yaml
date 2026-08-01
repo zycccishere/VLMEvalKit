@@ -20,6 +20,15 @@ dataset_task_env:
     GEMMA3_VLLM_TOP_P: "1"
     GEMMA3_MAX_NEW_TOKENS: "32"
     MINICPM45_MAX_NEW_TOKENS: "32"
+    MINICPM45_NUM_BEAMS: "1"
+    MINICPM45_SAMPLING: "0"
+    MINICPM45_TEMPERATURE: "0"
+    MINICPM45_TOP_P: "1"
+    MINICPM45_TOP_K: "0"
+    MINICPM45_REPETITION_PENALTY: "1"
+    MINICPM45_PRESENCE_PENALTY: "0"
+  RefCOCO:
+    REFCOCO_COORDINATE_MODE: normalized_0_1_xyxy
 policies:
   default:
     replay_prompt_template_name: identity

@@ -60,6 +60,42 @@ class FinalModelInputDumpTest(unittest.TestCase):
         )
         self.assertIsNone(payload)
 
+    def test_generation_config_reads_effective_object_attributes(self):
+        class FakeSamplingParams:
+            n = 1
+            best_of = 1
+            temperature = 0.0
+            top_p = 1.0
+            top_k = -1
+            max_tokens = 32
+            repetition_penalty = 1.0
+            presence_penalty = 0.0
+            length_penalty = 1.0
+            early_stopping = False
+
+        self.assertEqual(
+            FINAL_DUMP.summarize_generation_config(
+                FakeSamplingParams(),
+                extras={"requested_num_beams": 1},
+            ),
+            {
+                "n": 1,
+                "best_of": 1,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "max_tokens": 32,
+                "repetition_penalty": 1.0,
+                "presence_penalty": 0.0,
+                "length_penalty": 1.0,
+                "early_stopping": False,
+                "requested_num_beams": 1,
+                "summary_source_type": "FakeSamplingParams",
+                "summary_completeness": "selected_effective_fields",
+                "decoding_mode": "greedy",
+            },
+        )
+
     def test_schema_visual_order_hash_and_identity_sources(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             dump_path = Path(tmpdir) / "nested" / "raw.jsonl"
@@ -90,6 +126,12 @@ class FinalModelInputDumpTest(unittest.TestCase):
                     ]
                 ),
                 processor_inputs={"input_ids": torch.tensor([[1, 2, 3]])},
+                generation_config={
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "max_tokens": 32,
+                    "repetition_penalty": 1.0,
+                },
                 dataset="CountQA",
                 model_key="fallback-model-key",
                 sample_meta={"sample_index": "countqa-0001-00"},
@@ -130,6 +172,18 @@ class FinalModelInputDumpTest(unittest.TestCase):
         self.assertEqual(
             record["processor_input_summary"]["input_ids"]["shape"],
             [1, 3],
+        )
+        self.assertEqual(
+            record["generation_config"],
+            {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "max_tokens": 32,
+                "repetition_penalty": 1.0,
+                "summary_source_type": "mapping",
+                "summary_completeness": "selected_effective_fields",
+                "decoding_mode": "greedy",
+            },
         )
 
     def test_missing_index_is_explicit_and_call_id_remains_available(self):

@@ -70,7 +70,24 @@ class DatasetTaskEnvTest(unittest.TestCase):
         minicpm_count = runner.build_env(minicpm, self._task(runner, minicpm.key, 'CountQA'), ['2'])
         minicpm_spatial = runner.build_env(minicpm, self._task(runner, minicpm.key, 'SpatialMQA'), ['2'])
         self.assertEqual(minicpm_count['MINICPM45_MAX_NEW_TOKENS'], '32')
+        self.assertEqual(minicpm_count['MINICPM45_NUM_BEAMS'], '1')
+        self.assertEqual(minicpm_count['MINICPM45_SAMPLING'], '0')
+        self.assertEqual(minicpm_count['MINICPM45_REPETITION_PENALTY'], '1')
         self.assertEqual(minicpm_spatial['MINICPM45_MAX_NEW_TOKENS'], '16384')
+        for key in (
+            'MINICPM45_NUM_BEAMS',
+            'MINICPM45_SAMPLING',
+            'MINICPM45_TEMPERATURE',
+            'MINICPM45_TOP_P',
+            'MINICPM45_TOP_K',
+            'MINICPM45_REPETITION_PENALTY',
+            'MINICPM45_PRESENCE_PENALTY',
+        ):
+            self.assertNotIn(key, minicpm_spatial)
+
+        qwen_refcoco = runner.build_env(qwen, self._task(runner, qwen.key, 'RefCOCO'), ['3'])
+        self.assertEqual(qwen_refcoco['REFCOCO_COORDINATE_MODE'], 'normalized_0_1_xyxy')
+        self.assertNotIn('REFCOCO_COORDINATE_MODE', qwen_spatial)
 
 
 if __name__ == '__main__':

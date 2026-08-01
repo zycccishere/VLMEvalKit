@@ -129,8 +129,22 @@ class MiniCPM_V_4_5(BaseModel):
             self.model.eval().cuda()
         torch.cuda.empty_cache()
 
-        self.num_beams = 3
+        self.num_beams = _env_int("MINICPM45_NUM_BEAMS", 3)
         self.max_new_tokens = _env_int("MINICPM45_MAX_NEW_TOKENS", 16384)
+        env_generate_overrides = {
+            "max_new_tokens": ("MINICPM45_MAX_NEW_TOKENS", int),
+            "num_beams": ("MINICPM45_NUM_BEAMS", int),
+            "sampling": ("MINICPM45_SAMPLING", _env_truthy),
+            "temperature": ("MINICPM45_TEMPERATURE", float),
+            "top_p": ("MINICPM45_TOP_P", float),
+            "top_k": ("MINICPM45_TOP_K", int),
+            "repetition_penalty": ("MINICPM45_REPETITION_PENALTY", float),
+            "presence_penalty": ("MINICPM45_PRESENCE_PENALTY", float),
+        }
+        for key, (env_name, parser) in env_generate_overrides.items():
+            raw = os.environ.get(env_name, "").strip()
+            if raw:
+                self.generate_overrides[key] = parser(env_name) if parser is _env_truthy else parser(raw)
         self.options_suffix_prompt = "\nAnswer with the option's letter from the given choices directly."
         self.wo_options_system_prompt = "Carefully read the following question. Answer the question directly."
         self.detail_system_prompt = "Answer this question in detail."
@@ -635,6 +649,9 @@ class MiniCPM_V_4_5(BaseModel):
 
     def _generate_batch_inner_vllm(self, messages, dataset=None):
         sampling_params, chat_template_kwargs = self._build_vllm_sampling(dataset=dataset)
+        requested_num_beams = int(
+            self._build_default_generate_kwargs(dataset=dataset).get("num_beams", 1)
+        )
         chat_template = None
         if chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False:
             chat_template = self._original_chat_template
@@ -676,6 +693,8 @@ class MiniCPM_V_4_5(BaseModel):
                         "chat_template_content_format": "string",
                         "chat_template_kwargs": chat_template_kwargs,
                     },
+                    generation_config=sampling_params,
+                    generation_config_extras={"requested_num_beams": requested_num_beams},
                     dataset=str(dataset) if dataset is not None else None,
                     model_key=self.model_path,
                     condition=getattr(self, "replay_cfg", {}).get("mode"),

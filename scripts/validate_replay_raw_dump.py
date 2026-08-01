@@ -302,6 +302,10 @@ def validate_final_record(
         errors.append(
             f"final question occurrences {question_occurrences} != {expected_occurrences}"
         )
+    generation_config = record.get("generation_config")
+    if generation_config is not None and not isinstance(generation_config, dict):
+        errors.append("generation_config is not an object")
+        generation_config = None
     return {
         "canonical_index": identity.get("canonical_index"),
         "batch_position": record.get("batch_position"),
@@ -311,6 +315,7 @@ def validate_final_record(
         "content_sequence_types": sequence_types,
         "question_occurrences": question_occurrences,
         "consumer_api": record.get("consumer_api"),
+        "generation_config": generation_config,
         "errors": errors,
     }
 

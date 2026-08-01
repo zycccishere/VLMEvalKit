@@ -17,6 +17,12 @@ class SpatialMQADataset(ImageMCQDataset):
     DATASET_URL = {'SpatialMQA': ''}
     DATASET_MD5 = {}
 
+    @staticmethod
+    def _official_question_text(question):
+        # HF test differs from the author repository only by this fixed wording
+        # on 748 rows; options, answers, images, and row order are identical.
+        return str(question).strip().replace('picture', 'image')
+
     def build_prompt(self, line):
         if isinstance(line, int):
             line = self.data.iloc[line]
@@ -34,7 +40,7 @@ class SpatialMQADataset(ImageMCQDataset):
             # The official scripts replace their literal <image> marker inside
             # the model wrapper. Here the preceding structured image item is
             # that marker, so retaining the text token would duplicate it.
-            f'Input: Image: provided above, Question: {str(line["question"]).strip()}, '
+            f'Input: Image: provided above, Question: {self._official_question_text(line["question"])}, '
             f'Options: {"; ".join(options)}.\nOutput:'
         )
         return [

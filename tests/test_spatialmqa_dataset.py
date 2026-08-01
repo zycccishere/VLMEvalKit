@@ -37,7 +37,7 @@ def test_official_spatialmqa_prompt_uses_relation_text_options(tmp_path, monkeyp
     pd.DataFrame([{
         'index': 'spatialmqa-test-000000',
         'image_path': str(image),
-        'question': 'Where is the object?',
+        'question': 'Where is the object in the picture?',
         'A': 'left of',
         'B': 'right of',
         'answer': 'B',
@@ -50,6 +50,8 @@ def test_official_spatialmqa_prompt_uses_relation_text_options(tmp_path, monkeyp
     assert dataset.FORCE_DATASET_PROMPT is True
     assert [item['type'] for item in prompt] == ['image', 'text']
     assert 'Input: Image: provided above' in prompt[1]['value']
+    assert 'Where is the object in the image?' in prompt[1]['value']
+    assert 'picture' not in prompt[1]['value']
     assert '<image>' not in prompt[1]['value']
     assert 'Options: left of; right of.' in prompt[1]['value']
     assert 'without explaining any reason' in prompt[1]['value']

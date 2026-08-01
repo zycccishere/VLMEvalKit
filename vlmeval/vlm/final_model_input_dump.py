@@ -282,6 +282,75 @@ def _summarize_processor_inputs(inputs: Any) -> Any:
     return _safe_json(inputs)
 
 
+_GENERATION_CONFIG_FIELDS = (
+    "n",
+    "best_of",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "max_tokens",
+    "min_tokens",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "stop",
+    "stop_token_ids",
+    "ignore_eos",
+    "use_beam_search",
+    "length_penalty",
+    "early_stopping",
+    "include_stop_str_in_output",
+    "detokenize",
+    "skip_special_tokens",
+    "spaces_between_special_tokens",
+    "truncate_prompt_tokens",
+    "bad_words",
+    "allowed_token_ids",
+    "logit_bias",
+    "logprobs",
+    "prompt_logprobs",
+    "requested_num_beams",
+)
+
+
+def summarize_generation_config(
+    config: Any,
+    extras: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return a stable JSON-safe summary of effective decoding controls."""
+    if config is None:
+        return None
+    if isinstance(config, Mapping):
+        values = dict(config)
+        source_type = "mapping"
+    else:
+        source_type = type(config).__name__
+        values = {
+            name: getattr(config, name)
+            for name in _GENERATION_CONFIG_FIELDS
+            if hasattr(config, name)
+        }
+    values.update(dict(extras or {}))
+    summary = {
+        name: _safe_json(values[name])
+        for name in _GENERATION_CONFIG_FIELDS
+        if name in values
+    }
+    summary["summary_source_type"] = source_type
+    summary["summary_completeness"] = "selected_effective_fields"
+    use_beam_search = bool(summary.get("use_beam_search", False))
+    temperature = summary.get("temperature")
+    if use_beam_search:
+        summary["decoding_mode"] = "beam_search"
+    elif temperature is not None and float(temperature) == 0.0:
+        summary["decoding_mode"] = "greedy"
+    elif temperature is not None:
+        summary["decoding_mode"] = "sampling"
+    return summary
+
+
 def _first_env(names: Sequence[str]) -> tuple[str | None, str | None]:
     for name in names:
         value = os.environ.get(name, "").strip()
@@ -350,6 +419,8 @@ def dump_final_model_input(
     visual_inputs: Sequence[Mapping[str, Any]],
     content_sequence: Sequence[Mapping[str, Any]] | None = None,
     processor_inputs: Any = None,
+    generation_config: Any = None,
+    generation_config_extras: Mapping[str, Any] | None = None,
     dataset: str | None = None,
     model_key: str | None = None,
     condition: str | None = None,
@@ -408,6 +479,10 @@ def dump_final_model_input(
             "visual_input_count": len(summarized_visuals),
             "visual_inputs": summarized_visuals,
             "processor_input_summary": _summarize_processor_inputs(processor_inputs),
+            "generation_config": summarize_generation_config(
+                generation_config,
+                extras=generation_config_extras,
+            ),
             "observability": _safe_json(dict(observability or {})),
         }
         _append_jsonl(dump_path, payload)
