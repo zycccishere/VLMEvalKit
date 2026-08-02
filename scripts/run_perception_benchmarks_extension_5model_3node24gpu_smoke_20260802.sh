@@ -108,8 +108,16 @@ if [[ "$JOB_NODE_RANK" == "0" ]]; then
     echo "[FATAL] output root must be fresh for this submission: $OUT_ROOT" >&2
     exit 1
   fi
-  mkdir -p "$OUT_ROOT/_control"
+  mkdir -p "$OUT_ROOT/_control" "$OUT_ROOT/_inputs"
   write_marker "$RUN_ID_FILE"
+  # Materialize the whole target split once before any of the 30 workers can
+  # touch the shared image cache. This keeps cold-cache smoke runs race-free.
+  "$CONTROL_PYTHON" scripts/materialize_dataset_split_images.py \
+    --dataset RefCOCO \
+    --split-column split \
+    --split-value RefCOCOg_test \
+    --expected-count 9602 \
+    --manifest-output "$OUT_ROOT/_inputs/refcocog_test_images.manifest.json"
   "$CONTROL_PYTHON" scripts/validate_perception_dataset_protocols.py \
     --output "$OUT_ROOT/dataset_protocol_smoke.json"
   write_marker "$PREFLIGHT_READY"
