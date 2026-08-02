@@ -109,6 +109,7 @@ models:
       MINICPM45_TOP_K: '0'
       MINICPM45_REPETITION_PENALTY: '1'
       MINICPM45_PRESENCE_PENALTY: '0'
+      MINICPM45_VLLM_SKIP_SPECIAL_TOKENS: '0'
   minicpm_o_45_no_reasoning:
     display_name: MiniCPM-o-4_5 no reasoning
     registry_name: MiniCPM-o-4_5-Replay

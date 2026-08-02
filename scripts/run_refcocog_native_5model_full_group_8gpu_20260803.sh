@@ -62,7 +62,9 @@ for path in "${COMMON_PATHS[@]}"; do
   [[ -e "$path" ]] || { echo "[FATAL] missing preflight path: $path" >&2; exit 1; }
 done
 
-OUT_ROOT="$REPO/runs/refcocog_native_5model_full_20260803"
+MATRIX_CONFIG=${REFCOCO_NATIVE_MATRIX_CONFIG:-configs/matrix_refcocog_native_5model_full_20260803.yaml}
+MATRIX_NAME=${REFCOCO_NATIVE_MATRIX_NAME:-refcocog_native_5model_full_20260803}
+OUT_ROOT=${REFCOCO_NATIVE_OUT_ROOT:-$REPO/runs/refcocog_native_5model_full_20260803}
 mkdir -p "$OUT_ROOT/_control" "$OUT_ROOT/_inputs" "$OUT_ROOT/_gpu_monitor/$GROUP"
 GROUP_MARKER="$OUT_ROOT/_control/${GROUP}_runner_done"
 if [[ -e "$GROUP_MARKER" ]]; then
@@ -124,7 +126,7 @@ flock -u 9
 
 TASK_MANIFEST="configs/task_manifests/refcocog_native_5model_full_20260803/${GROUP}_tasks.csv"
 COMMON_ARGS=(
-  --matrix-config configs/matrix_refcocog_native_5model_full_20260803.yaml
+  --matrix-config "$MATRIX_CONFIG"
   --model-config configs/models_refcocog_native.yaml
   --nodes 1
   --node-rank 0
@@ -166,7 +168,7 @@ else
 fi
 "$CONTROL_PYTHON" scripts/validate_refcocog_native_full.py \
   --root "$OUT_ROOT" \
-  --matrix refcocog_native_5model_full_20260803 \
+  --matrix "$MATRIX_NAME" \
   --allowlist "$OUT_ROOT/_inputs/refcocog_test_indices.txt" \
   --models "${GROUP_MODELS[@]}" \
   --expected-rows 9602 \
@@ -182,7 +184,7 @@ if [[ -e "$OUT_ROOT/_control/gemma_runner_done" && -e "$OUT_ROOT/_control/minicp
   [[ "$(<"$OUT_ROOT/_control/minicpm_runner_done")" == "$RUN_UUID" ]]
   "$CONTROL_PYTHON" scripts/validate_refcocog_native_full.py \
     --root "$OUT_ROOT" \
-    --matrix refcocog_native_5model_full_20260803 \
+    --matrix "$MATRIX_NAME" \
     --allowlist "$OUT_ROOT/_inputs/refcocog_test_indices.txt" \
     --models gemma3_4b gemma3_12b gemma3_27b minicpm_o_45_no_reasoning minicpm_v_45_no_reasoning \
     --expected-rows 9602 \

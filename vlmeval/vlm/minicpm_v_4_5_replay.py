@@ -607,6 +607,7 @@ class MiniCPM_V_4_5(BaseModel):
             top_k = 0
         repetition_penalty = float(generate_kwargs.pop("repetition_penalty", 1.0))
         presence_penalty = float(generate_kwargs.pop("presence_penalty", 0.0))
+        skip_special_tokens = _env_truthy("MINICPM45_VLLM_SKIP_SPECIAL_TOKENS", True)
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
             temperature=temperature,
@@ -614,6 +615,7 @@ class MiniCPM_V_4_5(BaseModel):
             top_k=top_k,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            skip_special_tokens=skip_special_tokens,
         )
         chat_template_kwargs = {}
         if enable_thinking is not None:
