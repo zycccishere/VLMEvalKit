@@ -1,0 +1,7 @@
+model_key,policy,mode,transform,dataset
+qwen25vl_72b,default,image_text,baseline,CountQA
+qwen25vl_72b,default,image_text_image_text,baseline,CountQA
+qwen25vl_72b,default,image_text,baseline,SpatialMQA
+qwen25vl_72b,default,image_text_image_text,baseline,SpatialMQA
+qwen25vl_72b,default,image_text,baseline,RefCOCO
+qwen25vl_72b,default,image_text_image_text,baseline,RefCOCO

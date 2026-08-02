@@ -1,0 +1,13 @@
+model_key,policy,mode,transform,dataset
+qwen25vl_32b,default,image_text,baseline,CountQA
+qwen25vl_32b,default,image_text_image_text,baseline,CountQA
+qwen25vl_32b,default,image_text,baseline,SpatialMQA
+qwen25vl_32b,default,image_text_image_text,baseline,SpatialMQA
+qwen25vl_32b,default,image_text,baseline,RefCOCO
+qwen25vl_32b,default,image_text_image_text,baseline,RefCOCO
+gemma3_27b,default,image_text,baseline,CountQA
+gemma3_27b,default,image_text_image_text,baseline,CountQA
+gemma3_27b,default,image_text,baseline,SpatialMQA
+gemma3_27b,default,image_text_image_text,baseline,SpatialMQA
+gemma3_27b,default,image_text,baseline,RefCOCO
+gemma3_27b,default,image_text_image_text,baseline,RefCOCO

@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from collections import Counter
 from pathlib import Path
 
+import pandas as pd
 
-COUNTQA_EXPECTED = {
+
+GREEDY_32_EXPECTED = {
     "n": 1,
     "temperature": 0.0,
     "top_p": 1.0,
@@ -19,6 +22,11 @@ COUNTQA_EXPECTED = {
     "decoding_mode": "greedy",
     "summary_source_type": "SamplingParams",
     "summary_completeness": "selected_effective_fields",
+}
+
+CONDITION_TO_MODE = {
+    "iq": "image_text",
+    "iqiq": "image_text_image_text",
 }
 
 MODEL_CONTRACTS = {
@@ -37,6 +45,79 @@ def _equal(actual, expected):
     return actual == expected
 
 
+def _load_predictions(path):
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(path, usecols=["index", "prediction"])
+    if path.suffix.lower() == ".tsv":
+        return pd.read_csv(path, sep="\t", usecols=["index", "prediction"])
+    return pd.read_csv(path, usecols=["index", "prediction"])
+
+
+def _classify_normalized_bbox(value):
+    number = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
+    separator = r"(?:\s*,\s*|\s+)"
+    match = re.fullmatch(
+        rf"\[\s*({number}){separator}({number}){separator}"
+        rf"({number}){separator}({number})\s*\]",
+        str(value).strip(),
+    )
+    if match is None:
+        return "invalid_syntax"
+    coords = [float(match.group(index)) for index in range(1, 5)]
+    if not all(math.isfinite(coord) for coord in coords):
+        return "invalid_syntax"
+    if any(coord < 0.0 or coord > 1.0 for coord in coords):
+        return "out_of_range_or_reversed"
+    if coords[2] < coords[0] or coords[3] < coords[1]:
+        return "out_of_range_or_reversed"
+    return "valid_normalized"
+
+
+def _audit_refcoco_predictions(root, required_tasks, expected_records, errors):
+    audits = {}
+    for task_key in required_tasks:
+        dataset, model_key, condition = task_key.split(":", 2)
+        if dataset != "RefCOCO":
+            continue
+        mode = CONDITION_TO_MODE.get(condition)
+        if mode is None:
+            errors.append(f"unsupported RefCOCO condition in required task: {task_key}")
+            continue
+        prediction_root = root / "default" / mode / "baseline" / model_key / dataset / "predictions"
+        candidates = sorted(
+            path for path in prediction_root.glob("*")
+            if path.is_file() and path.suffix.lower() in {".xlsx", ".xls", ".csv", ".tsv"}
+        )
+        if len(candidates) != 1:
+            errors.append(
+                f"{task_key}: expected one RefCOCO prediction file, found {len(candidates)}: "
+                f"{[str(path) for path in candidates]}"
+            )
+            continue
+        path = candidates[0]
+        try:
+            frame = _load_predictions(path)
+        except Exception as exc:
+            errors.append(f"{task_key}: unable to load {path}: {type(exc).__name__}: {exc}")
+            continue
+        if len(frame) != expected_records:
+            errors.append(
+                f"{task_key}: RefCOCO predictions={len(frame)}, expected {expected_records}"
+            )
+        if frame["index"].astype(str).duplicated().any():
+            errors.append(f"{task_key}: duplicate RefCOCO prediction indices in {path}")
+        counts = Counter(_classify_normalized_bbox(value) for value in frame["prediction"])
+        audits[task_key] = {
+            "prediction_file": str(path),
+            "records": len(frame),
+            "valid_normalized": counts["valid_normalized"],
+            "out_of_range_or_reversed": counts["out_of_range_or_reversed"],
+            "invalid_syntax": counts["invalid_syntax"],
+            "predictions": [str(value) for value in frame["prediction"].tolist()],
+        }
+    return audits
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -49,7 +130,7 @@ def main() -> int:
     observed = Counter()
     observed_indices = {}
     checked_records = 0
-    checked_countqa_records = 0
+    checked_generation_records = 0
     for path in sorted(args.root.rglob("replay_raw.jsonl")):
         for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             record = json.loads(line)
@@ -104,10 +185,8 @@ def main() -> int:
             if not isinstance(config, dict):
                 errors.append(f"{record_prefix}: missing generation_config")
                 continue
-            if dataset != "CountQA":
-                continue
-            checked_countqa_records += 1
-            for key, expected in COUNTQA_EXPECTED.items():
+            checked_generation_records += 1
+            for key, expected in GREEDY_32_EXPECTED.items():
                 if not _equal(config.get(key), expected):
                     errors.append(
                         f"{record_prefix}: generation_config.{key}={config.get(key)!r}, "
@@ -129,8 +208,8 @@ def main() -> int:
 
     if checked_records == 0:
         errors.append("no final_model_input records found")
-    if checked_countqa_records == 0:
-        errors.append("no CountQA final_model_input records found")
+    if checked_generation_records == 0:
+        errors.append("no generation configs found")
 
     required_tasks = list(dict.fromkeys(args.required_task))
     for task_key in required_tasks:
@@ -142,13 +221,21 @@ def main() -> int:
                 f"expected {args.expect_records_per_task}"
             )
 
+    refcoco_prediction_audit = _audit_refcoco_predictions(
+        args.root,
+        required_tasks,
+        args.expect_records_per_task,
+        errors,
+    )
+
     payload = {
         "root": str(args.root),
         "checked_final_records": checked_records,
-        "checked_countqa_final_records": checked_countqa_records,
+        "checked_generation_config_records": checked_generation_records,
         "observed_tasks": dict(sorted(observed.items())),
         "required_tasks": required_tasks,
         "expected_records_per_task": args.expect_records_per_task,
+        "refcoco_prediction_audit": refcoco_prediction_audit,
         "errors": errors,
         "ok": not errors,
     }
