@@ -2,7 +2,7 @@
 set -euo pipefail
 
 detect_job_node_rank() {
-  for key in NODE_RANK SLURM_NODEID RANK OMPI_COMM_WORLD_RANK PMI_RANK; do
+  for key in PERCEPTION_SHARD_RANK NODE_RANK SLURM_NODEID RANK OMPI_COMM_WORLD_RANK PMI_RANK; do
     if [[ -n "${!key:-}" ]]; then
       printf '%s\n' "${!key}"
       return 0
@@ -70,6 +70,7 @@ fi
 
 # Each matrix cell launches an independent, model-local vLLM process.
 unset RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT NODE_RANK GROUP_RANK
+unset PERCEPTION_SHARD_RANK
 unset SLURM_NODEID SLURM_PROCID SLURM_LOCALID SLURM_NTASKS SLURM_NPROCS
 unset OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_SIZE OMPI_COMM_WORLD_LOCAL_RANK
 unset PMI_RANK PMI_SIZE PMI_LOCAL_RANK PMIX_RANK
