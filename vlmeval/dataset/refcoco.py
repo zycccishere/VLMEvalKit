@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import os.path as osp
@@ -22,12 +23,19 @@ class RefCOCODataset(ImageBaseDataset):
     COORDINATE_MODE_ENV = 'REFCOCO_COORDINATE_MODE'
     LEGACY_COORDINATE_MODE = 'legacy_auto'
     NORMALIZED_COORDINATE_MODE = 'normalized_0_1_xyxy'
+    GEMMA_COORDINATE_MODE = 'gemma_0_1000_yxyx'
+    MINICPM_V46_COORDINATE_MODE = 'minicpm_v46_0_1000_xyxy'
     NORMALIZED_PROMPT = (
         'Bounding box coordinates are specified in the format '
         '(top-left x, top-left y, bottom-right x, bottom-right y). '
         'All values are floating point numbers bounded between 0 and 1. '
         'Return only one box in the exact format [x1, y1, x2, y2]. '
         'Please provide the bounding box coordinate of the region this sentence describes: {}'
+    )
+    GEMMA_PROMPT = 'detect {}, output only ```json'
+    MINICPM_V46_PROMPT = (
+        'Please provide the bounding box coordinate of the region this sentence describes: '
+        '<ref>{}</ref>'
     )
 
     DATASET_FILES = {
@@ -274,7 +282,12 @@ class RefCOCODataset(ImageBaseDataset):
 
     def coordinate_mode(self) -> str:
         mode = os.environ.get(self.COORDINATE_MODE_ENV, self.LEGACY_COORDINATE_MODE).strip().lower()
-        supported = {self.LEGACY_COORDINATE_MODE, self.NORMALIZED_COORDINATE_MODE}
+        supported = {
+            self.LEGACY_COORDINATE_MODE,
+            self.NORMALIZED_COORDINATE_MODE,
+            self.GEMMA_COORDINATE_MODE,
+            self.MINICPM_V46_COORDINATE_MODE,
+        }
         if mode not in supported:
             raise ValueError(
                 f'Unsupported {self.COORDINATE_MODE_ENV}={mode!r}; expected one of {sorted(supported)}.'
@@ -296,8 +309,16 @@ class RefCOCODataset(ImageBaseDataset):
         if isinstance(line, int):
             line = self.data.iloc[line]
         messages = super().build_prompt(line)
-        if self.coordinate_mode() == self.NORMALIZED_COORDINATE_MODE:
-            prompt = self.NORMALIZED_PROMPT.format(self._reference_expression(line['question']))
+        mode = self.coordinate_mode()
+        expression = self._reference_expression(line['question'])
+        if mode == self.NORMALIZED_COORDINATE_MODE:
+            prompt = self.NORMALIZED_PROMPT.format(expression)
+            messages[-1] = dict(type='text', value=prompt)
+        elif mode == self.GEMMA_COORDINATE_MODE:
+            prompt = self.GEMMA_PROMPT.format(expression)
+            messages[-1] = dict(type='text', value=prompt)
+        elif mode == self.MINICPM_V46_COORDINATE_MODE:
+            prompt = self.MINICPM_V46_PROMPT.format(expression)
             messages[-1] = dict(type='text', value=prompt)
         return messages
 
@@ -420,13 +441,23 @@ class RefCOCODataset(ImageBaseDataset):
         width: float,
         height: float,
     ) -> Optional[np.ndarray]:
-        if self.coordinate_mode() == self.NORMALIZED_COORDINATE_MODE:
+        mode = self.coordinate_mode()
+        if mode == self.NORMALIZED_COORDINATE_MODE:
             return self._normalized_0_1_to_absolute(coords, width, height)
+        if mode == self.GEMMA_COORDINATE_MODE:
+            return self._grid_0_1000_to_absolute(coords, width, height, order='yxyx')
+        if mode == self.MINICPM_V46_COORDINATE_MODE:
+            return self._grid_0_1000_to_absolute(coords, width, height, order='xyxy')
         return self._to_absolute(coords, width, height)
 
     def _parse_model_prediction(self, text: str) -> Optional[np.ndarray]:
-        if self.coordinate_mode() == self.NORMALIZED_COORDINATE_MODE:
+        mode = self.coordinate_mode()
+        if mode == self.NORMALIZED_COORDINATE_MODE:
             return self._parse_bracket_prediction(text)
+        if mode == self.GEMMA_COORDINATE_MODE:
+            return self._parse_gemma_prediction(text)
+        if mode == self.MINICPM_V46_COORDINATE_MODE:
+            return self._parse_minicpm_v46_prediction(text)
         return self._parse_prediction(text)
 
     def _ensure_metadata_ready(self) -> None:
@@ -592,6 +623,43 @@ class RefCOCODataset(ImageBaseDataset):
         return np.array([float(x) for x in matches[:4]], dtype=float)
 
     @staticmethod
+    def _parse_gemma_prediction(text: str) -> Optional[np.ndarray]:
+        if not isinstance(text, str):
+            return None
+        match = re.search(r'```json\s+(.*?)\s+```', text, flags=re.DOTALL | re.IGNORECASE)
+        if match is None:
+            return None
+        try:
+            payload = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, list) or len(payload) != 1:
+            return None
+        payload = payload[0]
+        if not isinstance(payload, dict) or 'box_2d' not in payload:
+            return None
+        values = payload['box_2d']
+        if not isinstance(values, list) or len(values) != 4:
+            return None
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            return None
+        coords = np.asarray(values, dtype=float)
+        return coords if np.isfinite(coords).all() else None
+
+    @staticmethod
+    def _parse_minicpm_v46_prediction(text: str) -> Optional[np.ndarray]:
+        if not isinstance(text, str):
+            return None
+        match = re.search(
+            r'<box>\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*</box>',
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        return np.asarray([float(match.group(i)) for i in range(1, 5)], dtype=float)
+
+    @staticmethod
     def _to_absolute(coords: np.ndarray, width: float, height: float) -> Optional[np.ndarray]:
         if coords is None or np.any(np.isnan(coords)) or width <= 0 or height <= 0:
             return None
@@ -634,6 +702,31 @@ class RefCOCODataset(ImageBaseDataset):
         if coords[2] < coords[0] or coords[3] < coords[1]:
             return None
         result = coords.copy()
+        result[0::2] *= width
+        result[1::2] *= height
+        return result
+
+    @staticmethod
+    def _grid_0_1000_to_absolute(
+        coords: np.ndarray,
+        width: float,
+        height: float,
+        order: str,
+    ) -> Optional[np.ndarray]:
+        if coords is None or width <= 0 or height <= 0:
+            return None
+        coords = np.asarray(coords, dtype=float)[:4]
+        if coords.shape != (4,) or not np.isfinite(coords).all():
+            return None
+        if np.any(coords < 0.0) or np.any(coords > 1000.0):
+            return None
+        if order == 'yxyx':
+            coords = coords[[1, 0, 3, 2]]
+        elif order != 'xyxy':
+            raise ValueError(f'Unsupported coordinate order: {order}')
+        if coords[2] < coords[0] or coords[3] < coords[1]:
+            return None
+        result = coords / 1000.0
         result[0::2] *= width
         result[1::2] *= height
         return result

@@ -1,0 +1,127 @@
+env_profiles:
+  minicpm45_vllm:
+    python: '{conda_root}/envs/vlmeval_minicpm45_vllm/bin/python'
+    pythonpath:
+      - '{repo_root}'
+    ensure_modules:
+      - librosa
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_USE_MINICPM45_MINIMAL_CONFIG: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      MINICPM45_USE_VLLM: '1'
+  gemma3_vllm:
+    python: '{conda_root}/envs/vlmeval_gemma3_vllm/bin/python'
+    pythonpath:
+      - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_USE_GEMMA3_MINIMAL_CONFIG: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      GEMMA3_USE_VLLM: '1'
+
+models:
+  gemma3_4b:
+    display_name: Gemma3-4B-it
+    registry_name: Gemma3-4B-Replay
+    env_profile: gemma3_vllm
+    model_path: '{model_root}/gemma-3-4b-it'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 128
+      max_num_seqs: 128
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env: &gemma_native_env
+      MODEL_PATH_GEMMA3_4B: '{model_root}/gemma-3-4b-it'
+      REFCOCO_COORDINATE_MODE: gemma_0_1000_yxyx
+      GEMMA3_VLLM_TEMPERATURE: '0'
+      GEMMA3_VLLM_TOP_P: '1'
+      GEMMA3_MAX_NEW_TOKENS: '64'
+  gemma3_12b:
+    display_name: Gemma3-12B-it
+    registry_name: Gemma3-12B-Replay
+    env_profile: gemma3_vllm
+    model_path: '{model_root}/gemma-3-12b-it'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.8
+    task_env:
+      <<: *gemma_native_env
+      MODEL_PATH_GEMMA3_4B: ''
+      MODEL_PATH_GEMMA3_12B: '{model_root}/gemma-3-12b-it'
+  gemma3_27b:
+    display_name: Gemma3-27B-it
+    registry_name: Gemma3-27B-Replay
+    env_profile: gemma3_vllm
+    model_path: '{model_root}/gemma-3-27b-it'
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 32768
+      estimated_dataset_cost: 3.2
+    task_env:
+      <<: *gemma_native_env
+      MODEL_PATH_GEMMA3_4B: ''
+      MODEL_PATH_GEMMA3_27B: '{model_root}/gemma-3-27b-it'
+  minicpm_v_45_no_reasoning:
+    display_name: MiniCPM-V-4_5 no reasoning
+    registry_name: MiniCPM-V-4_5-Replay
+    env_profile: minicpm45_vllm
+    model_path: '{model_root}/MiniCPM-V-4_5'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env: &minicpm_native_env
+      MODEL_PATH_MINICPM45: '{model_root}/MiniCPM-V-4_5'
+      REFCOCO_COORDINATE_MODE: minicpm_v46_0_1000_xyxy
+      MINICPM45_MAX_NEW_TOKENS: '64'
+      MINICPM45_REASONING_MODE: no_thinking
+      MINICPM45_NUM_BEAMS: '1'
+      MINICPM45_SAMPLING: '0'
+      MINICPM45_TEMPERATURE: '0'
+      MINICPM45_TOP_P: '1'
+      MINICPM45_TOP_K: '0'
+      MINICPM45_REPETITION_PENALTY: '1'
+      MINICPM45_PRESENCE_PENALTY: '0'
+  minicpm_o_45_no_reasoning:
+    display_name: MiniCPM-o-4_5 no reasoning
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: minicpm45_vllm
+    model_path: '{model_root}/MiniCPM-o-4_5'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env:
+      <<: *minicpm_native_env
+      MODEL_PATH_MINICPM45: ''
+      MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'

@@ -1,0 +1,7 @@
+model_key,policy,mode,transform,dataset
+gemma3_4b,default,image_text,baseline,RefCOCO
+gemma3_4b,default,image_text_image_text,baseline,RefCOCO
+gemma3_12b,default,image_text,baseline,RefCOCO
+gemma3_12b,default,image_text_image_text,baseline,RefCOCO
+gemma3_27b,default,image_text,baseline,RefCOCO
+gemma3_27b,default,image_text_image_text,baseline,RefCOCO
