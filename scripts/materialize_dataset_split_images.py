@@ -54,6 +54,10 @@ def main():
     parser.add_argument('--split-value', required=True)
     parser.add_argument('--expected-count', required=True, type=int)
     parser.add_argument('--manifest-output', required=True)
+    parser.add_argument(
+        '--records-output',
+        help='Optional TSV output containing index, absolute path, file size, and widthxheight.',
+    )
     parser.add_argument('--check-only', action='store_true')
     args = parser.parse_args()
 
@@ -103,6 +107,8 @@ def main():
             raise AssertionError(f'Existing materialization manifest does not match: {output}')
     else:
         _atomic_write_text(output, json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    if args.records_output:
+        _atomic_write_text(args.records_output, record_payload)
     print(json.dumps(manifest, sort_keys=True))
 
 
