@@ -3,6 +3,7 @@ import gc
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from functools import partial
 import inspect
 
@@ -263,20 +264,18 @@ def _env_truthy(name: str, default: str = "1") -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _is_qwen25vl_model(model_name: str) -> bool:
-    pieces = [
-        model_name,
-        os.environ.get("MODEL_PATH", ""),
-        os.environ.get("MODEL_PATH_QWEN25", ""),
-        os.environ.get("MODEL_PATH_QWEN25_3B", ""),
-        os.environ.get("MODEL_PATH_QWEN25_32B", ""),
-        os.environ.get("MODEL_PATH_QWEN25_72B", ""),
-    ]
-    text = " ".join(str(x) for x in pieces).lower()
+def _is_qwen25vl_model(model_name: str, model_config=None) -> bool:
+    pieces = [model_name]
+    if isinstance(model_config, dict):
+        pieces.extend(
+            model_config.get(key, "")
+            for key in ("class", "model_path", "model", "name")
+        )
+    text = " ".join(str(piece) for piece in pieces).lower()
     return (
         "qwen2.5-vl" in text
         or "qwen25vl" in text
-        or model_name == "Qwen2VLChatReplay"
+        or "qwen2vlchatreplay" in text
     )
 
 
@@ -289,6 +288,39 @@ QWEN25VL_LOGICVISTA_SAMPLING_KEYS = [
     "QWEN2VL_VLLM_STOP_TOKEN_IDS",
 ]
 
+QWEN25VL_DATASET_RUNTIME_KEYS = [
+    "VLLM_USE_V1",
+    "VLLM_MAX_NUM_SEQS",
+    "LOGICVISTA_QWEN25VL_FORCE_V0",
+    "LOGICVISTA_QWEN25VL_LEGACY_SAMPLING",
+    *QWEN25VL_LOGICVISTA_SAMPLING_KEYS,
+]
+
+
+@dataclass(frozen=True)
+class DatasetRuntimeBaseline:
+    qwen_env: dict
+    batch_size: int
+
+
+def capture_qwen25vl_runtime_env():
+    return {key: os.environ.get(key) for key in QWEN25VL_DATASET_RUNTIME_KEYS}
+
+
+def capture_dataset_runtime_baseline(args):
+    return DatasetRuntimeBaseline(
+        qwen_env=capture_qwen25vl_runtime_env(),
+        batch_size=args.batch_size,
+    )
+
+
+def restore_qwen25vl_runtime_env(baseline):
+    for key, value in baseline.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 def _drop_model_reference():
     gc.collect()
@@ -300,9 +332,18 @@ def _drop_model_reference():
         pass
 
 
-def apply_dataset_runtime_policy(args, model_name: str, dataset_name: str):
+def apply_dataset_runtime_policy(
+    args,
+    model_name: str,
+    dataset_name: str,
+    runtime_baseline=None,
+    model_config=None,
+):
     """Central place for dataset-specific replay runtime compatibility."""
-    is_qwen25vl = _is_qwen25vl_model(model_name)
+    if runtime_baseline is not None:
+        restore_qwen25vl_runtime_env(runtime_baseline.qwen_env)
+        args.batch_size = runtime_baseline.batch_size
+    is_qwen25vl = _is_qwen25vl_model(model_name, model_config=model_config)
     if dataset_name == "DynaMath":
         os.environ["DYNAMATH_PROMPT_SCHEMA"] = "legacy_two_keys" if is_qwen25vl else "short_answer_only"
     else:
@@ -341,9 +382,10 @@ def apply_dataset_runtime_policy(args, model_name: str, dataset_name: str):
 
     if is_qwen25vl:
         os.environ.setdefault("VLLM_USE_V1", "1")
-        os.environ.pop("LOGICVISTA_QWEN25VL_LEGACY_SAMPLING", None)
-        for key in QWEN25VL_LOGICVISTA_SAMPLING_KEYS:
-            os.environ.pop(key, None)
+        if runtime_baseline is None:
+            os.environ.pop("LOGICVISTA_QWEN25VL_LEGACY_SAMPLING", None)
+            for key in QWEN25VL_LOGICVISTA_SAMPLING_KEYS:
+                os.environ.pop(key, None)
 
     return (
         "default",
@@ -416,6 +458,8 @@ def main():
             timeout=datetime.timedelta(seconds=int(os.environ.get('DIST_TIMEOUT', 3600)))
         )
 
+    runtime_baseline = capture_dataset_runtime_baseline(args)
+
     for _, model_name in enumerate(args.model):
         model = None
         model_runtime_policy = None
@@ -434,7 +478,14 @@ def main():
             os.makedirs(pred_root, exist_ok=True)
 
         for _, dataset_name in enumerate(args.data):
-            runtime_policy = apply_dataset_runtime_policy(args, model_name, dataset_name)
+            current_model_config = cfg["model"].get(model_name) if use_config else None
+            runtime_policy = apply_dataset_runtime_policy(
+                args,
+                model_name,
+                dataset_name,
+                runtime_baseline=runtime_baseline,
+                model_config=current_model_config,
+            )
             if model is not None and runtime_policy != model_runtime_policy:
                 logger.warning(
                     f"Runtime policy changed for {model_name} before {dataset_name}; "
