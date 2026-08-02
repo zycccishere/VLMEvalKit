@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,14 @@ except ImportError as exc:
 
 def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def detect_node_rank() -> int:
@@ -1213,7 +1222,7 @@ except Exception:
 
     def _task_payload(self, task: Task, model: ModelSpec, expected: int) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "matrix": self.matrix_name,
             "task": {
                 "tag": task.tag,
@@ -1261,22 +1270,28 @@ except Exception:
                 "artifact_type": "prediction",
                 "status": "complete",
                 "prediction_file": str(pred_file),
+                "prediction_sha256": sha256_file(pred_file),
                 "prediction_dir": str(self.prediction_dir(task)),
             }
         )
         self._write_json(self.prediction_manifest_path(task), payload)
 
     def write_eval_manifest(self, task: Task, model: ModelSpec, expected: int, pred_file: Path, rc: int) -> None:
-        score_files = [str(path) for path in self.acc_marker_paths(task, model) if path.is_file()]
+        score_paths = [path for path in self.acc_marker_paths(task, model) if path.is_file()]
+        score_files = [str(path) for path in score_paths]
         payload = self._task_payload(task, model, expected)
         payload.update(
             {
                 "artifact_type": "eval",
                 "status": "complete" if rc == 0 and score_files else "failed",
                 "prediction_file": str(pred_file),
+                "prediction_sha256": sha256_file(pred_file),
                 "eval_dir": str(self.eval_output_dir(task)),
                 "judge": str(self.evaluation_cfg.get("judge", "gpt-4o-mini")),
                 "score_files": score_files,
+                "score_file_sha256": {
+                    str(path): sha256_file(path) for path in score_paths
+                },
                 "returncode": rc,
             }
         )
@@ -1289,13 +1304,33 @@ except Exception:
         if manifest.get("status") != "complete" or int(manifest.get("expected_rows", -1)) != expected:
             return False
         pred_file = self.infer_file_path(task, model)
-        return self.prediction_file_valid(pred_file, expected)
+        if not self.prediction_file_valid(pred_file, expected):
+            return False
+        if int(manifest.get("schema_version", 1)) < 2:
+            return True
+        return manifest.get("prediction_sha256") == sha256_file(pred_file)
 
     def eval_complete(self, task: Task, model: ModelSpec, expected: int) -> bool:
         manifest = self._read_json(self.eval_manifest_path(task))
         if manifest.get("status") != "complete" or int(manifest.get("expected_rows", -1)) != expected:
             return False
-        return self.acc_complete(task, model)
+        if int(manifest.get("schema_version", 1)) < 2:
+            return self.acc_complete(task, model)
+        pred_file = self.infer_file_path(task, model)
+        if pred_file is None or not pred_file.is_file():
+            return False
+        if manifest.get("prediction_sha256") != sha256_file(pred_file):
+            return False
+        score_hashes = manifest.get("score_file_sha256")
+        if not isinstance(score_hashes, dict) or not score_hashes:
+            return False
+        score_paths = self.acc_marker_paths(task, model)
+        if {str(path) for path in score_paths} != set(score_hashes):
+            return False
+        return all(
+            path.is_file() and score_hashes[str(path)] == sha256_file(path)
+            for path in score_paths
+        )
 
     def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path) -> int:
         ensure_dir(log_path.parent)

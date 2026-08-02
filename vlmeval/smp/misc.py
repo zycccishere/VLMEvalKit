@@ -217,8 +217,14 @@ def load_env():
 
     from dotenv import dotenv_values
     values = dotenv_values(pth)
+    runtime_topology_keys = {
+        'RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE',
+        'MASTER_ADDR', 'MASTER_PORT', 'NODE_RANK', 'GROUP_RANK',
+    }
     for k, v in values.items():
-        if v is not None and len(v):
+        # Distributed topology belongs to the active launcher, never a
+        # persistent .env file. Preserve any launcher-provided values.
+        if k not in runtime_topology_keys and v is not None and len(v):
             os.environ[k] = v
     logging.info(f'API Keys successfully loaded from {pth}')
 

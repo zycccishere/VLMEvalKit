@@ -11,6 +11,10 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
     set +a
 fi
 
+# The matrix runner shards work explicitly and launches one isolated process
+# per cell. Outer allocation topology must never leak into those processes.
+unset RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT NODE_RANK GROUP_RANK
+
 if [[ -z "${CONTROL_PYTHON:-}" ]]; then
     if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
         CONTROL_PYTHON="${VIRTUAL_ENV}/bin/python"

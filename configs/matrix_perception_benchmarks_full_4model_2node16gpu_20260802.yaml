@@ -1,0 +1,100 @@
+name: perception_benchmarks_full_4model_2node16gpu_20260802
+repo_root: "{repo_root}"
+results_root: runs/perception_benchmarks_full_4model_2node16gpu_20260802
+node_gpu_ids: "0,1,2,3,4,5,6,7"
+scheduler: gpu_pool
+datasets:
+  - RefCOCO
+  - CountQA
+  - SpatialMQA
+dataset_index_allowlists:
+  RefCOCO: "{repo_root}/runs/perception_benchmarks_full_4model_2node16gpu_20260802/_inputs/refcocog_test_indices.txt"
+dataset_task_env:
+  CountQA:
+    QWEN2VL_VLLM_TEMPERATURE: "0"
+    QWEN2VL_VLLM_TOP_P: "1"
+    QWEN2VL_VLLM_MAX_TOKENS: "32"
+    GEMMA3_VLLM_TEMPERATURE: "0"
+    GEMMA3_VLLM_TOP_P: "1"
+    GEMMA3_MAX_NEW_TOKENS: "32"
+    MINICPM45_MAX_NEW_TOKENS: "32"
+    MINICPM45_NUM_BEAMS: "1"
+    MINICPM45_SAMPLING: "0"
+    MINICPM45_TEMPERATURE: "0"
+    MINICPM45_TOP_P: "1"
+    MINICPM45_TOP_K: "0"
+    MINICPM45_REPETITION_PENALTY: "1"
+    MINICPM45_PRESENCE_PENALTY: "0"
+  SpatialMQA:
+    QWEN2VL_VLLM_TEMPERATURE: "0"
+    QWEN2VL_VLLM_TOP_P: "1"
+    QWEN2VL_VLLM_MAX_TOKENS: "32"
+    GEMMA3_VLLM_TEMPERATURE: "0"
+    GEMMA3_VLLM_TOP_P: "1"
+    GEMMA3_MAX_NEW_TOKENS: "32"
+    MINICPM45_MAX_NEW_TOKENS: "32"
+    MINICPM45_NUM_BEAMS: "1"
+    MINICPM45_SAMPLING: "0"
+    MINICPM45_TEMPERATURE: "0"
+    MINICPM45_TOP_P: "1"
+    MINICPM45_TOP_K: "0"
+    MINICPM45_REPETITION_PENALTY: "1"
+    MINICPM45_PRESENCE_PENALTY: "0"
+  RefCOCO:
+    REFCOCO_COORDINATE_MODE: normalized_0_1_xyxy
+    QWEN2VL_VLLM_TEMPERATURE: "0"
+    QWEN2VL_VLLM_TOP_P: "1"
+    QWEN2VL_VLLM_MAX_TOKENS: "32"
+    GEMMA3_VLLM_TEMPERATURE: "0"
+    GEMMA3_VLLM_TOP_P: "1"
+    GEMMA3_MAX_NEW_TOKENS: "32"
+    MINICPM45_MAX_NEW_TOKENS: "32"
+    MINICPM45_NUM_BEAMS: "1"
+    MINICPM45_SAMPLING: "0"
+    MINICPM45_TEMPERATURE: "0"
+    MINICPM45_TOP_P: "1"
+    MINICPM45_TOP_K: "0"
+    MINICPM45_REPETITION_PENALTY: "1"
+    MINICPM45_PRESENCE_PENALTY: "0"
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text
+  - image_text_image_text
+image_transforms:
+  - baseline
+models:
+  - qwen25vl_3b
+  - gemma3_4b
+  - gemma3_12b
+  - minicpm_o_45_no_reasoning
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  strict_batch: 1
+  stage_debug: 1
+  stage_debug_samples: 2
+  prompt_audit: 1
+  prompt_audit_print: 1
+trace:
+  level: full
+  samples: 2
+  dump_max_chars: 24000
+  prompt_audit_print: 1
+  validate_after_infer: false
+  backend: vllm
+answer_format:
+  enable: 0
+evaluation:
+  launch_mode: fg
+  nproc: 1
+  judge: gpt-4o-mini
+worker_monitor:
+  enable: true
+  interval_seconds: 30
+resume_infer_default: false
