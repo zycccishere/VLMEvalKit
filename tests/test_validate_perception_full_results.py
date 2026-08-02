@@ -141,6 +141,27 @@ def _build_matrix(root, validator, model='model_a'):
 
 
 class PerceptionFullValidatorTest(unittest.TestCase):
+    def test_run_markers_cover_every_declared_node(self):
+        validator = _load_validator()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '_control').mkdir(parents=True)
+            (root / '_inputs').mkdir(parents=True)
+            run_uuid = 'three-node-test'
+            for path in [
+                root / '_control' / 'run_uuid',
+                root / '_inputs' / 'PREFLIGHT_READY',
+                root / 'NODE_0_RUNNER_DONE',
+                root / 'NODE_1_RUNNER_DONE',
+                root / 'NODE_2_RUNNER_DONE',
+            ]:
+                path.write_text(run_uuid, encoding='utf-8')
+
+            validator._validate_run_markers(root, run_uuid, nodes=3)
+            (root / 'NODE_2_RUNNER_DONE').unlink()
+            with self.assertRaisesRegex(AssertionError, 'NODE_2_RUNNER_DONE'):
+                validator._validate_run_markers(root, run_uuid, nodes=3)
+
     def test_validate_accepts_complete_matrix(self):
         validator = _load_validator()
         with TemporaryDirectory() as directory:

@@ -155,13 +155,14 @@ def _validate_allowlist_manifest(root, manifest_path):
     return payload
 
 
-def _validate_run_markers(root, run_uuid):
+def _validate_run_markers(root, run_uuid, nodes=2):
+    if nodes < 1:
+        raise AssertionError(f'Node count must be positive: {nodes}')
     marker_paths = [
         root / '_control' / 'run_uuid',
         root / '_inputs' / 'PREFLIGHT_READY',
-        root / 'NODE_0_RUNNER_DONE',
-        root / 'NODE_1_RUNNER_DONE',
     ]
+    marker_paths.extend(root / f'NODE_{rank}_RUNNER_DONE' for rank in range(nodes))
     for marker in marker_paths:
         if not marker.is_file():
             raise AssertionError(f'Missing run marker: {marker}')
@@ -252,13 +253,14 @@ def main():
     parser.add_argument('--models', nargs='+', required=True)
     parser.add_argument('--matrix', required=True)
     parser.add_argument('--run-uuid', required=True)
+    parser.add_argument('--nodes', type=int, default=2)
     parser.add_argument('--allowlist-manifest', required=True)
     parser.add_argument('--json-output', required=True)
     parser.add_argument('--csv-output', required=True)
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
-    _validate_run_markers(root, args.run_uuid)
+    _validate_run_markers(root, args.run_uuid, args.nodes)
     records, allowlist_payload = validate(
         root,
         args.models,
@@ -270,6 +272,7 @@ def main():
         'root': str(root),
         'matrix': args.matrix,
         'run_uuid': args.run_uuid,
+        'nodes': args.nodes,
         'cell_count': len(records),
         'expected_rows': EXPECTED_ROWS,
         'refcocog_allowlist': allowlist_payload,
