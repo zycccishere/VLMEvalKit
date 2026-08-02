@@ -85,7 +85,7 @@ def test_runtime_validator_accepts_complete_real_contract(tmp_path):
 def test_runtime_validator_rejects_empty_root(tmp_path):
     result = _run(tmp_path)
     assert result.returncode == 1
-    assert 'no CountQA final_model_input records found' in result.stdout
+    assert 'no generation configs found' in result.stdout
 
 
 def test_runtime_validator_rejects_wrong_backend_and_candidate_count(tmp_path):
