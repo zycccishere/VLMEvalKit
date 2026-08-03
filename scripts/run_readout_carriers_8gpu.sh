@@ -22,17 +22,17 @@ case "${MODEL_KEY}" in
   qwen25vl_3b)
     PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-3B-Instruct}"
-    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v3_20260803/qwen25vl_3b/validation.json}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v4_20260803/qwen25vl_3b/validation.json}"
     ;;
   qwen25vl_7b)
     PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-7B-Instruct}"
-    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v3_20260803/qwen25vl_7b/validation.json}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v4_20260803/qwen25vl_7b/validation.json}"
     ;;
   minicpm_o_45)
     PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/MiniCPM-o-4_5}"
-    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v3_20260803/minicpm_o_45/validation.json}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v4_20260803/minicpm_o_45/validation.json}"
     ;;
   *)
     echo "Unsupported MODEL_KEY: ${MODEL_KEY}" >&2
@@ -67,7 +67,7 @@ for gpu in "${GPU_ARRAY[@]}"; do
   SEEN_GPUS["${gpu}"]=1
 done
 TOTAL_WORKERS=$((8 * WORKERS_PER_GPU))
-DEFAULT_SMOKE_MANIFEST="/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v3_20260803/manifests/${MODEL_KEY}.json"
+DEFAULT_SMOKE_MANIFEST="/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v4_20260803/manifests/${MODEL_KEY}.json"
 MANIFEST="${MANIFEST_PATH:-${DEFAULT_SMOKE_MANIFEST}}"
 OUTPUT_BASE="$(realpath -m /user/zyc1781/outputs/readout_carriers)"
 OUT_ROOT="$(realpath -m "${OUT_ROOT}")"

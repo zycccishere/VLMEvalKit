@@ -8,6 +8,7 @@ from PIL import Image
 from vlmeval.probes.readout_carriers import (
     MASK_CONDITIONS,
     PreparedSequence,
+    _attention_backend,
     _candidate_parity,
     _candidate_values,
     _carrier_masks,
@@ -19,6 +20,7 @@ from vlmeval.probes.readout_carriers import (
     _nested_input_summary,
     _normalize_minicpm_iqi_content,
     _prepare_literal_blind,
+    _run_minicpm_allowed,
     _score_values,
     _single_edit_spec,
     _splice_ids_2d,
@@ -65,6 +67,40 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
 
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
+    def test_attention_backend_is_scoped(self):
+        config = SimpleNamespace(_attn_implementation="sdpa")
+        with _attention_backend(config, "eager"):
+            self.assertEqual(config._attn_implementation, "eager")
+        self.assertEqual(config._attn_implementation, "sdpa")
+
+    def test_minicpm_masks_run_as_independent_single_examples(self):
+        class FakeLLM:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def __call__(self, **kwargs):
+                self.batch_sizes.append(int(kwargs["inputs_embeds"].shape[0]))
+                visible = float((kwargs["attention_mask"] == 0).sum())
+                return SimpleNamespace(logits=torch.tensor([[[visible, -visible]]]))
+
+        model = SimpleNamespace(llm=FakeLLM())
+        state = {
+            "inputs_embeds": torch.zeros((1, 3, 2)),
+            "position_ids": torch.arange(3).unsqueeze(0),
+            "cache_position": torch.arange(3),
+            "public_meta": {},
+        }
+        allowed = torch.stack(
+            [
+                torch.eye(3, dtype=torch.bool),
+                torch.tril(torch.ones((3, 3), dtype=torch.bool)),
+            ]
+        )
+        logits, _, _ = _run_minicpm_allowed(model, {}, allowed, state=state)
+        self.assertEqual(model.llm.batch_sizes, [1, 1])
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertNotEqual(float(logits[0, 0]), float(logits[1, 0]))
+
     def test_splice_recomputes_unpadded_minicpm_positions(self):
         inputs = {
             "input_ids": torch.tensor([[10, 11, 12]], dtype=torch.long),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import csv
 import hashlib
@@ -1414,22 +1415,22 @@ def _run_minicpm_allowed(
     state = state or _prepare_minicpm_state(model, inputs)
     embeds = state["inputs_embeds"]
     positions = state["position_ids"]
-    batch = int(allowed.shape[0])
-    repeated_embeds = embeds.repeat(batch, 1, 1)
-    repeated_positions = positions.repeat(batch, 1)
-    attention = _additive_mask(allowed, repeated_embeds.dtype, repeated_embeds.device)
-    with torch.inference_mode():
-        outputs = model.llm(
-            input_ids=None,
-            inputs_embeds=repeated_embeds,
-            position_ids=repeated_positions,
-            attention_mask=attention,
-            cache_position=state["cache_position"],
-            use_cache=False,
-            return_dict=True,
-            logits_to_keep=1,
-        )
-    return outputs.logits[:, -1, :], state["public_meta"], state
+    logits = []
+    for mask in allowed:
+        attention = _additive_mask(mask.unsqueeze(0), embeds.dtype, embeds.device)
+        with torch.inference_mode():
+            outputs = model.llm(
+                input_ids=None,
+                inputs_embeds=embeds,
+                position_ids=positions,
+                attention_mask=attention,
+                cache_position=state["cache_position"],
+                use_cache=False,
+                return_dict=True,
+                logits_to_keep=1,
+            )
+        logits.append(outputs.logits[0, -1, :])
+    return torch.stack(logits), state["public_meta"], state
 
 
 def _run_minicpm_standard(model: Any, inputs: dict[str, Any]) -> torch.Tensor:
@@ -1447,6 +1448,22 @@ def _run_minicpm_standard(model: Any, inputs: dict[str, Any]) -> torch.Tensor:
             logits_to_keep=1,
         )
     return outputs.logits[0, -1, :]
+
+
+def _llm_attention_config(wrapper: Any, family: str) -> Any:
+    if family == "qwen25vl":
+        return wrapper.model.model.language_model.config
+    return wrapper.model.llm.config
+
+
+@contextlib.contextmanager
+def _attention_backend(config: Any, backend: str):
+    previous = config._attn_implementation
+    config._attn_implementation = backend
+    try:
+        yield
+    finally:
+        config._attn_implementation = previous
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -1880,10 +1897,11 @@ def score_record(
             causal = torch.tril(
                 torch.ones((seq_len, seq_len), dtype=torch.bool)
             ).unsqueeze(0)
-            manual_causal_logits, _, _ = _run_allowed(
-                family, wrapper, sequence.inputs, causal, state=state
-            )
-            standard_causal_logits = _run_standard(family, wrapper, sequence.inputs)
+            with _attention_backend(_llm_attention_config(wrapper, family), "eager"):
+                manual_causal_logits, _, _ = _run_allowed(
+                    family, wrapper, sequence.inputs, causal, state=state
+                )
+                standard_causal_logits = _run_standard(family, wrapper, sequence.inputs)
             causal_parity = _candidate_parity(
                 standard_causal_logits,
                 manual_causal_logits[0],
