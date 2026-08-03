@@ -966,6 +966,7 @@ def _prepare_minicpm_content(
             "tgt_sizes": _nested_tensor_summary_value(inputs.get("tgt_sizes")),
             "query_num": query_num,
             "max_slice_nums": int(wrapper.model.config.slice_config.max_slice_nums),
+            "vision_encode_mode": "per_image_batch_one",
         },
     )
 
@@ -1325,13 +1326,43 @@ def _has_nonempty_tensor(value: Any) -> bool:
     return False
 
 
+def _minicpm_per_image_vision_states(
+    model: Any, inputs: dict[str, Any]
+) -> list[torch.Tensor]:
+    pixels = inputs["pixel_values"][0]
+    target_sizes = inputs["tgt_sizes"][0]
+    image_count = len(inputs["image_bound"][0])
+    if len(pixels) != image_count or len(target_sizes) != image_count:
+        raise RuntimeError("MiniCPM image tensors and bounds are misaligned")
+    parts = []
+    for image_idx in range(image_count):
+        image_inputs = {
+            "pixel_values": [pixels[image_idx : image_idx + 1]],
+            "tgt_sizes": [target_sizes[image_idx : image_idx + 1]],
+        }
+        image_state = model.get_vision_embedding(image_inputs)[0]
+        if image_state.shape[:2] != (1, int(model.config.query_num)):
+            raise RuntimeError(
+                f"Unexpected MiniCPM per-image state shape: {image_state.shape}"
+            )
+        parts.append(image_state)
+    vision_states = torch.cat(parts, dim=0)
+    if int(vision_states.shape[0]) != image_count:
+        raise RuntimeError("MiniCPM per-image states changed image order/count")
+    return [vision_states]
+
+
 def _prepare_minicpm_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     attention_backend = getattr(model.llm.config, "_attn_implementation", None)
     if attention_backend not in {"sdpa", "eager"}:
         raise RuntimeError(
             "MiniCPM carrier masks require sdpa/eager, got " f"{attention_backend!r}"
         )
-    embeds, vision_states = model.get_vllm_embedding(inputs)
+    embedding_inputs = dict(inputs)
+    embedding_inputs["vision_hidden_states"] = _minicpm_per_image_vision_states(
+        model, inputs
+    )
+    embeds, vision_states = model.get_vllm_embedding(embedding_inputs)
     audio_features = inputs.get("audio_features")
     if _has_nonempty_tensor(audio_features):
         raise RuntimeError(
@@ -1402,6 +1433,7 @@ def _prepare_minicpm_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]
             "visual_scatter_max_abs_diff": scatter_max_abs_diff,
             "attention_backend": attention_backend,
             "no_audio_omni_max_abs_diff": omni_diff,
+            "vision_encode_mode": "per_image_batch_one",
         },
     }
 
@@ -1433,8 +1465,12 @@ def _run_minicpm_allowed(
     return torch.stack(logits), state["public_meta"], state
 
 
-def _run_minicpm_standard(model: Any, inputs: dict[str, Any]) -> torch.Tensor:
-    state = _prepare_minicpm_state(model, inputs)
+def _run_minicpm_standard(
+    model: Any,
+    inputs: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    state = state or _prepare_minicpm_state(model, inputs)
     embeds = state["inputs_embeds"]
     with torch.inference_mode():
         outputs = model.llm(
@@ -1697,11 +1733,16 @@ def _run_allowed(
     raise AssertionError(family)
 
 
-def _run_standard(family: str, wrapper: Any, inputs: dict[str, Any]) -> torch.Tensor:
+def _run_standard(
+    family: str,
+    wrapper: Any,
+    inputs: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_standard(wrapper.model, inputs)
     if family == "minicpmo45":
-        return _run_minicpm_standard(wrapper.model, inputs)
+        return _run_minicpm_standard(wrapper.model, inputs, state=state)
     raise AssertionError(family)
 
 
@@ -1825,7 +1866,12 @@ def score_record(
     blind_score = _score_values(blind_values, answer_key)
 
     full = _extend_prepared(sequences["full"], prefix_ids, family)
-    full_logits = _run_standard(family, wrapper, full.inputs)
+    full_dump_state = (
+        _prepare_minicpm_state(wrapper.model, full.inputs)
+        if dump_dir is not None and family == "minicpmo45"
+        else None
+    )
+    full_logits = _run_standard(family, wrapper, full.inputs, state=full_dump_state)
     full_score = _score_values(_candidate_values(full_logits, plan), answer_key)
 
     carriers: dict[str, Any] = {}
@@ -1836,6 +1882,11 @@ def score_record(
     raw_masks: dict[str, torch.Tensor] = {}
     runtime_meta: dict[str, Any] = {}
     raw_runtime_tensors: dict[str, np.ndarray] = {}
+    if full_dump_state is not None:
+        for tensor_name in ("visual_feature_0", "visual_core_0"):
+            raw_runtime_tensors[f"full__{tensor_name}"] = _tensor_dump_numpy(
+                full_dump_state["raw_tensors"][tensor_name]
+            )
     diagnostic_logits: dict[str, np.ndarray] = {}
     for carrier in CARRIERS:
         sequence = _extend_prepared(sequences[carrier], prefix_ids, family)
@@ -2921,6 +2972,14 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                             f"{path} {carrier} {(span_start, span_end)}"
                         )
             else:
+                if (
+                    sequence["metadata"].get("vision_encode_mode")
+                    != "per_image_batch_one"
+                    or model_meta.get("vision_encode_mode") != "per_image_batch_one"
+                ):
+                    raise RuntimeError(
+                        f"MiniCPM images were not encoded independently: {path} {carrier}"
+                    )
                 if positions.shape != (1, seq_len) or not np.array_equal(
                     positions[0], np.arange(seq_len, dtype=positions.dtype)
                 ):
@@ -3076,6 +3135,41 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         )
             else:
                 artifact_has_diagnostics = False
+
+        if artifact["model_family"] == "minicpmo45":
+            if (
+                artifact["sequences"]["full"]["metadata"].get("vision_encode_mode")
+                != "per_image_batch_one"
+            ):
+                raise RuntimeError(f"MiniCPM full image was not encoded alone: {path}")
+            source_features = {}
+            for name in ("full", *CARRIERS):
+                feature_key = f"{name}__visual_feature_0"
+                core_key = f"{name}__visual_core_0"
+                if (
+                    feature_key not in runtime_tensors
+                    or core_key not in runtime_tensors
+                ):
+                    raise RuntimeError(
+                        f"Source visual tensors missing for {path} {name}"
+                    )
+                feature = np.asarray(runtime_tensors[feature_key])
+                core = np.asarray(runtime_tensors[core_key])
+                if not np.array_equal(feature, core):
+                    raise RuntimeError(
+                        f"Source visual feature/core mismatch for {path} {name}"
+                    )
+                source_features[name] = feature
+            reference_source = source_features["full"]
+            for name in CARRIERS:
+                if not np.array_equal(reference_source, source_features[name]):
+                    max_diff = float(
+                        np.max(np.abs(reference_source - source_features[name]))
+                    )
+                    raise RuntimeError(
+                        f"Source visual feature changed across carriers: "
+                        f"{path} full vs {name} max={max_diff}"
+                    )
 
         if artifact_has_diagnostics:
             diagnostic_artifacts += 1

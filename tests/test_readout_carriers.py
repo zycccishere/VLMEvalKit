@@ -17,6 +17,7 @@ from vlmeval.probes.readout_carriers import (
     _insert_matched_text_carrier,
     _independent_qwen_mrope,
     _literal_token_id,
+    _minicpm_per_image_vision_states,
     _nested_input_summary,
     _normalize_minicpm_iqi_content,
     _prepare_literal_blind,
@@ -67,6 +68,31 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
 
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
+    def test_minicpm_images_are_encoded_one_at_a_time(self):
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+                self.config = SimpleNamespace(query_num=2)
+
+            def get_vision_embedding(self, inputs):
+                pixels = inputs["pixel_values"][0]
+                sizes = inputs["tgt_sizes"][0]
+                self.calls.append((len(pixels), tuple(sizes.shape)))
+                value = float(pixels[0].item())
+                return [torch.full((1, 2, 3), value)]
+
+        model = FakeModel()
+        inputs = {
+            "pixel_values": [[torch.tensor(1.0), torch.tensor(2.0)]],
+            "tgt_sizes": [torch.tensor([[10, 11], [20, 21]])],
+            "image_bound": [torch.tensor([[5, 7], [9, 11]])],
+        }
+        states = _minicpm_per_image_vision_states(model, inputs)
+        self.assertEqual(model.calls, [(1, (1, 2)), (1, (1, 2))])
+        self.assertEqual(tuple(states[0].shape), (2, 2, 3))
+        self.assertTrue(torch.all(states[0][0] == 1))
+        self.assertTrue(torch.all(states[0][1] == 2))
+
     def test_attention_backend_is_scoped(self):
         config = SimpleNamespace(_attn_implementation="sdpa")
         with _attention_backend(config, "eager"):
