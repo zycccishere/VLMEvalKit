@@ -464,9 +464,10 @@ def _literal_token_id(tokenizer: Any, literal: str) -> int:
     return int(ids[0])
 
 
-def _insert_ids_2d(
+def _splice_ids_2d(
     inputs: dict[str, Any],
-    position: int,
+    start: int,
+    end: int,
     token_ids: list[int],
     *,
     recompute_position_ids: bool,
@@ -477,11 +478,13 @@ def _insert_ids_2d(
         raise RuntimeError(
             f"Expected one unpadded sequence, got {tuple(old_ids.shape)}"
         )
-    extra = torch.tensor([token_ids], dtype=old_ids.dtype, device=old_ids.device)
-    out["input_ids"] = torch.cat(
-        [old_ids[:, :position], extra, old_ids[:, position:]], dim=-1
-    )
     old_len = int(old_ids.shape[-1])
+    if not 0 <= start <= end <= old_len:
+        raise RuntimeError(
+            f"Invalid token splice [{start}, {end}) for length {old_len}"
+        )
+    extra = torch.tensor([token_ids], dtype=old_ids.dtype, device=old_ids.device)
+    out["input_ids"] = torch.cat([old_ids[:, :start], extra, old_ids[:, end:]], dim=-1)
     for key, value in inputs.items():
         if key == "input_ids" or not isinstance(value, torch.Tensor):
             continue
@@ -492,9 +495,7 @@ def _insert_ids_2d(
                     dtype=value.dtype,
                     device=value.device,
                 )
-                out[key] = torch.cat(
-                    [value[:, :position], fill, value[:, position:]], dim=-1
-                )
+                out[key] = torch.cat([value[:, :start], fill, value[:, end:]], dim=-1)
             elif key == "position_ids" and recompute_position_ids:
                 continue
             else:
@@ -516,15 +517,17 @@ def _insert_ids_2d(
 def _append_ids(
     inputs: dict[str, Any], token_ids: list[int], *, recompute_position_ids: bool
 ) -> dict[str, Any]:
-    return _insert_ids_2d(
+    position = int(inputs["input_ids"].shape[-1])
+    return _splice_ids_2d(
         inputs,
-        int(inputs["input_ids"].shape[-1]),
+        position,
+        position,
         token_ids,
         recompute_position_ids=recompute_position_ids,
     )
 
 
-def _single_insertion_spec(
+def _single_edit_spec(
     base_ids: torch.Tensor,
     expanded_ids: torch.Tensor,
     core_start: int,
@@ -539,21 +542,17 @@ def _single_insertion_spec(
         suffix += 1
     base_middle_end = len(base) - suffix if suffix else len(base)
     expanded_middle_end = len(expanded) - suffix if suffix else len(expanded)
-    if base[prefix:base_middle_end]:
-        raise RuntimeError(
-            "Carrier construction is not a pure insertion into the standard IQ prompt: "
-            f"base_middle={base[prefix:base_middle_end]}"
-        )
     if not (prefix <= core_start < core_end_exclusive <= expanded_middle_end):
         raise RuntimeError(
-            "Readout core is outside the inserted carrier envelope: "
+            "Readout core is outside the expanded carrier envelope: "
             f"prefix={prefix} core=[{core_start},{core_end_exclusive}) "
-            f"insert_end={expanded_middle_end}"
+            f"edit_end={expanded_middle_end}"
         )
-    inserted = expanded[prefix:expanded_middle_end]
     return {
-        "insert_at": prefix,
-        "inserted_ids": inserted,
+        "edit_start": prefix,
+        "source_end": base_middle_end,
+        "source_ids": base[prefix:base_middle_end],
+        "expanded_ids": expanded[prefix:expanded_middle_end],
         "prefix_envelope_ids": expanded[prefix:core_start],
         "suffix_envelope_ids": expanded[core_end_exclusive:expanded_middle_end],
         "core_offset": core_start - prefix,
@@ -574,7 +573,7 @@ def _insert_matched_text_carrier(
     carrier: str,
     family: str,
 ) -> PreparedSequence:
-    spec = _single_insertion_spec(
+    spec = _single_edit_spec(
         base.inputs["input_ids"],
         reference.inputs["input_ids"],
         core_start,
@@ -586,17 +585,22 @@ def _insert_matched_text_carrier(
         + [int(literal_token_id)] * target_n
         + list(spec["suffix_envelope_ids"])
     )
-    if len(replacement) != len(spec["inserted_ids"]):
-        raise AssertionError("Matched text carrier changed inserted-envelope length")
+    if len(replacement) != len(spec["expanded_ids"]):
+        raise AssertionError("Matched text carrier changed expanded-envelope length")
+    if int(spec["source_end"]) > int(base.prefill_len):
+        raise RuntimeError("Carrier edit crosses the standard IQ prefill boundary")
+    if int(spec["edit_start"]) + len(replacement) > int(reference.prefill_len):
+        raise RuntimeError("Carrier edit crosses the IQI prefill boundary")
     out = copy.copy(base)
-    out.inputs = _insert_ids_2d(
+    out.inputs = _splice_ids_2d(
         base.inputs,
-        int(spec["insert_at"]),
+        int(spec["edit_start"]),
+        int(spec["source_end"]),
         replacement,
         recompute_position_ids=family == "minicpmo45",
     )
-    out.prefill_len = int(base.prefill_len) + len(replacement)
-    readout_start = int(spec["insert_at"]) + len(spec["prefix_envelope_ids"])
+    out.prefill_len = int(base.prefill_len) - len(spec["source_ids"]) + len(replacement)
+    readout_start = int(spec["edit_start"]) + len(spec["prefix_envelope_ids"])
     out.readout_indices = list(range(readout_start, readout_start + target_n))
     out.token_roles = list(base.token_roles)
     inserted_roles = (
@@ -604,7 +608,15 @@ def _insert_matched_text_carrier(
         + [f"readout:{carrier}"] * target_n
         + ["carrier_envelope"] * len(spec["suffix_envelope_ids"])
     )
-    out.token_roles[int(spec["insert_at"]) : int(spec["insert_at"])] = inserted_roles
+    out.token_roles[int(spec["edit_start"]) : int(spec["source_end"])] = inserted_roles
+    out_ids = out.inputs["input_ids"][0]
+    reference_ids = reference.inputs["input_ids"][0]
+    if not torch.equal(
+        out_ids[:core_start], reference_ids[:core_start]
+    ) or not torch.equal(
+        out_ids[core_end_exclusive:], reference_ids[core_end_exclusive:]
+    ):
+        raise RuntimeError("Matched text carrier differs from IQI outside its core")
     out.metadata = copy.deepcopy(base.metadata)
     out.artifact_images = dict(base.artifact_images)
     out.metadata.update(
@@ -612,8 +624,9 @@ def _insert_matched_text_carrier(
             "carrier": carrier,
             "carrier_kind": "literal_text_token_ids_in_matched_visual_envelope",
             "literal_token_id": int(literal_token_id),
-            "insert_position": int(spec["insert_at"]),
-            "inserted_token_count": len(replacement),
+            "edit_position": int(spec["edit_start"]),
+            "replaced_source_token_count": len(spec["source_ids"]),
+            "replacement_token_count": len(replacement),
             "prefix_envelope_token_count": len(spec["prefix_envelope_ids"]),
             "suffix_envelope_token_count": len(spec["suffix_envelope_ids"]),
             "source_prefix_sha256": spec["source_prefix_sha256"],
@@ -752,7 +765,7 @@ def _prepare_qwen_sequences(
     sequences: dict[str, PreparedSequence] = {"full": full}
     reference_grid = reference.metadata["image_grid_thw"]
     reference_core = reference.metadata["image_spans"][1]
-    insertion_spec = _single_insertion_spec(
+    edit_spec = _single_edit_spec(
         full.inputs["input_ids"],
         reference.inputs["input_ids"],
         int(reference_core["core_start"]),
@@ -784,15 +797,12 @@ def _prepare_qwen_sequences(
                 "raw_carrier_rgb": list(COLOR_VALUES[carrier]),
                 "standard_prompt": prompt_summary,
                 "standard_prompt_sha256": sha256_json(prompt_summary),
-                "source_prefix_sha256": insertion_spec["source_prefix_sha256"],
-                "insert_position": insertion_spec["insert_at"],
-                "inserted_token_count": len(insertion_spec["inserted_ids"]),
-                "prefix_envelope_token_count": len(
-                    insertion_spec["prefix_envelope_ids"]
-                ),
-                "suffix_envelope_token_count": len(
-                    insertion_spec["suffix_envelope_ids"]
-                ),
+                "source_prefix_sha256": edit_spec["source_prefix_sha256"],
+                "edit_position": edit_spec["edit_start"],
+                "replaced_source_token_count": len(edit_spec["source_ids"]),
+                "replacement_token_count": len(edit_spec["expanded_ids"]),
+                "prefix_envelope_token_count": len(edit_spec["prefix_envelope_ids"]),
+                "suffix_envelope_token_count": len(edit_spec["suffix_envelope_ids"]),
             }
         )
         prepared.artifact_images[carrier] = replacement
@@ -967,6 +977,12 @@ def _minicpm_replay_content(
     prompt = build_standard_prompt(wrapper, dataset, dataset_name, row)
     replayed_message = wrapper._apply_replay_pipeline(prompt, dataset=dataset_name)
     content = wrapper._message_to_content(replayed_message, dataset=dataset_name)
+    content = _normalize_minicpm_iqi_content(content)
+    base = [content[0], content[1]]
+    return content, base, prompt
+
+
+def _normalize_minicpm_iqi_content(content: list[Any]) -> list[Any]:
     types = [
         "image"
         if isinstance(item, Image.Image)
@@ -975,10 +991,13 @@ def _minicpm_replay_content(
         else type(item).__name__
         for item in content
     ]
-    if types != ["image", "text", "image"]:
+    if len(content) < 3 or types[0] != "image" or types[-1] != "image":
         raise RuntimeError(f"Expected exact MiniCPM IQI order, got {types}")
-    base = [content[0], content[1]]
-    return content, base, prompt
+    if any(item_type != "text" for item_type in types[1:-1]):
+        raise RuntimeError(
+            f"Expected only MiniCPM question text between images, got {types}"
+        )
+    return [content[0], "\n".join(content[1:-1]), content[-1]]
 
 
 def _prepare_minicpm_sequences(
@@ -1004,7 +1023,7 @@ def _prepare_minicpm_sequences(
         )
     second = replayed[2].convert("RGB")
     second_start, second_end = reference.metadata["image_bound"][1]
-    insertion_spec = _single_insertion_spec(
+    edit_spec = _single_edit_spec(
         full.inputs["input_ids"],
         reference.inputs["input_ids"],
         int(second_start),
@@ -1034,15 +1053,12 @@ def _prepare_minicpm_sequences(
                 "raw_carrier_rgb": list(COLOR_VALUES[carrier]),
                 "standard_prompt": prompt_summary,
                 "standard_prompt_sha256": sha256_json(prompt_summary),
-                "source_prefix_sha256": insertion_spec["source_prefix_sha256"],
-                "insert_position": insertion_spec["insert_at"],
-                "inserted_token_count": len(insertion_spec["inserted_ids"]),
-                "prefix_envelope_token_count": len(
-                    insertion_spec["prefix_envelope_ids"]
-                ),
-                "suffix_envelope_token_count": len(
-                    insertion_spec["suffix_envelope_ids"]
-                ),
+                "source_prefix_sha256": edit_spec["source_prefix_sha256"],
+                "edit_position": edit_spec["edit_start"],
+                "replaced_source_token_count": len(edit_spec["source_ids"]),
+                "replacement_token_count": len(edit_spec["expanded_ids"]),
+                "prefix_envelope_token_count": len(edit_spec["prefix_envelope_ids"]),
+                "suffix_envelope_token_count": len(edit_spec["suffix_envelope_ids"]),
             }
         )
         prepared.artifact_images[carrier] = replacement
@@ -2764,8 +2780,8 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(
                     f"Raw input shape mismatch for {path} {carrier}: {input_ids.shape}"
                 )
-            insert_at = int(carrier_record["metadata"]["insert_position"])
-            if not np.array_equal(input_ids[0, :insert_at], full_ids[0, :insert_at]):
+            edit_at = int(carrier_record["metadata"]["edit_position"])
+            if not np.array_equal(input_ids[0, :edit_at], full_ids[0, :edit_at]):
                 raise RuntimeError(
                     f"Pre-carrier prefix diverges from standard IQ input: {path} {carrier}"
                 )

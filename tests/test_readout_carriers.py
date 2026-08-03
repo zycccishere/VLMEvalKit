@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from PIL import Image
 
 from vlmeval.probes.readout_carriers import (
     MASK_CONDITIONS,
@@ -12,14 +13,15 @@ from vlmeval.probes.readout_carriers import (
     _carrier_masks,
     _validate_corruption_control,
     _independent_expected_masks,
-    _insert_ids_2d,
     _insert_matched_text_carrier,
     _independent_qwen_mrope,
     _literal_token_id,
     _nested_input_summary,
+    _normalize_minicpm_iqi_content,
     _prepare_literal_blind,
     _score_values,
-    _single_insertion_spec,
+    _single_edit_spec,
+    _splice_ids_2d,
     _tensor_sha256,
     _validate_matched_readout_counts,
     _validate_raw_score,
@@ -63,15 +65,16 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
 
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
-    def test_insert_recomputes_unpadded_minicpm_positions(self):
+    def test_splice_recomputes_unpadded_minicpm_positions(self):
         inputs = {
             "input_ids": torch.tensor([[10, 11, 12]], dtype=torch.long),
             "attention_mask": torch.ones((1, 3), dtype=torch.bool),
             "position_ids": torch.arange(3).unsqueeze(0),
             "image_grid_thw": torch.tensor([[1, 2, 3, 4]]),
         }
-        out = _insert_ids_2d(
+        out = _splice_ids_2d(
             inputs,
+            2,
             2,
             [20, 21],
             recompute_position_ids=True,
@@ -130,7 +133,7 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
             generation_text="expanded+assistant",
             token_roles=["prefill"] * 6 + ["decode_prefix"] * 2,
         )
-        spec = _single_insertion_spec(
+        spec = _single_edit_spec(
             base.inputs["input_ids"], reference.inputs["input_ids"], 3, 5
         )
         self.assertEqual(spec["prefix_envelope_ids"], [50])
@@ -153,6 +156,55 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
             text.prefill_len - text.readout_indices[-1] - 1,
             reference.prefill_len - reference.readout_indices[-1] - 1,
         )
+
+    def test_text_core_handles_one_token_boundary_retokenization(self):
+        base = PreparedSequence(
+            inputs={
+                "input_ids": torch.tensor([[10, 13, 90]]),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+                "position_ids": torch.arange(3).unsqueeze(0),
+            },
+            prefill_len=2,
+            readout_indices=[],
+            prompt_text="base",
+            generation_text="base+assistant",
+            token_roles=["prefill", "prefill", "decode_prefix"],
+        )
+        reference = PreparedSequence(
+            inputs={
+                "input_ids": torch.tensor([[10, 113, 50, 20, 51, 90]]),
+                "attention_mask": torch.ones((1, 6), dtype=torch.long),
+                "position_ids": torch.arange(6).unsqueeze(0),
+            },
+            prefill_len=5,
+            readout_indices=[3],
+            prompt_text="expanded",
+            generation_text="expanded+assistant",
+            token_roles=["prefill"] * 5 + ["decode_prefix"],
+        )
+        text = _insert_matched_text_carrier(
+            base,
+            reference,
+            core_start=3,
+            core_end_exclusive=4,
+            literal_token_id=13,
+            carrier="dot_text",
+            family="minicpmo45",
+        )
+        self.assertEqual(text.inputs["input_ids"].tolist(), [[10, 113, 50, 13, 51, 90]])
+        self.assertEqual(text.inputs["position_ids"].tolist(), [[0, 1, 2, 3, 4, 5]])
+        self.assertEqual(text.prefill_len, reference.prefill_len)
+        self.assertEqual(text.metadata["replaced_source_token_count"], 1)
+
+    def test_minicpm_adjacent_text_segments_preserve_joined_prompt(self):
+        first = Image.new("RGB", (2, 2), color="white")
+        second = Image.new("RGB", (2, 2), color="yellow")
+        normalized = _normalize_minicpm_iqi_content(
+            [first, "system text", "question text", second]
+        )
+        self.assertIs(normalized[0], first)
+        self.assertEqual(normalized[1], "system text\nquestion text")
+        self.assertIs(normalized[2], second)
 
     def test_structural_match_rejects_equal_core_with_different_answer_position(self):
         def sequence(length, prefill):
