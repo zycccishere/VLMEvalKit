@@ -415,6 +415,7 @@ def _validate_run_contract_attestation(
 
 def _load_probe_model(env: dict[str, str], registry_name: str, family: str) -> Any:
     with patched_environ(env):
+        os.environ.pop("WORLD_SIZE", None)
         for name in (
             "vlmeval.config_runtime",
             "vlmeval.config_qwen_minimal",
@@ -2647,7 +2648,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
         ) or not required_runtime_fields.issubset(runtime_identity):
             raise RuntimeError(f"Incomplete runtime identity in {path}")
         expected_transformers = (
-            "4.53.3" if artifact.get("model_family") == "qwen25vl" else "4.57.3"
+            "4.53.3" if artifact.get("model_family") == "qwen25vl" else "4.51.0"
         )
         if runtime_identity.get("transformers") != expected_transformers:
             raise RuntimeError(

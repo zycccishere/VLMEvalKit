@@ -3,13 +3,14 @@ set -euo pipefail
 
 ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-carriers}"
 QWEN_PYTHON="${QWEN_PYTHON:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
-MINICPM_PYTHON="${MINICPM_PYTHON:-/user/wanzihao/miniconda3/envs/vlmevalkit_minicpmv/bin/python}"
+MINICPM_PYTHON="${MINICPM_PYTHON:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
+MINICPM_PYDEPS="${MINICPM_PYDEPS:-/user/zyc1781/.venvs/minicpmo-token-roll-pydeps}"
 QWEN3B_PATH="${QWEN3B_PATH:-/user/zyc1781/models/Qwen2.5-VL-3B-Instruct}"
 QWEN7B_PATH="${QWEN7B_PATH:-/user/zyc1781/models/Qwen2.5-VL-7B-Instruct}"
 MINICPM_PATH="${MINICPM_PATH:-/user/zyc1781/models/MiniCPM-o-4_5}"
 LMU_DATA="${LMUData:-/user/zyc1781/LMUData}"
 MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"
-RUN_ID="${RUN_ID:-readout_carrier_smoke_20260803}"
+RUN_ID="${RUN_ID:-readout_carrier_smoke_v2_20260803}"
 OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_carriers/${RUN_ID}}"
 MANIFEST_ROOT="${MANIFEST_ROOT:-${OUT_ROOT}/manifests}"
 PREBUILT_MANIFESTS="${PREBUILT_MANIFESTS:-0}"
@@ -73,6 +74,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 required_paths=( \
   "${QWEN_PYTHON}" "${MINICPM_PYTHON}" \
+  "${MINICPM_PYDEPS}" \
   "${QWEN3B_PATH}" "${QWEN7B_PATH}" "${MINICPM_PATH}" \
   "${MATRIX_CONFIG}" \
 )
@@ -89,6 +91,8 @@ for required in "${required_paths[@]}"; do
     exit 2
   fi
 done
+PYTHONPATH="${ROOT}:${MINICPM_PYDEPS}" "${MINICPM_PYTHON}" -c \
+  'import librosa, torch, torchaudio, transformers; print(transformers.__version__, torch.__version__, torchaudio.__version__, librosa.__version__)'
 
 if [[ "${PREBUILT_MANIFESTS}" == "1" ]]; then
   rm -rf \
@@ -175,12 +179,17 @@ launch_probe() {
   local datasets="$5"
   local tag="$6"
   local diagnostics="$7"
+  local worker_pythonpath="${ROOT}"
+  if [[ "${model_key}" == "minicpm_o_45" ]]; then
+    worker_pythonpath="${ROOT}:${MINICPM_PYDEPS}"
+  fi
   local diagnostic_args=()
   if [[ "${diagnostics}" == "1" ]]; then
     diagnostic_args=(--diagnostics --diagnostics-limit 1)
   fi
   (
     export CUDA_VISIBLE_DEVICES="${gpu}"
+    export PYTHONPATH="${worker_pythonpath}"
     "${python_bin}" -m vlmeval.probes.readout_carriers run \
       --repo-root "${ROOT}" \
       --manifest "${MANIFEST_ROOT}/${model_key}.json" \
