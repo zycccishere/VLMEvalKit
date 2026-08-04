@@ -21,6 +21,7 @@ from vlmeval.probes.readout_carriers import (
     _nested_input_summary,
     _normalize_minicpm_iqi_content,
     _prepare_literal_blind,
+    _qwen_per_image_features,
     _run_minicpm_allowed,
     _score_values,
     _single_edit_spec,
@@ -68,6 +69,61 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
 
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
+    def test_qwen_images_are_encoded_one_at_a_time(self):
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+                self.config = SimpleNamespace(
+                    vision_config=SimpleNamespace(spatial_merge_size=2)
+                )
+
+            def get_image_features(self, pixels, grid):
+                self.calls.append((pixels.clone(), grid.clone()))
+                value = float(pixels[0, 0].item())
+                feature_count = int(grid.prod() // 4)
+                return (torch.full((feature_count, 3), value),)
+
+        model = FakeModel()
+        pixels = torch.tensor([[1.0]] * 4 + [[2.0]] * 8)
+        grid = torch.tensor([[1, 2, 2], [1, 2, 4]])
+        features = _qwen_per_image_features(model, pixels, grid)
+
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(tuple(model.calls[0][0].shape), (4, 1))
+        self.assertEqual(tuple(model.calls[1][0].shape), (8, 1))
+        self.assertEqual(model.calls[0][1].tolist(), [[1, 2, 2]])
+        self.assertEqual(model.calls[1][1].tolist(), [[1, 2, 4]])
+        self.assertEqual([tuple(part.shape) for part in features], [(1, 3), (2, 3)])
+        self.assertTrue(torch.all(features[0] == 1))
+        self.assertTrue(torch.all(features[1] == 2))
+
+    def test_qwen_per_image_encoding_rejects_incomplete_grid(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2)
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly consume"):
+            _qwen_per_image_features(
+                model,
+                torch.zeros((5, 1)),
+                torch.tensor([[1, 2, 2]]),
+            )
+
+    def test_qwen_per_image_encoding_rejects_wrong_feature_length(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2)
+            ),
+            get_image_features=lambda pixels, grid: (torch.zeros((2, 3)),),
+        )
+        with self.assertRaisesRegex(RuntimeError, "feature length mismatch"):
+            _qwen_per_image_features(
+                model,
+                torch.zeros((4, 1)),
+                torch.tensor([[1, 2, 2]]),
+            )
+
     def test_minicpm_images_are_encoded_one_at_a_time(self):
         class FakeModel:
             def __init__(self):

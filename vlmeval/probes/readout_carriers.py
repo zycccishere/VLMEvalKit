@@ -1211,6 +1211,49 @@ def _additive_mask(
     return out.unsqueeze(1)
 
 
+def _qwen_per_image_features(
+    model: Any, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    if image_grid_thw.ndim != 2 or image_grid_thw.shape[1] != 3:
+        raise RuntimeError(f"Unexpected Qwen image grid shape: {image_grid_thw.shape}")
+    if torch.any(image_grid_thw <= 0):
+        raise RuntimeError(f"Qwen image grid must be positive: {image_grid_thw}")
+    patch_counts = [int(value) for value in image_grid_thw.prod(dim=-1).tolist()]
+    if sum(patch_counts) != int(pixel_values.shape[0]):
+        raise RuntimeError(
+            "Qwen image grids do not exactly consume pixel_values: "
+            f"{patch_counts} vs {pixel_values.shape[0]}"
+        )
+    merge_area = int(model.config.vision_config.spatial_merge_size) ** 2
+    if any(count % merge_area for count in patch_counts):
+        raise RuntimeError(
+            f"Qwen image patch counts are not divisible by {merge_area}: "
+            f"{patch_counts}"
+        )
+    pixel_parts = torch.split(pixel_values, patch_counts, dim=0)
+    feature_parts = []
+    for image_idx, pixel_part in enumerate(pixel_parts):
+        image_features = model.get_image_features(
+            pixel_part, image_grid_thw[image_idx : image_idx + 1]
+        )
+        if isinstance(image_features, torch.Tensor):
+            image_features = (image_features,)
+        if len(image_features) != 1:
+            raise RuntimeError(
+                f"Qwen per-image encoder returned {len(image_features)} feature parts"
+            )
+        image_feature = image_features[0]
+        expected_features = patch_counts[image_idx] // merge_area
+        if int(image_feature.shape[0]) != expected_features:
+            raise RuntimeError(
+                "Qwen per-image feature length mismatch: "
+                f"{image_feature.shape[0]} != {expected_features}"
+            )
+        feature_parts.append(image_feature)
+    return tuple(feature_parts)
+
+
+@torch.no_grad()
 def _prepare_qwen_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     input_ids = inputs["input_ids"]
     embeds = model.get_input_embeddings()(input_ids)
@@ -1220,11 +1263,9 @@ def _prepare_qwen_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     scatter_max_abs_diff = 0.0
     pixel_values = inputs.get("pixel_values")
     if pixel_values is not None:
-        feature_parts = model.get_image_features(
-            pixel_values, inputs.get("image_grid_thw")
+        feature_parts = _qwen_per_image_features(
+            model, pixel_values, inputs["image_grid_thw"]
         )
-        if isinstance(feature_parts, torch.Tensor):
-            feature_parts = (feature_parts,)
         feature_parts = tuple(
             part.to(device=embeds.device, dtype=embeds.dtype) for part in feature_parts
         )
@@ -1268,6 +1309,7 @@ def _prepare_qwen_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
             "inputs_embeds_sha256": _tensor_sha256(embeds),
             "visual_features": feature_stats,
             "visual_scatter_max_abs_diff": scatter_max_abs_diff,
+            "vision_encode_mode": "per_image_batch_one",
         },
     }
 
@@ -1866,11 +1908,12 @@ def score_record(
     blind_score = _score_values(blind_values, answer_key)
 
     full = _extend_prepared(sequences["full"], prefix_ids, family)
-    full_dump_state = (
-        _prepare_minicpm_state(wrapper.model, full.inputs)
-        if dump_dir is not None and family == "minicpmo45"
-        else None
-    )
+    full_dump_state = None
+    if dump_dir is not None:
+        if family == "qwen25vl":
+            full_dump_state = _prepare_qwen_state(wrapper.model, full.inputs)
+        elif family == "minicpmo45":
+            full_dump_state = _prepare_minicpm_state(wrapper.model, full.inputs)
     full_logits = _run_standard(family, wrapper, full.inputs, state=full_dump_state)
     full_score = _score_values(_candidate_values(full_logits, plan), answer_key)
 
@@ -1883,6 +1926,12 @@ def score_record(
     runtime_meta: dict[str, Any] = {}
     raw_runtime_tensors: dict[str, np.ndarray] = {}
     if full_dump_state is not None:
+        runtime_meta["full"] = {
+            key: value.detach().cpu().tolist()
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in full_dump_state["public_meta"].items()
+        }
         for tensor_name in ("visual_feature_0", "visual_core_0"):
             raw_runtime_tensors[f"full__{tensor_name}"] = _tensor_dump_numpy(
                 full_dump_state["raw_tensors"][tensor_name]
@@ -3135,6 +3184,43 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         )
             else:
                 artifact_has_diagnostics = False
+
+        if artifact["model_family"] == "qwen25vl":
+            source_features = {}
+            for name in ("full", *CARRIERS):
+                if (
+                    artifact["runtime_meta"][name].get("vision_encode_mode")
+                    != "per_image_batch_one"
+                ):
+                    raise RuntimeError(
+                        f"Qwen images were not encoded independently: {path} {name}"
+                    )
+                feature_key = f"{name}__visual_feature_0"
+                core_key = f"{name}__visual_core_0"
+                if (
+                    feature_key not in runtime_tensors
+                    or core_key not in runtime_tensors
+                ):
+                    raise RuntimeError(
+                        f"Source visual tensors missing for {path} {name}"
+                    )
+                feature = np.asarray(runtime_tensors[feature_key])
+                core = np.asarray(runtime_tensors[core_key])
+                if not np.array_equal(feature, core):
+                    raise RuntimeError(
+                        f"Source visual feature/core mismatch for {path} {name}"
+                    )
+                source_features[name] = feature
+            reference_source = source_features["full"]
+            for name in CARRIERS:
+                if not np.array_equal(reference_source, source_features[name]):
+                    max_diff = float(
+                        np.max(np.abs(reference_source - source_features[name]))
+                    )
+                    raise RuntimeError(
+                        f"Qwen source visual feature changed across carriers: "
+                        f"{path} full vs {name} max={max_diff}"
+                    )
 
         if artifact["model_family"] == "minicpmo45":
             if (
