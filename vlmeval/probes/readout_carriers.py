@@ -111,8 +111,11 @@ RECORD_FIELDS = (
 MODEL_FAMILIES = {
     "qwen25vl_3b": "qwen25vl",
     "qwen25vl_7b": "qwen25vl",
+    "qwen25vl_32b": "qwen25vl",
+    "minicpm_v_45": "minicpmv45",
     "minicpm_o_45": "minicpmo45",
 }
+MINICPM_FAMILIES = frozenset({"minicpmv45", "minicpmo45"})
 LOREM_TEXT = (
     " Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod "
     "tempor incididunt ut labore et dolore magna aliqua."
@@ -154,11 +157,21 @@ def _parse_csv(value: str | Iterable[str]) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _flatten_ints(value: Any) -> list[int]:
+    if isinstance(value, (list, tuple)):
+        return [item for nested in value for item in _flatten_ints(nested)]
+    return [int(value)]
+
+
 def _model_family(model_key: str) -> str:
     try:
         return MODEL_FAMILIES[model_key]
     except KeyError as exc:
         raise ValueError(f"Unsupported readout-carrier model: {model_key}") from exc
+
+
+def _is_minicpm_family(family: str) -> bool:
+    return family in MINICPM_FAMILIES
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:
@@ -672,7 +685,7 @@ def _insert_matched_text_ids_carrier(
         int(spec["edit_start"]),
         int(spec["source_end"]),
         replacement,
-        recompute_position_ids=family == "minicpmo45",
+        recompute_position_ids=_is_minicpm_family(family),
     )
     out.prefill_len = int(base.prefill_len) - len(spec["source_ids"]) + len(replacement)
     readout_start = int(spec["edit_start"]) + len(spec["prefix_envelope_ids"])
@@ -1008,6 +1021,7 @@ def _minicpm_content_to_prompt(
     wrapper: Any,
     content: list[Any],
     *,
+    family: str,
     add_generation_prompt: bool,
 ) -> tuple[str, list[Image.Image]]:
     images: list[Image.Image] = []
@@ -1015,38 +1029,59 @@ def _minicpm_content_to_prompt(
     for item in content:
         if isinstance(item, Image.Image):
             images.append(item.convert("RGB"))
-            parts.append("<image>./</image>")
+            parts.append(
+                "(<image>./</image>)"
+                if family == "minicpmv45"
+                else "<image>./</image>"
+            )
         elif isinstance(item, str):
             parts.append(item)
         else:
             raise TypeError(f"Unsupported MiniCPM content item: {type(item).__name__}")
     messages = [{"role": "user", "content": "\n".join(parts)}]
+    template_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": add_generation_prompt,
+        "enable_thinking": False,
+    }
+    if family == "minicpmo45":
+        template_kwargs["use_tts_template"] = False
     prompt = wrapper.processor.tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-        use_tts_template=False,
-        enable_thinking=False,
+        messages, **template_kwargs
     )
     return str(prompt), images
 
 
 def _minicpm_processor_call(
-    wrapper: Any, prompt: str, images: list[Image.Image]
+    wrapper: Any,
+    prompt: str,
+    images: list[Image.Image],
+    *,
+    family: str,
 ) -> dict[str, Any]:
     model = wrapper.model
-    model.prepare_processor(processor=wrapper.processor, tokenizer=wrapper.tokenizer)
-    batch = wrapper.processor(
-        [prompt],
-        [images],
-        [[]],
-        [[]],
-        max_slice_nums=1,
-        use_image_id=True,
-        stream_input=False,
-        return_tensors="pt",
-        max_length=8192,
-    ).to(model.device)
+    if family == "minicpmo45":
+        model.prepare_processor(processor=wrapper.processor, tokenizer=wrapper.tokenizer)
+        batch = wrapper.processor(
+            [prompt],
+            [images],
+            [[]],
+            [[]],
+            max_slice_nums=1,
+            use_image_id=True,
+            stream_input=False,
+            return_tensors="pt",
+            max_length=8192,
+        ).to(model.device)
+    else:
+        batch = wrapper.processor(
+            [prompt],
+            [images],
+            max_slice_nums=1,
+            use_image_id=True,
+            return_tensors="pt",
+            max_length=8192,
+        ).to(model.device)
     out = dict(batch)
     out.pop("image_sizes", None)
     return out
@@ -1056,13 +1091,14 @@ def _prepare_minicpm_content(
     wrapper: Any,
     content: list[Any],
     *,
+    family: str,
     expected_images: int,
 ) -> PreparedSequence:
     prompt_text, prompt_images = _minicpm_content_to_prompt(
-        wrapper, content, add_generation_prompt=False
+        wrapper, content, family=family, add_generation_prompt=False
     )
     generation_text, generation_images = _minicpm_content_to_prompt(
-        wrapper, content, add_generation_prompt=True
+        wrapper, content, family=family, add_generation_prompt=True
     )
     if (
         len(generation_images) != expected_images
@@ -1072,8 +1108,12 @@ def _prepare_minicpm_content(
             f"Expected {expected_images} MiniCPM images, got "
             f"{len(prompt_images)}/{len(generation_images)}"
         )
-    inputs = _minicpm_processor_call(wrapper, generation_text, generation_images)
-    prompt_inputs = _minicpm_processor_call(wrapper, prompt_text, prompt_images)
+    inputs = _minicpm_processor_call(
+        wrapper, generation_text, generation_images, family=family
+    )
+    prompt_inputs = _minicpm_processor_call(
+        wrapper, prompt_text, prompt_images, family=family
+    )
     prompt_ids = prompt_inputs["input_ids"][0].detach().cpu().tolist()
     generation_ids = inputs["input_ids"][0].detach().cpu().tolist()
     if generation_ids[: len(prompt_ids)] != prompt_ids:
@@ -1126,12 +1166,16 @@ def _prepare_minicpm_content(
         generation_text=generation_text,
         token_roles=roles,
         metadata={
-            "model_family": "minicpmo45",
+            "model_family": family,
             "image_bound": bounds,
             "image_bound_lengths": bound_lengths,
             "tgt_sizes": _nested_tensor_summary_value(inputs.get("tgt_sizes")),
+            "temporal_ids": _nested_tensor_summary_value(inputs.get("temporal_ids")),
             "query_num": query_num,
-            "max_slice_nums": int(wrapper.model.config.slice_config.max_slice_nums),
+            "max_slice_nums": 1,
+            "model_config_max_slice_nums": int(
+                wrapper.model.config.slice_config.max_slice_nums
+            ),
             "vision_encode_mode": "per_image_batch_one",
         },
     )
@@ -1169,13 +1213,15 @@ def _normalize_minicpm_iqi_content(content: list[Any]) -> list[Any]:
 
 
 def _prepare_minicpm_sequences(
-    wrapper: Any, dataset: Any, dataset_name: str, row: Any
+    wrapper: Any, dataset: Any, dataset_name: str, row: Any, *, family: str
 ) -> dict[str, PreparedSequence]:
     replayed, base, standard_prompt = _minicpm_replay_content(
         wrapper, dataset, dataset_name, row
     )
-    reference = _prepare_minicpm_content(wrapper, replayed, expected_images=2)
-    full = _prepare_minicpm_content(wrapper, base, expected_images=1)
+    reference = _prepare_minicpm_content(
+        wrapper, replayed, family=family, expected_images=2
+    )
+    full = _prepare_minicpm_content(wrapper, base, family=family, expected_images=1)
     prompt_summary = summarize_prompt_items(standard_prompt)
     full.metadata.update(
         {
@@ -1200,7 +1246,9 @@ def _prepare_minicpm_sequences(
     for carrier in VISUAL_CARRIERS:
         replacement = _visual_carrier_image(second, carrier)
         content = [replayed[0], replayed[1], replacement]
-        prepared = _prepare_minicpm_content(wrapper, content, expected_images=2)
+        prepared = _prepare_minicpm_content(
+            wrapper, content, family=family, expected_images=2
+        )
         if prepared.metadata["image_bound"] != reference.metadata["image_bound"]:
             raise RuntimeError(
                 f"MiniCPM {carrier} changed image_bound: "
@@ -1242,7 +1290,7 @@ def _prepare_minicpm_sequences(
             core_end_exclusive=int(second_end),
             literal_token_id=token,
             carrier=carrier,
-            family="minicpmo45",
+            family=family,
         )
         prepared.metadata.update(
             {
@@ -1263,7 +1311,7 @@ def _prepare_minicpm_sequences(
             core_end_exclusive=int(second_end),
             carrier_token_ids=token_ids,
             carrier=carrier,
-            family="minicpmo45",
+            family=family,
             carrier_metadata=metadata,
         )
         prepared.metadata.update(
@@ -1597,15 +1645,57 @@ def _minicpm_per_image_vision_states(
     return [vision_states]
 
 
-def _prepare_minicpm_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
+def _minicpm_v_per_image_vision_states(
+    model: Any, inputs: dict[str, Any]
+) -> list[torch.Tensor]:
+    pixels = inputs["pixel_values"][0]
+    target_sizes = inputs["tgt_sizes"][0]
+    temporal_ids = inputs["temporal_ids"][0]
+    image_count = len(inputs["image_bound"][0])
+    if not (
+        len(pixels) == len(target_sizes) == len(temporal_ids) == image_count
+    ):
+        raise RuntimeError("MiniCPM-V image tensors, temporal IDs, and bounds misalign")
+    parts = []
+    query_num = int(model.config.query_num)
+    for image_idx in range(image_count):
+        image_inputs = {
+            "input_ids": torch.zeros(
+                (1, query_num), dtype=torch.long, device=model.device
+            ),
+            "image_bound": [
+                torch.tensor([[0, query_num]], dtype=torch.long, device=model.device)
+            ],
+            "pixel_values": [pixels[image_idx : image_idx + 1]],
+            "tgt_sizes": [target_sizes[image_idx : image_idx + 1]],
+            "temporal_ids": [temporal_ids[image_idx : image_idx + 1]],
+        }
+        _, vision_states = model.get_vllm_embedding(image_inputs)
+        image_state = vision_states[0]
+        if image_state.shape[:2] != (1, query_num):
+            raise RuntimeError(
+                f"Unexpected MiniCPM-V per-image state shape: {image_state.shape}"
+            )
+        parts.append(image_state)
+    vision_states = torch.cat(parts, dim=0)
+    if int(vision_states.shape[0]) != image_count:
+        raise RuntimeError("MiniCPM-V per-image states changed image order/count")
+    return [vision_states]
+
+
+def _prepare_minicpm_state(
+    model: Any, inputs: dict[str, Any], *, apply_omni: bool
+) -> dict[str, Any]:
     attention_backend = getattr(model.llm.config, "_attn_implementation", None)
     if attention_backend not in {"sdpa", "eager"}:
         raise RuntimeError(
             "MiniCPM carrier masks require sdpa/eager, got " f"{attention_backend!r}"
         )
     embedding_inputs = dict(inputs)
-    embedding_inputs["vision_hidden_states"] = _minicpm_per_image_vision_states(
-        model, inputs
+    embedding_inputs["vision_hidden_states"] = (
+        _minicpm_per_image_vision_states(model, inputs)
+        if apply_omni
+        else _minicpm_v_per_image_vision_states(model, inputs)
     )
     embeds, vision_states = model.get_vllm_embedding(embedding_inputs)
     audio_features = inputs.get("audio_features")
@@ -1637,11 +1727,15 @@ def _prepare_minicpm_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]
             visual_stats.append(_tensor_runtime_stats(expected))
             visual_features.append(expected)
     pre_omni_embeds = embeds.clone()
-    embeds = model.get_omni_embedding(
-        inputs,
-        input_embeddings=embeds,
-        chunk_length=model.config.audio_chunk_length,
-    )
+    if apply_omni:
+        embeds = model.get_omni_embedding(
+            inputs,
+            input_embeddings=embeds,
+            chunk_length=model.config.audio_chunk_length,
+        )
+        embedding_postprocess = "applied_no_audio_identity"
+    else:
+        embedding_postprocess = "not_applicable"
     positions = inputs["position_ids"].long()
     if not _has_nonempty_tensor(audio_features):
         omni_diff = float((embeds - pre_omni_embeds).abs().max())
@@ -1679,6 +1773,7 @@ def _prepare_minicpm_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]
             "visual_scatter_max_abs_diff": scatter_max_abs_diff,
             "attention_backend": attention_backend,
             "no_audio_omni_max_abs_diff": omni_diff,
+            "embedding_postprocess": embedding_postprocess,
             "vision_encode_mode": "per_image_batch_one",
         },
     }
@@ -1689,8 +1784,10 @@ def _run_minicpm_allowed(
     inputs: dict[str, Any],
     allowed: torch.Tensor,
     state: dict[str, Any] | None = None,
+    *,
+    apply_omni: bool,
 ) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
-    state = state or _prepare_minicpm_state(model, inputs)
+    state = state or _prepare_minicpm_state(model, inputs, apply_omni=apply_omni)
     embeds = state["inputs_embeds"]
     positions = state["position_ids"]
     logits = []
@@ -1715,8 +1812,10 @@ def _run_minicpm_standard(
     model: Any,
     inputs: dict[str, Any],
     state: dict[str, Any] | None = None,
+    *,
+    apply_omni: bool,
 ) -> torch.Tensor:
-    state = state or _prepare_minicpm_state(model, inputs)
+    state = state or _prepare_minicpm_state(model, inputs, apply_omni=apply_omni)
     embeds = state["inputs_embeds"]
     with torch.inference_mode():
         outputs = model.llm(
@@ -1898,7 +1997,7 @@ def _extend_prepared(
     out.inputs = _append_ids(
         sequence.inputs,
         prefix_ids,
-        recompute_position_ids=family == "minicpmo45",
+        recompute_position_ids=_is_minicpm_family(family),
     )
     out.token_roles = list(sequence.token_roles) + ["answer_prefix"] * len(prefix_ids)
     out.metadata = copy.deepcopy(sequence.metadata)
@@ -1918,7 +2017,7 @@ def _prepare_literal_blind(
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids),
     }
-    if family == "minicpmo45":
+    if _is_minicpm_family(family):
         inputs["position_ids"] = torch.arange(
             input_ids.shape[-1], dtype=torch.long, device=device
         ).unsqueeze(0)
@@ -1974,8 +2073,14 @@ def _run_allowed(
 ) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
     if family == "qwen25vl":
         return _run_qwen_allowed(wrapper.model, inputs, masks, state=state)
-    if family == "minicpmo45":
-        return _run_minicpm_allowed(wrapper.model, inputs, masks, state=state)
+    if _is_minicpm_family(family):
+        return _run_minicpm_allowed(
+            wrapper.model,
+            inputs,
+            masks,
+            state=state,
+            apply_omni=family == "minicpmo45",
+        )
     raise AssertionError(family)
 
 
@@ -1987,8 +2092,13 @@ def _run_standard(
 ) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_standard(wrapper.model, inputs)
-    if family == "minicpmo45":
-        return _run_minicpm_standard(wrapper.model, inputs, state=state)
+    if _is_minicpm_family(family):
+        return _run_minicpm_standard(
+            wrapper.model,
+            inputs,
+            state=state,
+            apply_omni=family == "minicpmo45",
+        )
     raise AssertionError(family)
 
 
@@ -2000,8 +2110,13 @@ def _run_embedded_standard(
 ) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_embedded_standard(wrapper.model, inputs, state)
-    if family == "minicpmo45":
-        return _run_minicpm_standard(wrapper.model, inputs, state=state)
+    if _is_minicpm_family(family):
+        return _run_minicpm_standard(
+            wrapper.model,
+            inputs,
+            state=state,
+            apply_omni=family == "minicpmo45",
+        )
     raise AssertionError(family)
 
 
@@ -2010,7 +2125,7 @@ def _run_literal_blind(
 ) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_standard(wrapper.model, sequence.inputs)
-    if family == "minicpmo45":
+    if _is_minicpm_family(family):
         inputs = sequence.inputs
         with torch.inference_mode():
             outputs = wrapper.model.llm(
@@ -2034,8 +2149,10 @@ def _prepare_sequences(
 ) -> dict[str, PreparedSequence]:
     if family == "qwen25vl":
         return _prepare_qwen_sequences(wrapper, dataset, dataset_name, row)
-    if family == "minicpmo45":
-        return _prepare_minicpm_sequences(wrapper, dataset, dataset_name, row)
+    if _is_minicpm_family(family):
+        return _prepare_minicpm_sequences(
+            wrapper, dataset, dataset_name, row, family=family
+        )
     raise AssertionError(family)
 
 
@@ -2066,6 +2183,7 @@ def _dump_token_table(
 def _runtime_identity(wrapper: Any, family: str) -> dict[str, Any]:
     import transformers
 
+    llm_config = _llm_attention_config(wrapper, family)
     if family == "qwen25vl":
         attention_backend = getattr(wrapper.model.config, "_attn_implementation", None)
     else:
@@ -2080,6 +2198,18 @@ def _runtime_identity(wrapper: Any, family: str) -> dict[str, Any]:
         "cuda_device_name": torch.cuda.get_device_name(0),
         "attention_backend": attention_backend,
         "model_class": wrapper.model.__class__.__name__,
+        "processor_class": wrapper.processor.__class__.__name__,
+        "tokenizer_class": (
+            wrapper.processor.tokenizer.__class__.__name__
+            if family == "qwen25vl"
+            else wrapper.tokenizer.__class__.__name__
+        ),
+        "hidden_size": int(llm_config.hidden_size),
+        "num_hidden_layers": int(llm_config.num_hidden_layers),
+        "hf_device_map": {
+            str(key): str(value)
+            for key, value in getattr(wrapper.model, "hf_device_map", {}).items()
+        },
     }
 
 
@@ -2129,8 +2259,12 @@ def score_record(
     if dump_dir is not None:
         if family == "qwen25vl":
             full_dump_state = _prepare_qwen_state(wrapper.model, full.inputs)
-        elif family == "minicpmo45":
-            full_dump_state = _prepare_minicpm_state(wrapper.model, full.inputs)
+        elif _is_minicpm_family(family):
+            full_dump_state = _prepare_minicpm_state(
+                wrapper.model,
+                full.inputs,
+                apply_omni=family == "minicpmo45",
+            )
     full_logits = _run_standard(family, wrapper, full.inputs, state=full_dump_state)
     full_score = _score_values(_candidate_values(full_logits, plan), answer_key)
 
@@ -2212,7 +2346,7 @@ def score_record(
             readout_ids = sequence.inputs["input_ids"][:, sequence.readout_indices]
             with torch.no_grad():
                 expected_text_core = embedding_layer(readout_ids)
-                if family == "minicpmo45" and hasattr(
+                if _is_minicpm_family(family) and hasattr(
                     wrapper.model.llm.config, "scale_emb"
                 ):
                     expected_text_core = (
@@ -2307,6 +2441,12 @@ def score_record(
         "candidate_plan": plan,
         "matched_readout_token_count": target_n,
         "runtime_identity": runtime_identity,
+        "cuda_memory": {
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        },
         "entry_environment": {key: os.environ.get(key) for key in ENTRY_ENV_KEYS},
         "provenance": provenance,
         "blind": blind_score,
@@ -2600,6 +2740,7 @@ def run_probe(args: argparse.Namespace) -> int:
                     / f"row{int(manifest_record['row_position'])}_idx{manifest_record['sample_index']}"
                 )
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
             record = score_record(
                 wrapper,
@@ -3018,6 +3159,11 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "cuda_device_name",
             "attention_backend",
             "model_class",
+            "processor_class",
+            "tokenizer_class",
+            "hidden_size",
+            "num_hidden_layers",
+            "hf_device_map",
         }
         if not isinstance(
             runtime_identity, dict
@@ -3032,6 +3178,51 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 f"{runtime_identity.get('transformers')} != {expected_transformers}"
             )
         runtime_identities.append(runtime_identity)
+        cuda_memory = artifact.get("cuda_memory", {})
+        if not all(
+            int(cuda_memory.get(key, 0)) > 0
+            for key in (
+                "allocated_bytes",
+                "reserved_bytes",
+                "peak_allocated_bytes",
+                "peak_reserved_bytes",
+            )
+        ):
+            raise RuntimeError(f"Invalid CUDA memory counters in {path}")
+        if manifest["model_key"] == "qwen25vl_32b":
+            device_targets = set(runtime_identity["hf_device_map"].values())
+            if not device_targets or any(
+                target in {"cpu", "disk"} for target in device_targets
+            ):
+                raise RuntimeError(f"Qwen32 checkpoint was offloaded in {path}")
+            if (
+                int(runtime_identity["hidden_size"]) != 5120
+                or int(runtime_identity["num_hidden_layers"]) != 64
+            ):
+                raise RuntimeError(f"Unexpected Qwen32 architecture in {path}")
+        if artifact.get("model_family") == "minicpmv45":
+            if runtime_identity["model_class"] != "MiniCPMV":
+                raise RuntimeError(f"Unexpected MiniCPM-V model class in {path}")
+            if runtime_identity["processor_class"] != "MiniCPMVProcessor":
+                raise RuntimeError(f"Unexpected MiniCPM-V processor class in {path}")
+            for sequence_name in ("full", *CARRIERS):
+                sequence = artifact["sequences"][sequence_name]
+                inputs = sequence["inputs"]
+                if "temporal_ids" not in inputs:
+                    raise RuntimeError(
+                        f"MiniCPM-V temporal IDs missing: {path} {sequence_name}"
+                    )
+                if "audio_features" in inputs or "audio_bounds" in inputs:
+                    raise RuntimeError(
+                        f"MiniCPM-V received audio inputs: {path} {sequence_name}"
+                    )
+                temporal_ids = _flatten_ints(sequence["metadata"]["temporal_ids"])
+                expected_images = 2 if sequence_name in VISUAL_CARRIERS else 1
+                if temporal_ids != [-1] * expected_images:
+                    raise RuntimeError(
+                        f"MiniCPM-V static-image temporal IDs mismatch: "
+                        f"{path} {sequence_name} {temporal_ids}"
+                    )
         entry_environment = artifact.get("entry_environment", {})
         if entry_environment.get("REPLAY_MODE") != "image_text_image":
             raise RuntimeError(f"Smoke replay mode is not IQI: {path}")
@@ -3338,6 +3529,15 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     raise RuntimeError(
                         f"MiniCPM no-audio omni path changed embeddings: {path} {carrier}"
                     )
+                expected_postprocess = (
+                    "applied_no_audio_identity"
+                    if artifact["model_family"] == "minicpmo45"
+                    else "not_applicable"
+                )
+                if model_meta.get("embedding_postprocess") != expected_postprocess:
+                    raise RuntimeError(
+                        f"MiniCPM embedding postprocess mismatch: {path} {carrier}"
+                    )
                 image_spans = bounds
 
             for feature_idx, feature in enumerate(model_meta["visual_features"]):
@@ -3398,7 +3598,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         corrupted,
                         context=f"{path}:{carrier}",
                     )
-                    if artifact["model_family"] == "minicpmo45":
+                    if _is_minicpm_family(artifact["model_family"]):
                         pre_key = f"{carrier}__pre_omni_embeddings"
                         post_key = f"{carrier}__post_omni_embeddings"
                         if (
@@ -3541,7 +3741,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         f"{path} full vs {name} max={max_diff}"
                     )
 
-        if artifact["model_family"] == "minicpmo45":
+        if _is_minicpm_family(artifact["model_family"]):
             if (
                 artifact["sequences"]["full"]["metadata"].get("vision_encode_mode")
                 != "per_image_batch_one"

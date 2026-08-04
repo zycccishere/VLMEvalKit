@@ -21,10 +21,15 @@ from vlmeval.probes.readout_carriers import (
     _literal_token_id,
     _lorem_carrier_token_ids,
     _minicpm_per_image_vision_states,
+    _minicpm_content_to_prompt,
+    _minicpm_processor_call,
+    _minicpm_v_per_image_vision_states,
+    _model_family,
     _natural_noise_image,
     _nested_input_summary,
     _normalize_minicpm_iqi_content,
     _prepare_literal_blind,
+    _prepare_minicpm_state,
     _qwen_per_image_features,
     _run_minicpm_allowed,
     _run_qwen_embedded_standard,
@@ -74,6 +79,11 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
 
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
+    def test_expanded_model_keys_use_the_intended_semantic_family(self):
+        self.assertEqual(_model_family("qwen25vl_32b"), "qwen25vl")
+        self.assertEqual(_model_family("minicpm_v_45"), "minicpmv45")
+        self.assertEqual(_model_family("minicpm_o_45"), "minicpmo45")
+
     def test_qwen_embedded_standard_reuses_precomputed_state(self):
         calls = []
 
@@ -177,6 +187,38 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
         self.assertTrue(torch.all(states[0][0] == 1))
         self.assertTrue(torch.all(states[0][1] == 2))
 
+    def test_minicpm_v_images_and_temporal_ids_are_encoded_one_at_a_time(self):
+        class FakeModel:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.config = SimpleNamespace(query_num=2)
+                self.calls = []
+
+            def get_vllm_embedding(self, inputs):
+                self.calls.append(
+                    (
+                        len(inputs["pixel_values"][0]),
+                        inputs["temporal_ids"][0],
+                    )
+                )
+                value = float(inputs["pixel_values"][0][0].item())
+                states = torch.full((1, 2, 3), value)
+                return torch.zeros((1, 2, 3)), [states]
+
+        model = FakeModel()
+        inputs = {
+            "pixel_values": [[torch.tensor(1.0), torch.tensor(2.0)]],
+            "tgt_sizes": [torch.tensor([[10, 11], [20, 21]])],
+            "temporal_ids": [[[-1], [-1]]],
+            "image_bound": [torch.tensor([[5, 7], [9, 11]])],
+        }
+        states = _minicpm_v_per_image_vision_states(model, inputs)
+        self.assertEqual(model.calls, [(1, [[-1]]), (1, [[-1]])])
+        self.assertEqual(tuple(states[0].shape), (2, 2, 3))
+        self.assertTrue(torch.all(states[0][0] == 1))
+        self.assertTrue(torch.all(states[0][1] == 2))
+
     def test_attention_backend_is_scoped(self):
         config = SimpleNamespace(_attn_implementation="sdpa")
         with _attention_backend(config, "eager"):
@@ -206,10 +248,120 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
                 torch.tril(torch.ones((3, 3), dtype=torch.bool)),
             ]
         )
-        logits, _, _ = _run_minicpm_allowed(model, {}, allowed, state=state)
+        logits, _, _ = _run_minicpm_allowed(
+            model, {}, allowed, state=state, apply_omni=False
+        )
         self.assertEqual(model.llm.batch_sizes, [1, 1])
         self.assertEqual(tuple(logits.shape), (2, 2))
         self.assertNotEqual(float(logits[0, 0]), float(logits[1, 0]))
+
+    def test_minicpm_v_skips_omni_while_minicpm_o_applies_identity_path(self):
+        class FakeModel:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.config = SimpleNamespace(query_num=2, audio_chunk_length=1)
+                self.llm = SimpleNamespace(
+                    config=SimpleNamespace(_attn_implementation="sdpa")
+                )
+                self.omni_calls = 0
+
+            def get_vision_embedding(self, inputs):
+                del inputs
+                return [torch.ones((1, 2, 3))]
+
+            def get_vllm_embedding(self, inputs):
+                states = inputs.get("vision_hidden_states")
+                if states is None:
+                    value = float(inputs["pixel_values"][0][0].item())
+                    states = [torch.full((1, 2, 3), value)]
+                bound = inputs["image_bound"][0][0]
+                embeds = torch.zeros((1, inputs["input_ids"].shape[-1], 3))
+                embeds[0, int(bound[0]) : int(bound[1])] = states[0][0]
+                return embeds, states
+
+            def get_omni_embedding(self, inputs, *, input_embeddings, chunk_length):
+                del inputs, chunk_length
+                self.omni_calls += 1
+                return input_embeddings
+
+        inputs = {
+            "input_ids": torch.zeros((1, 4), dtype=torch.long),
+            "pixel_values": [torch.ones((1, 1))],
+            "tgt_sizes": [torch.tensor([[1, 1]])],
+            "image_bound": [torch.tensor([[1, 3]])],
+            "position_ids": torch.arange(4).unsqueeze(0),
+            "temporal_ids": [[[-1]]],
+        }
+        model = FakeModel()
+        visual_state = _prepare_minicpm_state(model, inputs, apply_omni=False)
+        self.assertEqual(model.omni_calls, 0)
+        self.assertEqual(
+            visual_state["public_meta"]["embedding_postprocess"], "not_applicable"
+        )
+        omni_state = _prepare_minicpm_state(model, inputs, apply_omni=True)
+        self.assertEqual(model.omni_calls, 1)
+        self.assertEqual(
+            omni_state["public_meta"]["embedding_postprocess"],
+            "applied_no_audio_identity",
+        )
+
+    def test_minicpm_processor_uses_model_specific_positional_inputs(self):
+        class Batch(dict):
+            def to(self, device):
+                self["moved_to"] = device
+                return self
+
+        class Processor:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return Batch(input_ids=torch.tensor([[1]]))
+
+        processor = Processor()
+        model = SimpleNamespace(device="cuda:0")
+        wrapper = SimpleNamespace(model=model, processor=processor, tokenizer=object())
+        _minicpm_processor_call(wrapper, "prompt", [], family="minicpmv45")
+        self.assertEqual(len(processor.calls[0][0]), 2)
+        self.assertNotIn("stream_input", processor.calls[0][1])
+
+        prepare_calls = []
+        model.prepare_processor = lambda **kwargs: prepare_calls.append(kwargs)
+        _minicpm_processor_call(wrapper, "prompt", [], family="minicpmo45")
+        self.assertEqual(len(processor.calls[1][0]), 4)
+        self.assertFalse(processor.calls[1][1]["stream_input"])
+        self.assertEqual(len(prepare_calls), 1)
+
+    def test_minicpm_prompt_uses_checkpoint_native_image_marker(self):
+        calls = []
+
+        class Tokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                calls.append((messages, kwargs))
+                return messages[0]["content"]
+
+        wrapper = SimpleNamespace(
+            processor=SimpleNamespace(tokenizer=Tokenizer())
+        )
+        image = Image.new("RGB", (2, 2))
+        v_prompt, _ = _minicpm_content_to_prompt(
+            wrapper,
+            [image, "question"],
+            family="minicpmv45",
+            add_generation_prompt=True,
+        )
+        o_prompt, _ = _minicpm_content_to_prompt(
+            wrapper,
+            [image, "question"],
+            family="minicpmo45",
+            add_generation_prompt=True,
+        )
+        self.assertTrue(v_prompt.startswith("(<image>./</image>)"))
+        self.assertTrue(o_prompt.startswith("<image>./</image>"))
+        self.assertNotIn("use_tts_template", calls[0][1])
+        self.assertFalse(calls[1][1]["use_tts_template"])
 
     def test_splice_recomputes_unpadded_minicpm_positions(self):
         inputs = {

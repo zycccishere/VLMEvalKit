@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-random-carriers}"
-MODEL_KEY="${MODEL_KEY:?Set MODEL_KEY to qwen25vl_3b, qwen25vl_7b, or minicpm_o_45}"
+ROOT="${ROOT:-}"
+MODEL_KEY="${MODEL_KEY:?Set a supported readout-carrier model key}"
 DATASETS="${DATASETS:-DynaMath,WeMath,MMBench_DEV_EN_V11,MMStar,AI2D_TEST}"
 PARTITION_TAG="${PARTITION_TAG:-all}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 LMU_DATA="${LMUData:-/user/zyc1781/LMUData}"
-MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"
 RUN_ID="${RUN_ID:-readout_random_carriers_128_20260804}"
 OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_random_carriers/${RUN_ID}/${MODEL_KEY}/${PARTITION_TAG}}"
 RESUME="${RESUME:-0}"
@@ -18,28 +17,52 @@ MINICPM_PYDEPS="${MINICPM_PYDEPS:-/user/zyc1781/.venvs/minicpmo-token-roll-pydep
 
 case "${MODEL_KEY}" in
   qwen25vl_3b)
+    DEFAULT_ROOT="/user/zyc1781/vlmevalkit-release-readout-random-carriers"
     DEFAULT_WORKERS_PER_GPU=8
     PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-3B-Instruct}"
     SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/qwen25vl_3b/validation.json}"
+    DEFAULT_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/manifests/qwen25vl_3b.json"
     ;;
   qwen25vl_7b)
+    DEFAULT_ROOT="/user/zyc1781/vlmevalkit-release-readout-random-carriers"
     DEFAULT_WORKERS_PER_GPU=4
     PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-7B-Instruct}"
     SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/qwen25vl_7b/validation.json}"
+    DEFAULT_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/manifests/qwen25vl_7b.json"
+    ;;
+  qwen25vl_32b)
+    DEFAULT_ROOT="/user/zyc1781/vlmevalkit-release-readout-expanded-models"
+    DEFAULT_WORKERS_PER_GPU=1
+    PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
+    MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-32B-Instruct}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_carrier_expanded_smoke_20260805/qwen25vl_32b/validation.json}"
+    DEFAULT_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_carrier_expanded_smoke_20260805/manifests/qwen25vl_32b.json"
+    ;;
+  minicpm_v_45)
+    DEFAULT_ROOT="/user/zyc1781/vlmevalkit-release-readout-expanded-models"
+    DEFAULT_WORKERS_PER_GPU=4
+    PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
+    MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/MiniCPM-V-4_5}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_carrier_expanded_smoke_20260805/minicpm_v_45/validation.json}"
+    DEFAULT_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_carrier_expanded_smoke_20260805/manifests/minicpm_v_45.json"
     ;;
   minicpm_o_45)
+    DEFAULT_ROOT="/user/zyc1781/vlmevalkit-release-readout-random-carriers"
     DEFAULT_WORKERS_PER_GPU=4
     PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/MiniCPM-o-4_5}"
     SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/minicpm_o_45/validation.json}"
+    DEFAULT_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/manifests/minicpm_o_45.json"
     ;;
   *)
     echo "Unsupported MODEL_KEY: ${MODEL_KEY}" >&2
     exit 2
     ;;
 esac
+ROOT="${ROOT:-${DEFAULT_ROOT}}"
+MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-${DEFAULT_WORKERS_PER_GPU}}"
 
 IFS=',' read -r -a GPU_ARRAY <<<"${GPU_IDS}"
@@ -65,8 +88,7 @@ for gpu in "${GPU_ARRAY[@]}"; do
   SEEN_GPUS["${gpu}"]=1
 done
 TOTAL_WORKERS=$((8 * WORKERS_PER_GPU))
-DEFAULT_SMOKE_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_v2_20260804/manifests/${MODEL_KEY}.json"
-MANIFEST="${MANIFEST_PATH:-${DEFAULT_SMOKE_MANIFEST}}"
+MANIFEST="${MANIFEST_PATH:-${DEFAULT_MANIFEST}}"
 OUTPUT_BASE="$(realpath -m /user/zyc1781/outputs/readout_random_carriers)"
 OUT_ROOT="$(realpath -m "${OUT_ROOT}")"
 case "${OUT_ROOT}" in
@@ -99,7 +121,7 @@ for required in \
     exit 2
   fi
 done
-if [[ "${MODEL_KEY}" == "minicpm_o_45" ]]; then
+if [[ "${MODEL_KEY}" == minicpm_*_45 ]]; then
   if [[ ! -d "${MINICPM_PYDEPS}" ]]; then
     echo "Required MiniCPM dependency overlay is missing: ${MINICPM_PYDEPS}" >&2
     exit 2
