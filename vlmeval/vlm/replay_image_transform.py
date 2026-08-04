@@ -32,6 +32,11 @@ FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS = {
     f"shift_{direction}_fixed_28px"
     for direction in SHIFT_DIRECTIONS
 }
+NOISE_IMAGE_TRANSFORMS = {
+    "noise_image_seed17": 17,
+    "noise_image_seed29": 29,
+    "noise_image_seed43": 43,
+}
 IMAGE_TRANSFORM_ALIASES = {
     f"shift_{direction}_vit_token": f"shift_{direction}_one_vit_token"
     for direction in SHIFT_DIRECTIONS
@@ -118,6 +123,7 @@ SUPPORTED_IMAGE_TRANSFORMS = {
     "shift_right_real_half_patch_wrap",
     *PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS,
     *FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS,
+    *NOISE_IMAGE_TRANSFORMS,
     "zoom_1p5_uncropped",
 }
 
@@ -180,6 +186,30 @@ def _strip_file_scheme(path_or_url: str) -> str:
     if raw.startswith("file://"):
         return raw[len("file://") :]
     return raw
+
+
+def image_rgb_sha256(image: Image.Image) -> str:
+    return hashlib.sha256(
+        np.asarray(image.convert("RGB"), dtype=np.uint8).tobytes()
+    ).hexdigest()
+
+
+def _natural_noise_image(size: tuple[int, int], seed: int) -> Image.Image:
+    width, height = (int(size[0]), int(size[1]))
+    side = 256
+    rng = np.random.default_rng(seed)
+    white = rng.standard_normal((side, side))
+    fy = np.fft.fftfreq(side)[:, None]
+    fx = np.fft.fftfreq(side)[None, :]
+    frequency = np.sqrt(fx * fx + fy * fy)
+    frequency[0, 0] = 1.0
+    filtered = np.fft.ifft2(np.fft.fft2(white) / frequency).real
+    filtered -= filtered.mean()
+    filtered /= filtered.std()
+    grayscale = np.clip(127.5 + 40.0 * filtered, 24.0, 231.0).astype(np.uint8)
+    rgb = np.repeat(grayscale[:, :, None], 3, axis=2)
+    base = Image.fromarray(rgb, mode="RGB")
+    return base.resize((width, height), Image.Resampling.BICUBIC)
 
 
 def _safe_token(text: str) -> str:
@@ -610,6 +640,19 @@ def apply_image_transform_to_content(
 
     if transform == "blank":
         output_image = Image.new("RGB", source_image.size, color=_fill_color("white"))
+    elif transform in NOISE_IMAGE_TRANSFORMS:
+        noise_seed = NOISE_IMAGE_TRANSFORMS[transform]
+        noise_base = _natural_noise_image((256, 256), noise_seed)
+        output_image = _natural_noise_image(source_image.size, noise_seed)
+        record["noise"] = {
+            "seed": noise_seed,
+            "family": "grayscale_power_spectrum_1_over_f_squared",
+            "base_size": [256, 256],
+            "base_sha256": image_rgb_sha256(noise_base),
+            "output_sha256": image_rgb_sha256(output_image),
+            "resize_interpolation": "bicubic",
+            "seed_scope": "global_condition",
+        }
     elif transform == "random_same_dataset":
         donor_ref = str(sample_meta.get("random_same_dataset_image_ref", "")).strip()
         donor_index = sample_meta.get("random_same_dataset_donor_index")

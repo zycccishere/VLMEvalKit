@@ -1,0 +1,6 @@
+mode,transform
+image_text_text,baseline
+image_text_image_text,baseline
+image_text_image_text,noise_image_seed17
+image_text_image_text,noise_image_seed29
+image_text_image_text,noise_image_seed43

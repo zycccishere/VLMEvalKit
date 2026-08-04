@@ -1,0 +1,31 @@
+name: three_model_image2_noise_posthoc_eval_20260805
+repo_root: "{repo_root}"
+results_root: runs/three_model_image2_noise_content_20260805
+node_gpu_ids: "0,1,2,3,4,5,6,7"
+scheduler: gpu_pool
+datasets: [MathVision, DynaMath, LogicVista, VisualPuzzles, AI2D_TEST, OCRBench, SEEDBench2_Plus]
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes: [image_text_text, image_text_image_text]
+image_transforms: [baseline, noise_image_seed17, noise_image_seed29, noise_image_seed43]
+models: [qwen25vl_32b, qwen25vl_3b, minicpm_o_45]
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  strict_batch: 1
+  stage_debug: 1
+  stage_debug_samples: 1
+  prompt_audit: 1
+  prompt_audit_print: 0
+  image_transform_strict: 1
+trace: {level: summary, samples: 1, dump_max_chars: 12000, prompt_audit_print: 0}
+answer_format: {enable: 1, require_boxed: 0, response_col: prediction, fallback_col: detailed_prediction, max_fails: 50}
+evaluation: {launch_mode: fg, nproc: 512, judge: gpt-4o-mini, require_complete_inference: true}
+worker_monitor: {enable: true, interval_seconds: 300}
+resume_infer_default: true
+resume_infer_start_delay_seconds: 0

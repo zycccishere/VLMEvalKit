@@ -1457,6 +1457,10 @@ except Exception:
             raise RuntimeError(f"dataset unavailable/build failed: {task.dataset}")
 
         infer_was_complete = self.infer_complete(task, model, expected_count)
+        if not infer_was_complete and truthy(self.evaluation_cfg.get("require_complete_inference", False)):
+            raise RuntimeError(
+                "evaluation requires a complete prediction manifest; refusing to run inference"
+            )
         if infer_was_complete and self.eval_complete(task, model, expected_count):
             acc_paths = ", ".join(str(path) for path in self.acc_marker_paths(task, model))
             if acc_paths:

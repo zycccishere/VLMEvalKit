@@ -27,6 +27,7 @@ from .replay_policy import (
 from .replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
+    image_rgb_sha256,
 )
 from ..smp import *
 
@@ -623,6 +624,9 @@ class MiniCPM_V_4_5(BaseModel):
                 "dataset": str(dataset) if dataset is not None else None,
                 "payload_image_count": len(images),
                 "payload_image_sizes": [list(image.size) for image in images],
+                "payload_image_rgb_sha256": [
+                    image_rgb_sha256(image) for image in images
+                ],
                 "message_replayed": self._serialize_message_for_debug(message),
                 "transform_record": transform_record if isinstance(transform_record, dict) else None,
             },
