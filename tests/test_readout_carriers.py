@@ -27,6 +27,7 @@ from vlmeval.probes.readout_carriers import (
     _prepare_literal_blind,
     _qwen_per_image_features,
     _run_minicpm_allowed,
+    _run_qwen_embedded_standard,
     _score_values,
     _single_edit_spec,
     _splice_ids_2d,
@@ -73,6 +74,33 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
 
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
+    def test_qwen_embedded_standard_reuses_precomputed_state(self):
+        calls = []
+
+        class LanguageModel:
+            def __call__(self, **kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(last_hidden_state=kwargs["inputs_embeds"] + 1)
+
+        model = SimpleNamespace(
+            model=SimpleNamespace(language_model=LanguageModel()),
+            lm_head=lambda value: value.sum(dim=-1, keepdim=True),
+        )
+        embeds = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+        positions = torch.arange(3).reshape(1, 1, 3).repeat(3, 1, 1)
+        attention = torch.ones((1, 3), dtype=torch.long)
+        logits = _run_qwen_embedded_standard(
+            model,
+            {"attention_mask": attention},
+            {"inputs_embeds": embeds, "position_ids": positions},
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["inputs_embeds"], embeds)
+        self.assertIs(calls[0]["position_ids"], positions)
+        self.assertIs(calls[0]["attention_mask"], attention)
+        self.assertIsNone(calls[0]["input_ids"])
+        torch.testing.assert_close(logits, (embeds[:, -1, :] + 1).sum(dim=-1))
+
     def test_qwen_images_are_encoded_one_at_a_time(self):
         class FakeModel:
             def __init__(self):

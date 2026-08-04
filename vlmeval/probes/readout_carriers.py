@@ -1547,6 +1547,22 @@ def _run_qwen_standard(model: Any, inputs: dict[str, Any]) -> torch.Tensor:
     return outputs.logits[0, -1, :]
 
 
+def _run_qwen_embedded_standard(
+    model: Any, inputs: dict[str, Any], state: dict[str, Any]
+) -> torch.Tensor:
+    with torch.inference_mode():
+        outputs = model.model.language_model(
+            input_ids=None,
+            inputs_embeds=state["inputs_embeds"],
+            position_ids=state["position_ids"],
+            attention_mask=inputs["attention_mask"],
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
+    return logits[0]
+
+
 def _has_nonempty_tensor(value: Any) -> bool:
     if isinstance(value, torch.Tensor):
         return value.numel() > 0
@@ -1976,6 +1992,19 @@ def _run_standard(
     raise AssertionError(family)
 
 
+def _run_embedded_standard(
+    family: str,
+    wrapper: Any,
+    inputs: dict[str, Any],
+    state: dict[str, Any],
+) -> torch.Tensor:
+    if family == "qwen25vl":
+        return _run_qwen_embedded_standard(wrapper.model, inputs, state)
+    if family == "minicpmo45":
+        return _run_minicpm_standard(wrapper.model, inputs, state=state)
+    raise AssertionError(family)
+
+
 def _run_literal_blind(
     family: str, wrapper: Any, sequence: PreparedSequence
 ) -> torch.Tensor:
@@ -2213,7 +2242,9 @@ def score_record(
                 manual_causal_logits, _, _ = _run_allowed(
                     family, wrapper, sequence.inputs, causal, state=state
                 )
-                standard_causal_logits = _run_standard(family, wrapper, sequence.inputs)
+                standard_causal_logits = _run_embedded_standard(
+                    family, wrapper, sequence.inputs, state
+                )
             causal_parity = _candidate_parity(
                 standard_causal_logits,
                 manual_causal_logits[0],
@@ -2261,7 +2292,7 @@ def score_record(
                 "position_null_invariant_atol_1e_5": bool(
                     float(null_diff.max()) <= BLOCKED_PREFIX_ATOL
                 ),
-                "standard_2d_vs_manual_causal_4d": causal_parity,
+                "same_state_standard_2d_vs_manual_causal_4d": causal_parity,
                 "batch_vs_single_4d": batch_single_parity,
             }
 
