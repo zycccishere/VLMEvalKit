@@ -68,7 +68,28 @@ EXPECTED_COUNTS = {
     "AI2D_TEST": 3060,
 }
 DEFAULT_DATASETS = tuple(DATASET_SOURCES)
-CARRIERS = ("blank_image", "yellow_image", "dot_text", "space_text")
+NOISE_CARRIER_SEEDS = {
+    "noise_image_s0": 17,
+    "noise_image_s1": 29,
+    "noise_image_s2": 43,
+}
+SHUFFLED_LOREM_SEEDS = {
+    "shuffled_lorem_s0": 17,
+    "shuffled_lorem_s1": 29,
+    "shuffled_lorem_s2": 43,
+}
+COLOR_VALUES = {
+    "blank_image": (255, 255, 255),
+    "yellow_image": (255, 255, 0),
+}
+VISUAL_CARRIERS = (*COLOR_VALUES, *NOISE_CARRIER_SEEDS)
+TEXT_CARRIERS = (
+    "dot_text",
+    "space_text",
+    "ordered_lorem",
+    *SHUFFLED_LOREM_SEEDS,
+)
+CARRIERS = (*VISUAL_CARRIERS, *TEXT_CARRIERS)
 MASK_CONDITIONS = ("aware", "no_write", "position_null")
 PRIMARY_CONDITIONS = ("blind", *CARRIERS, "full")
 ENTRY_ENV_KEYS = (
@@ -92,17 +113,17 @@ MODEL_FAMILIES = {
     "qwen25vl_7b": "qwen25vl",
     "minicpm_o_45": "minicpmo45",
 }
-COLOR_VALUES = {
-    "blank_image": (255, 255, 255),
-    "yellow_image": (255, 255, 0),
-}
+LOREM_TEXT = (
+    " Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod "
+    "tempor incididunt ut labore et dolore magna aliqua."
+)
 LOGIT_PARITY_ATOL = 0.05
 LOGIT_PARITY_RTOL = 0.005
 CANDIDATE_PARITY_ATOL = 0.02
 BLOCKED_PREFIX_ATOL = 1e-5
 CORRUPTION_POSITIVE_MIN = 1e-4
-SCHEMA = "topic-image-replay/readout-carrier-controls/v2"
-RECORD_SCHEMA = "topic-image-replay/readout-carrier-record/v2"
+SCHEMA = "topic-image-replay/readout-random-carriers/v1"
+RECORD_SCHEMA = "topic-image-replay/readout-random-carrier-record/v1"
 
 
 @dataclass
@@ -252,6 +273,21 @@ def build_frozen_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 f"Frozen count mismatch for {dataset}: {len(rows)} != {expected_count}"
             )
         rows.sort(key=lambda row: (row["row_position"], row["sample_index"]))
+        source_count = len(rows)
+        if args.samples_per_dataset is not None:
+            sample_count = int(args.samples_per_dataset)
+            if not 0 < sample_count <= source_count:
+                raise ValueError(
+                    f"Invalid samples-per-dataset for {dataset}: {sample_count}"
+                )
+            seed_bytes = hashlib.sha256(
+                f"{int(args.selection_seed)}:{dataset}".encode("utf-8")
+            ).digest()[:8]
+            dataset_seed = int.from_bytes(seed_bytes, "little")
+            indices = np.random.default_rng(dataset_seed).choice(
+                source_count, size=sample_count, replace=False
+            )
+            rows = [rows[int(index)] for index in sorted(indices.tolist())]
         for dataset_position, row in enumerate(rows):
             key = _record_key(row)
             if key in seen:
@@ -265,6 +301,7 @@ def build_frozen_manifest(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "dataset": dataset,
                 "selected_rows": len(rows),
+                "source_rows": source_count,
                 "choice_count_histogram": dict(
                     sorted(Counter(row["choice_count"] for row in rows).items())
                 ),
@@ -308,6 +345,8 @@ def build_frozen_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "carrier_primary_mask": "aware",
         "blind_semantics": "literal context-free Answer prefix without chat framing",
         "carrier_token_count_semantics": "per-sample projected visual-core count",
+        "samples_per_dataset": args.samples_per_dataset,
+        "selection_seed": int(args.selection_seed),
         "frozen_sources": sources,
         "source_data": source_data,
         "source_data_sha256": sha256_json(source_data),
@@ -465,6 +504,36 @@ def _literal_token_id(tokenizer: Any, literal: str) -> int:
     return int(ids[0])
 
 
+def _token_ids_sha256(token_ids: Iterable[int]) -> str:
+    values = np.asarray(list(token_ids), dtype=np.int64)
+    return hashlib.sha256(values.tobytes()).hexdigest()
+
+
+def _lorem_carrier_token_ids(
+    tokenizer: Any, target_n: int, carrier: str
+) -> tuple[list[int], dict[str, Any]]:
+    source_ids = [
+        int(item) for item in tokenizer(LOREM_TEXT, add_special_tokens=False).input_ids
+    ]
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    if not source_ids or any(token_id in special_ids for token_id in source_ids):
+        raise RuntimeError("Lorem carrier produced an empty or special-token sequence")
+    ordered = (source_ids * math.ceil(target_n / len(source_ids)))[:target_n]
+    token_ids = list(ordered)
+    shuffle_seed = SHUFFLED_LOREM_SEEDS.get(carrier)
+    if shuffle_seed is not None:
+        permutation = np.random.default_rng(shuffle_seed).permutation(target_n)
+        token_ids = [ordered[int(index)] for index in permutation]
+    elif carrier != "ordered_lorem":
+        raise ValueError(f"Unknown Lorem carrier: {carrier}")
+    return token_ids, {
+        "text_source": "canonical_lorem_ipsum",
+        "source_text": LOREM_TEXT,
+        "shuffle_seed": shuffle_seed,
+        "ordered_token_ids_sha256": _token_ids_sha256(ordered),
+    }
+
+
 def _splice_ids_2d(
     inputs: dict[str, Any],
     start: int,
@@ -564,15 +633,16 @@ def _single_edit_spec(
     }
 
 
-def _insert_matched_text_carrier(
+def _insert_matched_text_ids_carrier(
     base: PreparedSequence,
     reference: PreparedSequence,
     *,
     core_start: int,
     core_end_exclusive: int,
-    literal_token_id: int,
+    carrier_token_ids: list[int],
     carrier: str,
     family: str,
+    carrier_metadata: dict[str, Any] | None = None,
 ) -> PreparedSequence:
     spec = _single_edit_spec(
         base.inputs["input_ids"],
@@ -581,9 +651,13 @@ def _insert_matched_text_carrier(
         core_end_exclusive,
     )
     target_n = core_end_exclusive - core_start
+    if len(carrier_token_ids) != target_n:
+        raise RuntimeError(
+            f"Carrier {carrier} has {len(carrier_token_ids)} tokens, expected {target_n}"
+        )
     replacement = (
         list(spec["prefix_envelope_ids"])
-        + [int(literal_token_id)] * target_n
+        + [int(item) for item in carrier_token_ids]
         + list(spec["suffix_envelope_ids"])
     )
     if len(replacement) != len(spec["expanded_ids"]):
@@ -623,8 +697,9 @@ def _insert_matched_text_carrier(
     out.metadata.update(
         {
             "carrier": carrier,
-            "carrier_kind": "literal_text_token_ids_in_matched_visual_envelope",
-            "literal_token_id": int(literal_token_id),
+            "carrier_kind": "text_token_ids_in_matched_visual_envelope",
+            "carrier_token_ids_sha256": _token_ids_sha256(carrier_token_ids),
+            "carrier_token_unique_count": len(set(carrier_token_ids)),
             "edit_position": int(spec["edit_start"]),
             "replaced_source_token_count": len(spec["source_ids"]),
             "replacement_token_count": len(replacement),
@@ -634,7 +709,31 @@ def _insert_matched_text_carrier(
             "rendered_text_excludes_injected_carrier": True,
         }
     )
+    out.metadata.update(carrier_metadata or {})
     return out
+
+
+def _insert_matched_text_carrier(
+    base: PreparedSequence,
+    reference: PreparedSequence,
+    *,
+    core_start: int,
+    core_end_exclusive: int,
+    literal_token_id: int,
+    carrier: str,
+    family: str,
+) -> PreparedSequence:
+    target_n = core_end_exclusive - core_start
+    return _insert_matched_text_ids_carrier(
+        base,
+        reference,
+        core_start=core_start,
+        core_end_exclusive=core_end_exclusive,
+        carrier_token_ids=[int(literal_token_id)] * target_n,
+        carrier=carrier,
+        family=family,
+        carrier_metadata={"literal_token_id": int(literal_token_id)},
+    )
 
 
 def _make_qwen_messages(
@@ -708,9 +807,11 @@ def _prepare_qwen_content(
         metadata={
             "model_family": "qwen25vl",
             "image_spans": spans,
-            "image_grid_thw": inputs.get("image_grid_thw").detach().cpu().tolist()
-            if isinstance(inputs.get("image_grid_thw"), torch.Tensor)
-            else None,
+            "image_grid_thw": (
+                inputs.get("image_grid_thw").detach().cpu().tolist()
+                if isinstance(inputs.get("image_grid_thw"), torch.Tensor)
+                else None
+            ),
             "boundary": boundary_meta,
             "image_token_id": _token_id(tokenizer, "<|image_pad|>"),
             "vision_start_token_id": _token_id(tokenizer, "<|vision_start|>"),
@@ -734,14 +835,60 @@ def _qwen_replay_content(
     return replayed, base, prompt
 
 
-def _qwen_color_content(
+def _natural_noise_image(size: tuple[int, int], seed: int) -> Image.Image:
+    width, height = (int(size[0]), int(size[1]))
+    side = 256
+    rng = np.random.default_rng(seed)
+    white = rng.standard_normal((side, side))
+    fy = np.fft.fftfreq(side)[:, None]
+    fx = np.fft.fftfreq(side)[None, :]
+    frequency = np.sqrt(fx * fx + fy * fy)
+    frequency[0, 0] = 1.0
+    filtered = np.fft.ifft2(np.fft.fft2(white) / frequency).real
+    filtered -= filtered.mean()
+    filtered /= filtered.std()
+    grayscale = np.clip(127.5 + 40.0 * filtered, 24.0, 231.0).astype(np.uint8)
+    rgb = np.repeat(grayscale[:, :, None], 3, axis=2)
+    base = Image.fromarray(rgb, mode="RGB")
+    return base.resize((width, height), Image.Resampling.BICUBIC)
+
+
+def _image_sha256(image: Image.Image) -> str:
+    return hashlib.sha256(
+        np.asarray(image.convert("RGB"), dtype=np.uint8).tobytes()
+    ).hexdigest()
+
+
+def _visual_carrier_image(original: Image.Image, carrier: str) -> Image.Image:
+    if carrier in COLOR_VALUES:
+        return Image.new("RGB", original.size, color=COLOR_VALUES[carrier])
+    return _natural_noise_image(original.size, NOISE_CARRIER_SEEDS[carrier])
+
+
+def _visual_carrier_metadata(carrier: str, image: Image.Image) -> dict[str, Any]:
+    metadata = {
+        "raw_carrier_sha256": _image_sha256(image),
+        "raw_carrier_size": list(image.size),
+    }
+    if carrier in COLOR_VALUES:
+        metadata["raw_carrier_rgb"] = list(COLOR_VALUES[carrier])
+    else:
+        metadata.update(
+            {
+                "noise_seed": int(NOISE_CARRIER_SEEDS[carrier]),
+                "noise_family": "grayscale_power_spectrum_1_over_f_squared",
+            }
+        )
+    return metadata
+
+
+def _qwen_visual_content(
     replayed: list[dict[str, Any]], carrier: str
 ) -> tuple[list[dict[str, Any]], Image.Image, Image.Image]:
     from qwen_vl_utils import fetch_image
 
     original = fetch_image(replayed[2]).convert("RGB")
-    color = COLOR_VALUES[carrier]
-    replacement = Image.new("RGB", original.size, color=color)
+    replacement = _visual_carrier_image(original, carrier)
     content = copy.deepcopy(replayed)
     content[2] = dict(content[2])
     content[2]["image"] = replacement
@@ -773,8 +920,8 @@ def _prepare_qwen_sequences(
         int(reference_core["core_end"]) + 1,
     )
 
-    for carrier in ("blank_image", "yellow_image"):
-        content, original, replacement = _qwen_color_content(replayed, carrier)
+    for carrier in VISUAL_CARRIERS:
+        content, original, replacement = _qwen_visual_content(replayed, carrier)
         prepared = _prepare_qwen_content(wrapper, content, expected_images=2)
         if prepared.metadata["image_grid_thw"] != reference_grid:
             raise RuntimeError(
@@ -794,8 +941,6 @@ def _prepare_qwen_sequences(
                 "reference_image_grid_thw": reference_grid,
                 "reference_readout_span": reference.metadata["image_spans"][1],
                 "raw_source_size": list(original.size),
-                "raw_carrier_size": list(replacement.size),
-                "raw_carrier_rgb": list(COLOR_VALUES[carrier]),
                 "standard_prompt": prompt_summary,
                 "standard_prompt_sha256": sha256_json(prompt_summary),
                 "source_prefix_sha256": edit_spec["source_prefix_sha256"],
@@ -806,6 +951,7 @@ def _prepare_qwen_sequences(
                 "suffix_envelope_token_count": len(edit_spec["suffix_envelope_ids"]),
             }
         )
+        prepared.metadata.update(_visual_carrier_metadata(carrier, replacement))
         prepared.artifact_images[carrier] = replacement
         prepared.artifact_images["source_readout_image"] = original
         sequences[carrier] = prepared
@@ -828,6 +974,26 @@ def _prepare_qwen_sequences(
         prepared.metadata.update(
             {
                 "literal": literal,
+                "standard_prompt": prompt_summary,
+                "standard_prompt_sha256": sha256_json(prompt_summary),
+            }
+        )
+        sequences[carrier] = prepared
+
+    for carrier in ("ordered_lorem", *SHUFFLED_LOREM_SEEDS):
+        token_ids, metadata = _lorem_carrier_token_ids(tokenizer, target_n, carrier)
+        prepared = _insert_matched_text_ids_carrier(
+            full,
+            reference,
+            core_start=int(reference_core["core_start"]),
+            core_end_exclusive=int(reference_core["core_end"]) + 1,
+            carrier_token_ids=token_ids,
+            carrier=carrier,
+            family="qwen25vl",
+            carrier_metadata=metadata,
+        )
+        prepared.metadata.update(
+            {
                 "standard_prompt": prompt_summary,
                 "standard_prompt_sha256": sha256_json(prompt_summary),
             }
@@ -986,11 +1152,11 @@ def _minicpm_replay_content(
 
 def _normalize_minicpm_iqi_content(content: list[Any]) -> list[Any]:
     types = [
-        "image"
-        if isinstance(item, Image.Image)
-        else "text"
-        if isinstance(item, str)
-        else type(item).__name__
+        (
+            "image"
+            if isinstance(item, Image.Image)
+            else "text" if isinstance(item, str) else type(item).__name__
+        )
         for item in content
     ]
     if len(content) < 3 or types[0] != "image" or types[-1] != "image":
@@ -1031,8 +1197,8 @@ def _prepare_minicpm_sequences(
         int(second_start),
         int(second_end),
     )
-    for carrier in ("blank_image", "yellow_image"):
-        replacement = Image.new("RGB", second.size, color=COLOR_VALUES[carrier])
+    for carrier in VISUAL_CARRIERS:
+        replacement = _visual_carrier_image(second, carrier)
         content = [replayed[0], replayed[1], replacement]
         prepared = _prepare_minicpm_content(wrapper, content, expected_images=2)
         if prepared.metadata["image_bound"] != reference.metadata["image_bound"]:
@@ -1051,8 +1217,6 @@ def _prepare_minicpm_sequences(
                 "reference_image_bound": reference.metadata["image_bound"],
                 "reference_tgt_sizes": reference.metadata["tgt_sizes"],
                 "raw_source_size": list(second.size),
-                "raw_carrier_size": list(replacement.size),
-                "raw_carrier_rgb": list(COLOR_VALUES[carrier]),
                 "standard_prompt": prompt_summary,
                 "standard_prompt_sha256": sha256_json(prompt_summary),
                 "source_prefix_sha256": edit_spec["source_prefix_sha256"],
@@ -1063,6 +1227,7 @@ def _prepare_minicpm_sequences(
                 "suffix_envelope_token_count": len(edit_spec["suffix_envelope_ids"]),
             }
         )
+        prepared.metadata.update(_visual_carrier_metadata(carrier, replacement))
         prepared.artifact_images[carrier] = replacement
         prepared.artifact_images["source_readout_image"] = second
         sequences[carrier] = prepared
@@ -1082,6 +1247,27 @@ def _prepare_minicpm_sequences(
         prepared.metadata.update(
             {
                 "literal": literal,
+                "standard_prompt": prompt_summary,
+                "standard_prompt_sha256": sha256_json(prompt_summary),
+            }
+        )
+        sequences[carrier] = prepared
+
+    target_n = len(sequences["blank_image"].readout_indices)
+    for carrier in ("ordered_lorem", *SHUFFLED_LOREM_SEEDS):
+        token_ids, metadata = _lorem_carrier_token_ids(tokenizer, target_n, carrier)
+        prepared = _insert_matched_text_ids_carrier(
+            full,
+            reference,
+            core_start=int(second_start),
+            core_end_exclusive=int(second_end),
+            carrier_token_ids=token_ids,
+            carrier=carrier,
+            family="minicpmo45",
+            carrier_metadata=metadata,
+        )
+        prepared.metadata.update(
+            {
                 "standard_prompt": prompt_summary,
                 "standard_prompt_sha256": sha256_json(prompt_summary),
             }
@@ -1293,6 +1479,7 @@ def _prepare_qwen_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
             )
     position_ids, rope_deltas = _qwen_position_ids(model, inputs)
     raw_tensors = {
+        "inputs_embeds": embeds,
         "position_ids": position_ids,
         "rope_deltas": rope_deltas,
     }
@@ -1452,6 +1639,7 @@ def _prepare_minicpm_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]
         embeds.shape[1], dtype=torch.long, device=embeds.device
     )
     raw_tensors = {
+        "inputs_embeds": embeds,
         "position_ids": positions,
         "image_bound": inputs["image_bound"][0],
         "cache_position": cache_position,
@@ -1927,9 +2115,11 @@ def score_record(
     raw_runtime_tensors: dict[str, np.ndarray] = {}
     if full_dump_state is not None:
         runtime_meta["full"] = {
-            key: value.detach().cpu().tolist()
-            if isinstance(value, torch.Tensor)
-            else value
+            key: (
+                value.detach().cpu().tolist()
+                if isinstance(value, torch.Tensor)
+                else value
+            )
             for key, value in full_dump_state["public_meta"].items()
         }
         for tensor_name in ("visual_feature_0", "visual_core_0"):
@@ -1962,15 +2152,18 @@ def score_record(
         raw_logits[carrier] = logits.detach().float().cpu()
         raw_masks[carrier] = masks.cpu()
         runtime_meta[carrier] = {
-            key: value.detach().cpu().tolist()
-            if isinstance(value, torch.Tensor)
-            else value
+            key: (
+                value.detach().cpu().tolist()
+                if isinstance(value, torch.Tensor)
+                else value
+            )
             for key, value in model_meta.items()
         }
         for tensor_name, tensor_value in state["raw_tensors"].items():
             if (
                 tensor_name
                 in {
+                    "inputs_embeds",
                     "pre_omni_embeddings",
                     "post_omni_embeddings",
                 }
@@ -1979,6 +2172,25 @@ def score_record(
                 continue
             raw_runtime_tensors[f"{carrier}__{tensor_name}"] = _tensor_dump_numpy(
                 tensor_value
+            )
+
+        if diagnostics and carrier in TEXT_CARRIERS:
+            embedding_layer = (
+                wrapper.model.get_input_embeddings()
+                if family == "qwen25vl"
+                else wrapper.model.llm.get_input_embeddings()
+            )
+            readout_ids = sequence.inputs["input_ids"][:, sequence.readout_indices]
+            with torch.no_grad():
+                expected_text_core = embedding_layer(readout_ids)
+                if family == "minicpmo45" and hasattr(
+                    wrapper.model.llm.config, "scale_emb"
+                ):
+                    expected_text_core = (
+                        expected_text_core * wrapper.model.llm.config.scale_emb
+                    )
+            raw_runtime_tensors[f"{carrier}__expected_text_core"] = _tensor_dump_numpy(
+                expected_text_core
             )
 
         if diagnostics:
@@ -2131,9 +2343,8 @@ def score_record(
                     name: f"{name}_input_ids.npy"
                     for name in ("blind", "full", *CARRIERS)
                 },
-                "images": {
-                    "blank_image": "blank_image.png",
-                    "yellow_image": "yellow_image.png",
+                "images": {carrier: f"{carrier}.png" for carrier in VISUAL_CARRIERS}
+                | {
                     "source_readout_image": "source_readout_image.png",
                 },
             },
@@ -2505,7 +2716,7 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
     output_root = Path(args.output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     summary = {
-        "schema": "topic-image-replay/readout-carrier-summary/v1",
+        "schema": "topic-image-replay/readout-random-carrier-summary/v1",
         "manifest_records_sha256": manifest["records_sha256"],
         "expected_records": len(expected),
         "observed_records": len(observed),
@@ -2885,6 +3096,8 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 f"{prompt_hashes}"
             )
         artifact_has_diagnostics = True
+        text_readout_ids: dict[str, np.ndarray] = {}
+        readout_embedding_stats: dict[str, dict[str, float]] = {}
         for carrier in CARRIERS:
             carrier_record = artifact["carriers"][carrier]
             sequence = artifact["sequences"][carrier]
@@ -2918,9 +3131,19 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             ]
             if table_readout != readout:
                 raise RuntimeError(f"Token-table readout mismatch for {path} {carrier}")
+            if carrier in TEXT_CARRIERS:
+                observed_ids = input_ids[0, readout].astype(np.int64)
+                text_readout_ids[carrier] = observed_ids
+                if (
+                    _token_ids_sha256(observed_ids.tolist())
+                    != carrier_record["metadata"]["carrier_token_ids_sha256"]
+                ):
+                    raise RuntimeError(
+                        f"Text carrier token hash mismatch for {path} {carrier}"
+                    )
             if carrier in {"dot_text", "space_text"}:
                 literal_id = int(carrier_record["metadata"]["literal_token_id"])
-                if any(int(input_ids[0, idx]) != literal_id for idx in readout):
+                if np.any(text_readout_ids[carrier] != literal_id):
                     raise RuntimeError(
                         f"Literal carrier token mismatch for {path} {carrier}"
                     )
@@ -2987,13 +3210,13 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 image_token_id = int(sequence["metadata"]["image_token_id"])
                 image_spans = _contiguous_value_spans(input_ids[0], image_token_id)
-                expected_images = 2 if carrier in {"blank_image", "yellow_image"} else 1
+                expected_images = 2 if carrier in VISUAL_CARRIERS else 1
                 if len(image_spans) != expected_images:
                     raise RuntimeError(
                         f"Qwen raw image-core count mismatch for {path} {carrier}: "
                         f"{image_spans}"
                     )
-                if carrier in {"blank_image", "yellow_image"}:
+                if carrier in VISUAL_CARRIERS:
                     if tuple(readout) != tuple(range(*image_spans[1])):
                         raise RuntimeError(
                             f"Qwen readout is not exactly the second raw visual core: "
@@ -3064,16 +3287,16 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     raise RuntimeError(
                         f"MiniCPM raw cache position mismatch: {path} {carrier}"
                     )
-                expected_images = 2 if carrier in {"blank_image", "yellow_image"} else 1
+                expected_images = 2 if carrier in VISUAL_CARRIERS else 1
                 if len(bounds) != expected_images or any(
                     end - start != 64 for start, end in bounds
                 ):
                     raise RuntimeError(
                         f"MiniCPM raw image bounds mismatch for {path} {carrier}: {bounds}"
                     )
-                if carrier in {"blank_image", "yellow_image"} and tuple(
-                    readout
-                ) != tuple(range(*bounds[1])):
+                if carrier in VISUAL_CARRIERS and tuple(readout) != tuple(
+                    range(*bounds[1])
+                ):
                     raise RuntimeError(
                         f"MiniCPM readout is not exactly image_bound[1]: {path} {carrier}"
                     )
@@ -3185,6 +3408,71 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 artifact_has_diagnostics = False
 
+        ordered_lorem = text_readout_ids["ordered_lorem"]
+        shuffled_orders = set()
+        for carrier, expected_seed in SHUFFLED_LOREM_SEEDS.items():
+            shuffled = text_readout_ids[carrier]
+            metadata = artifact["carriers"][carrier]["metadata"]
+            if int(metadata["shuffle_seed"]) != expected_seed:
+                raise RuntimeError(f"Lorem shuffle seed mismatch: {path} {carrier}")
+            if not np.array_equal(np.sort(ordered_lorem), np.sort(shuffled)):
+                raise RuntimeError(f"Lorem token multiset changed for {path} {carrier}")
+            if np.array_equal(ordered_lorem, shuffled):
+                raise RuntimeError(
+                    f"Lorem shuffle kept the original order: {path} {carrier}"
+                )
+            shuffled_orders.add(shuffled.tobytes())
+        if len(shuffled_orders) != len(SHUFFLED_LOREM_SEEDS):
+            raise RuntimeError(f"Lorem shuffle seeds produced duplicate orders: {path}")
+
+        if artifact_has_diagnostics:
+            outside_readout = np.ones(carrier_lengths[CARRIERS[0]], dtype=bool)
+            outside_readout[list(shared_readout)] = False
+            for topology, names in (
+                ("visual", VISUAL_CARRIERS),
+                ("text", TEXT_CARRIERS),
+            ):
+                reference_key = f"{names[0]}__inputs_embeds"
+                if reference_key not in runtime_tensors:
+                    raise RuntimeError(
+                        f"Raw diagnostic embeddings missing: {path} {reference_key}"
+                    )
+                reference = np.asarray(runtime_tensors[reference_key])
+                for name in names[1:]:
+                    key = f"{name}__inputs_embeds"
+                    if key not in runtime_tensors:
+                        raise RuntimeError(
+                            f"Raw diagnostic embeddings missing: {path} {key}"
+                        )
+                    observed = np.asarray(runtime_tensors[key])
+                    if reference.shape != observed.shape or not np.array_equal(
+                        reference[:, outside_readout], observed[:, outside_readout]
+                    ):
+                        raise RuntimeError(
+                            f"Non-readout embeddings changed within {topology} topology: "
+                            f"{path} {names[0]} vs {name}"
+                        )
+            for name in TEXT_CARRIERS:
+                actual = np.asarray(runtime_tensors[f"{name}__inputs_embeds"])[
+                    :, list(shared_readout)
+                ]
+                expected_key = f"{name}__expected_text_core"
+                if expected_key not in runtime_tensors or not np.array_equal(
+                    actual, np.asarray(runtime_tensors[expected_key])
+                ):
+                    raise RuntimeError(
+                        f"Text readout embeddings do not match token lookup: {path} {name}"
+                    )
+            for name in CARRIERS:
+                core = np.asarray(
+                    runtime_tensors[f"{name}__inputs_embeds"], dtype=np.float64
+                )[0, list(shared_readout)]
+                centered = core - core.mean(axis=0, keepdims=True)
+                readout_embedding_stats[name] = {
+                    "mean_token_l2_norm": float(np.linalg.norm(core, axis=1).mean()),
+                    "mean_tokenwise_variance": float(np.mean(centered * centered)),
+                }
+
         if artifact["model_family"] == "qwen25vl":
             source_features = {}
             for name in ("full", *CARRIERS):
@@ -3268,34 +3556,55 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(
                     f"Raw color image mismatch: {image_path} {unique.tolist()}"
                 )
+        noise_hashes = set()
+        for carrier, seed in NOISE_CARRIER_SEEDS.items():
+            image_path = path.parent / f"{carrier}.png"
+            image = np.asarray(Image.open(image_path).convert("RGB"))
+            if not (
+                np.array_equal(image[:, :, 0], image[:, :, 1])
+                and np.array_equal(image[:, :, 0], image[:, :, 2])
+                and float(image[:, :, 0].std()) > 20.0
+            ):
+                raise RuntimeError(
+                    f"Noise image is not nonconstant grayscale: {image_path}"
+                )
+            metadata = artifact["sequences"][carrier]["metadata"]
+            observed_hash = hashlib.sha256(image.tobytes()).hexdigest()
+            if (
+                int(metadata["noise_seed"]) != seed
+                or metadata["raw_carrier_sha256"] != observed_hash
+            ):
+                raise RuntimeError(f"Noise image metadata mismatch: {image_path}")
+            noise_hashes.add(observed_hash)
+        if len(noise_hashes) != len(NOISE_CARRIER_SEEDS):
+            raise RuntimeError(f"Noise image seeds produced duplicate images: {path}")
         source_image_path = path.parent / "source_readout_image.png"
         if not source_image_path.is_file():
             raise RuntimeError(
                 f"Raw source readout image is missing: {source_image_path}"
             )
 
-        if artifact["model_family"] == "qwen25vl":
-            blank_layout = artifact["sequences"]["blank_image"]["metadata"][
-                "image_grid_thw"
-            ]
-            yellow_layout = artifact["sequences"]["yellow_image"]["metadata"][
-                "image_grid_thw"
-            ]
-        else:
-            blank_layout = artifact["sequences"]["blank_image"]["metadata"][
-                "image_bound"
-            ]
-            yellow_layout = artifact["sequences"]["yellow_image"]["metadata"][
-                "image_bound"
-            ]
-        if blank_layout != yellow_layout:
-            raise RuntimeError(f"Blank/yellow visual layouts differ: {path}")
-        blank_features = artifact["runtime_meta"]["blank_image"]["visual_features"]
-        yellow_features = artifact["runtime_meta"]["yellow_image"]["visual_features"]
-        if len(blank_features) < 2 or len(yellow_features) < 2:
-            raise RuntimeError(f"Visual carrier feature count is not two: {path}")
-        if blank_features[1]["sha256"] == yellow_features[1]["sha256"]:
-            raise RuntimeError(f"Blank/yellow readout embeddings are identical: {path}")
+        layout_key = (
+            "image_grid_thw"
+            if artifact["model_family"] == "qwen25vl"
+            else "image_bound"
+        )
+        layouts = {
+            carrier: artifact["sequences"][carrier]["metadata"][layout_key]
+            for carrier in VISUAL_CARRIERS
+        }
+        if len({json.dumps(value, sort_keys=True) for value in layouts.values()}) != 1:
+            raise RuntimeError(f"Visual carrier layouts differ: {path} {layouts}")
+        feature_hashes = set()
+        for carrier in VISUAL_CARRIERS:
+            features = artifact["runtime_meta"][carrier]["visual_features"]
+            if len(features) != 2:
+                raise RuntimeError(
+                    f"Visual carrier feature count is not two: {path} {carrier}"
+                )
+            feature_hashes.add(features[1]["sha256"])
+        if len(feature_hashes) != len(VISUAL_CARRIERS):
+            raise RuntimeError(f"Visual readout embeddings are not distinct: {path}")
 
         validations.append(
             {
@@ -3304,6 +3613,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "model_family": artifact["model_family"],
                 "matched_token_count": next(iter(counts.values())),
                 "diagnostics": artifact_has_diagnostics,
+                "readout_embedding_stats": readout_embedding_stats,
             }
         )
     if diagnostic_artifacts < int(args.require_diagnostics):
@@ -3317,7 +3627,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             f"Smoke artifacts used inconsistent runtime identities: {runtime_hashes}"
         )
     payload = {
-        "schema": "topic-image-replay/readout-carrier-smoke-validation/v1",
+        "schema": "topic-image-replay/readout-random-carrier-smoke-validation/v1",
         "manifest_sha256": sha256_file(manifest_path),
         "provenance": expected_provenance,
         "model_key": manifest["model_key"],
@@ -3335,7 +3645,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Matched blank/yellow/text readout carriers"
+        description="Matched visual and text readout carriers"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -3351,6 +3661,8 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--model-key", required=True, choices=sorted(MODEL_FAMILIES))
     manifest.add_argument("--model-path", required=True)
     manifest.add_argument("--num-shards", type=int, default=8)
+    manifest.add_argument("--samples-per-dataset", type=int)
+    manifest.add_argument("--selection-seed", type=int, default=20260804)
 
     verify = sub.add_parser("verify-run-contract")
     verify.add_argument("--repo-root", required=True)

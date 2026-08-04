@@ -1,44 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-carriers}"
+ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-random-carriers}"
 MODEL_KEY="${MODEL_KEY:?Set MODEL_KEY to qwen25vl_3b, qwen25vl_7b, or minicpm_o_45}"
 DATASETS="${DATASETS:-DynaMath,WeMath,MMBench_DEV_EN_V11,MMStar,AI2D_TEST}"
 PARTITION_TAG="${PARTITION_TAG:-all}"
-WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 LMU_DATA="${LMUData:-/user/zyc1781/LMUData}"
 MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"
-RUN_ID="${RUN_ID:-readout_carriers_20260803}"
-OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_carriers/${RUN_ID}/${MODEL_KEY}/${PARTITION_TAG}}"
+RUN_ID="${RUN_ID:-readout_random_carriers_128_20260804}"
+OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_random_carriers/${RUN_ID}/${MODEL_KEY}/${PARTITION_TAG}}"
 RESUME="${RESUME:-0}"
 REPAIR_TORN_JSONL="${REPAIR_TORN_JSONL:-0}"
-ALLOW_MULTI_MODEL_PER_GPU="${ALLOW_MULTI_MODEL_PER_GPU:-0}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-20}"
 WAVE_DELAY_SECONDS="${WAVE_DELAY_SECONDS:-30}"
 MINICPM_PYDEPS="${MINICPM_PYDEPS:-/user/zyc1781/.venvs/minicpmo-token-roll-pydeps}"
 
 case "${MODEL_KEY}" in
   qwen25vl_3b)
+    DEFAULT_WORKERS_PER_GPU=8
     PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-3B-Instruct}"
-    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v5_20260803/qwen25vl_3b/validation.json}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_20260804/qwen25vl_3b/validation.json}"
     ;;
   qwen25vl_7b)
+    DEFAULT_WORKERS_PER_GPU=4
     PYTHON_BIN="${PYTHON_BIN:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/Qwen2.5-VL-7B-Instruct}"
-    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v5_20260803/qwen25vl_7b/validation.json}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_20260804/qwen25vl_7b/validation.json}"
     ;;
   minicpm_o_45)
+    DEFAULT_WORKERS_PER_GPU=4
     PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zyc1781/models/MiniCPM-o-4_5}"
-    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v5_20260803/minicpm_o_45/validation.json}"
+    SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_20260804/minicpm_o_45/validation.json}"
     ;;
   *)
     echo "Unsupported MODEL_KEY: ${MODEL_KEY}" >&2
     exit 2
     ;;
 esac
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-${DEFAULT_WORKERS_PER_GPU}}"
 
 IFS=',' read -r -a GPU_ARRAY <<<"${GPU_IDS}"
 if [[ "${#GPU_ARRAY[@]}" -ne 8 ]]; then
@@ -47,10 +49,6 @@ if [[ "${#GPU_ARRAY[@]}" -ne 8 ]]; then
 fi
 if ! [[ "${WORKERS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
   echo "WORKERS_PER_GPU must be a positive integer" >&2
-  exit 2
-fi
-if ((WORKERS_PER_GPU > 1)) && [[ "${ALLOW_MULTI_MODEL_PER_GPU}" != "1" ]]; then
-  echo "WORKERS_PER_GPU>1 requires ALLOW_MULTI_MODEL_PER_GPU=1 after a measured smoke" >&2
   exit 2
 fi
 declare -A SEEN_GPUS=()
@@ -67,9 +65,9 @@ for gpu in "${GPU_ARRAY[@]}"; do
   SEEN_GPUS["${gpu}"]=1
 done
 TOTAL_WORKERS=$((8 * WORKERS_PER_GPU))
-DEFAULT_SMOKE_MANIFEST="/user/zyc1781/outputs/readout_carriers/readout_carrier_smoke_v5_20260803/manifests/${MODEL_KEY}.json"
+DEFAULT_SMOKE_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_random_carrier_smoke_20260804/manifests/${MODEL_KEY}.json"
 MANIFEST="${MANIFEST_PATH:-${DEFAULT_SMOKE_MANIFEST}}"
-OUTPUT_BASE="$(realpath -m /user/zyc1781/outputs/readout_carriers)"
+OUTPUT_BASE="$(realpath -m /user/zyc1781/outputs/readout_random_carriers)"
 OUT_ROOT="$(realpath -m "${OUT_ROOT}")"
 case "${OUT_ROOT}" in
   "${OUTPUT_BASE}"/*) ;;

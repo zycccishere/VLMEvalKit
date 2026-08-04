@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-carriers}"
+ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-random-carriers}"
 QWEN_PYTHON="${QWEN_PYTHON:-/user/wanzihao/miniconda3/envs/vlmevalkit/bin/python}"
 MINICPM_PYTHON="${MINICPM_PYTHON:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
 MINICPM_PYDEPS="${MINICPM_PYDEPS:-/user/zyc1781/.venvs/minicpmo-token-roll-pydeps}"
@@ -10,12 +10,14 @@ QWEN7B_PATH="${QWEN7B_PATH:-/user/zyc1781/models/Qwen2.5-VL-7B-Instruct}"
 MINICPM_PATH="${MINICPM_PATH:-/user/zyc1781/models/MiniCPM-o-4_5}"
 LMU_DATA="${LMUData:-/user/zyc1781/LMUData}"
 MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"
-RUN_ID="${RUN_ID:-readout_carrier_smoke_v5_20260803}"
-OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_carriers/${RUN_ID}}"
+RUN_ID="${RUN_ID:-readout_random_carrier_smoke_20260804}"
+OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_random_carriers/${RUN_ID}}"
 MANIFEST_ROOT="${MANIFEST_ROOT:-${OUT_ROOT}/manifests}"
 PREBUILT_MANIFESTS="${PREBUILT_MANIFESTS:-0}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-10}"
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-128}"
+SELECTION_SEED="${SELECTION_SEED:-20260804}"
 
 ALL_SINGLE_CHOICE_MANIFEST="${ALL_SINGLE_CHOICE_MANIFEST:-/user/zyc1781/outputs/readout_v2/qwen25vl3b_readout_v2_all_single_choice_20260729/manifest_all_single_choice.json}"
 FIXED_CHOICE_MANIFEST="${FIXED_CHOICE_MANIFEST:-/user/zyc1781/outputs/readout_v2/qwen25vl3b_readout_v2_fixed_choice_20260728_v2/manifest.json}"
@@ -40,7 +42,7 @@ for gpu in "${GPU_ARRAY[@]}"; do
   fi
   SEEN_GPUS["${gpu}"]=1
 done
-OUTPUT_BASE="$(realpath -m /user/zyc1781/outputs/readout_carriers)"
+OUTPUT_BASE="$(realpath -m /user/zyc1781/outputs/readout_random_carriers)"
 OUT_ROOT="$(realpath -m "${OUT_ROOT}")"
 MANIFEST_ROOT="$(realpath -m "${MANIFEST_ROOT}")"
 case "${OUT_ROOT}" in
@@ -111,6 +113,7 @@ done
 build_manifest() {
   local model_key="$1"
   local model_path="$2"
+  local num_shards="$3"
   "${QWEN_PYTHON}" -m vlmeval.probes.readout_carriers manifest \
     --repo-root "${ROOT}" \
     --output "${MANIFEST_ROOT}/${model_key}.json" \
@@ -122,7 +125,9 @@ build_manifest() {
     --datasets "${ALL_DATASETS}" \
     --model-key "${model_key}" \
     --model-path "${model_path}" \
-    --num-shards 8
+    --num-shards "${num_shards}" \
+    --samples-per-dataset "${SAMPLES_PER_DATASET}" \
+    --selection-seed "${SELECTION_SEED}"
 }
 
 if [[ "${PREBUILT_MANIFESTS}" == "1" ]]; then
@@ -133,9 +138,9 @@ if [[ "${PREBUILT_MANIFESTS}" == "1" ]]; then
     fi
   done
 else
-  build_manifest qwen25vl_3b "${QWEN3B_PATH}"
-  build_manifest qwen25vl_7b "${QWEN7B_PATH}"
-  build_manifest minicpm_o_45 "${MINICPM_PATH}"
+  build_manifest qwen25vl_3b "${QWEN3B_PATH}" 64
+  build_manifest qwen25vl_7b "${QWEN7B_PATH}" 32
+  build_manifest minicpm_o_45 "${MINICPM_PATH}" 32
 fi
 
 verify_contract() {

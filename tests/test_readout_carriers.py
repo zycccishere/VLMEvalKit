@@ -6,6 +6,7 @@ import torch
 from PIL import Image
 
 from vlmeval.probes.readout_carriers import (
+    CARRIERS,
     MASK_CONDITIONS,
     PreparedSequence,
     _attention_backend,
@@ -16,8 +17,11 @@ from vlmeval.probes.readout_carriers import (
     _independent_expected_masks,
     _insert_matched_text_carrier,
     _independent_qwen_mrope,
+    _insert_matched_text_ids_carrier,
     _literal_token_id,
+    _lorem_carrier_token_ids,
     _minicpm_per_image_vision_states,
+    _natural_noise_image,
     _nested_input_summary,
     _normalize_minicpm_iqi_content,
     _prepare_literal_blind,
@@ -99,9 +103,7 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
 
     def test_qwen_per_image_encoding_rejects_incomplete_grid(self):
         model = SimpleNamespace(
-            config=SimpleNamespace(
-                vision_config=SimpleNamespace(spatial_merge_size=2)
-            )
+            config=SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
         )
         with self.assertRaisesRegex(RuntimeError, "exactly consume"):
             _qwen_per_image_features(
@@ -112,9 +114,7 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
 
     def test_qwen_per_image_encoding_rejects_wrong_feature_length(self):
         model = SimpleNamespace(
-            config=SimpleNamespace(
-                vision_config=SimpleNamespace(spatial_merge_size=2)
-            ),
+            config=SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2)),
             get_image_features=lambda pixels, grid: (torch.zeros((2, 3)),),
         )
         with self.assertRaisesRegex(RuntimeError, "feature length mismatch"):
@@ -314,6 +314,75 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
         self.assertEqual(text.prefill_len, reference.prefill_len)
         self.assertEqual(text.metadata["replaced_source_token_count"], 1)
 
+    def test_generic_text_core_inserts_exact_token_sequence(self):
+        base = PreparedSequence(
+            inputs={
+                "input_ids": torch.tensor([[10, 11, 90]]),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            },
+            prefill_len=2,
+            readout_indices=[],
+            prompt_text="base",
+            generation_text="base+assistant",
+            token_roles=["prefill", "prefill", "decode_prefix"],
+        )
+        reference = PreparedSequence(
+            inputs={
+                "input_ids": torch.tensor([[10, 11, 50, 20, 20, 20, 51, 90]]),
+                "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            },
+            prefill_len=7,
+            readout_indices=[3, 4, 5],
+            prompt_text="expanded",
+            generation_text="expanded+assistant",
+            token_roles=["prefill"] * 7 + ["decode_prefix"],
+        )
+        text = _insert_matched_text_ids_carrier(
+            base,
+            reference,
+            core_start=3,
+            core_end_exclusive=6,
+            carrier_token_ids=[71, 72, 73],
+            carrier="ordered_lorem",
+            family="qwen25vl",
+        )
+        self.assertEqual(
+            text.inputs["input_ids"].tolist(), [[10, 11, 50, 71, 72, 73, 51, 90]]
+        )
+        self.assertEqual(text.readout_indices, [3, 4, 5])
+
+    def test_noise_is_deterministic_grayscale_and_seed_specific(self):
+        first = np.asarray(_natural_noise_image((48, 32), 17))
+        repeated = np.asarray(_natural_noise_image((48, 32), 17))
+        different = np.asarray(_natural_noise_image((48, 32), 29))
+        np.testing.assert_array_equal(first, repeated)
+        self.assertFalse(np.array_equal(first, different))
+        np.testing.assert_array_equal(first[:, :, 0], first[:, :, 1])
+        np.testing.assert_array_equal(first[:, :, 0], first[:, :, 2])
+        self.assertGreater(float(first[:, :, 0].std()), 20.0)
+
+    def test_lorem_shuffle_preserves_exact_multiset(self):
+        class LoremTokenizer:
+            all_special_ids = [999]
+
+            def __call__(self, text, add_special_tokens=False):
+                del text, add_special_tokens
+                return SimpleNamespace(input_ids=[10, 20, 30, 40, 50])
+
+        ordered, _ = _lorem_carrier_token_ids(LoremTokenizer(), 64, "ordered_lorem")
+        shuffles = []
+        for carrier, seed in (
+            ("shuffled_lorem_s0", 17),
+            ("shuffled_lorem_s1", 29),
+            ("shuffled_lorem_s2", 43),
+        ):
+            shuffled, metadata = _lorem_carrier_token_ids(LoremTokenizer(), 64, carrier)
+            self.assertCountEqual(ordered, shuffled)
+            self.assertNotEqual(ordered, shuffled)
+            self.assertEqual(metadata["shuffle_seed"], seed)
+            shuffles.append(tuple(shuffled))
+        self.assertEqual(len(set(shuffles)), 3)
+
     def test_minicpm_adjacent_text_segments_preserve_joined_prompt(self):
         first = Image.new("RGB", (2, 2), color="white")
         second = Image.new("RGB", (2, 2), color="yellow")
@@ -335,12 +404,8 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
                 token_roles=["prefill"] * length,
             )
 
-        sequences = {
-            "blank_image": sequence(10, 8),
-            "yellow_image": sequence(10, 8),
-            "dot_text": sequence(8, 6),
-            "space_text": sequence(8, 6),
-        }
+        sequences = {carrier: sequence(10, 8) for carrier in CARRIERS}
+        sequences["space_text"] = sequence(8, 6)
         with self.assertRaisesRegex(RuntimeError, "structural match"):
             _validate_matched_readout_counts(sequences)
 
@@ -355,12 +420,8 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
                 token_roles=["prefill"] * 10,
             )
 
-        sequences = {
-            "blank_image": sequence([2, 3]),
-            "yellow_image": sequence([2, 3]),
-            "dot_text": sequence([1, 3]),
-            "space_text": sequence([2, 3]),
-        }
+        sequences = {carrier: sequence([2, 3]) for carrier in CARRIERS}
+        sequences["dot_text"] = sequence([1, 3])
         with self.assertRaisesRegex(RuntimeError, "positions"):
             _validate_matched_readout_counts(sequences)
 
