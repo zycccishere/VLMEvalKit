@@ -4004,6 +4004,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             full_expected = _independent_gemma_native_masks(
                 full_types,
                 int(artifact["sequences"]["full"]["metadata"]["sliding_window"]),
+                int(artifact["sequences"]["full"]["metadata"]["tokens_per_image"]),
             )
             if not np.array_equal(full_native, full_expected):
                 raise RuntimeError(f"Gemma Full native mask oracle mismatch: {path}")
