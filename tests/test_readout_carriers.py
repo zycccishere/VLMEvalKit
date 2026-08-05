@@ -103,13 +103,14 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
         self.assertTrue(masks[0, 0, 11, 8])
         self.assertFalse(masks[0, 1, 11, 6])
 
-    def test_gemma_native_oracle_adds_only_same_image_future_edges(self):
-        token_types = np.array([[0, 1, 1, 1, 0, 1, 1, 0]])
-        masks = _independent_gemma_native_masks(token_types, 4)
-        self.assertTrue(masks[0, 1, 3])
-        self.assertFalse(masks[0, 1, 5])
-        self.assertTrue(masks[0, 5, 1])
-        self.assertTrue(masks[1, 1, 3])
+    def test_gemma_native_oracle_matches_official_cross_span_distance_rule(self):
+        token_types = np.array([[0, 1, 1, 0, 0, 1, 1, 0]])
+        masks = _independent_gemma_native_masks(token_types, 4, 4)
+        self.assertTrue(masks[0, 1, 5])
+        self.assertFalse(masks[0, 1, 6])
+        self.assertTrue(masks[0, 1, 2])
+        self.assertFalse(masks[0, 1, 3])
+        self.assertTrue(masks[1, 5, 1])
         self.assertFalse(masks[1, 7, 1])
 
 

@@ -3559,7 +3559,7 @@ def _independent_expected_gemma_masks(
 
 
 def _independent_gemma_native_masks(
-    token_type_ids: np.ndarray, sliding_window: int
+    token_type_ids: np.ndarray, sliding_window: int, tokens_per_image: int
 ) -> np.ndarray:
     token_types = np.asarray(token_type_ids).reshape(-1)
     seq_len = int(token_types.size)
@@ -3568,11 +3568,12 @@ def _independent_gemma_native_masks(
     causal = np.tri(seq_len, seq_len, dtype=bool)
     sliding = causal & (key > query - int(sliding_window))
     image = token_types == 1
-    starts = image & ~np.pad(image[:-1], (1, 0), constant_values=False)
-    groups = np.cumsum(starts.astype(np.int64)) - 1
-    groups[~image] = -1
-    same_image = (groups[:, None] == groups[None, :]) & (groups[:, None] >= 0)
-    return np.stack([causal | same_image, sliding | same_image], axis=0)
+    image_window = (
+        image[:, None]
+        & image[None, :]
+        & (np.abs(query - key) <= int(tokens_per_image))
+    )
+    return np.stack([causal | image_window, sliding | image_window], axis=0)
 
 
 def _validate_raw_score(
@@ -4244,6 +4245,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 native_expected = _independent_gemma_native_masks(
                     token_types,
                     int(sequence["metadata"]["sliding_window"]),
+                    int(sequence["metadata"]["tokens_per_image"]),
                 )
                 if not np.array_equal(native_raw, native_expected):
                     raise RuntimeError(
