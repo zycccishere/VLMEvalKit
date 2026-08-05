@@ -27,6 +27,7 @@ from vlmeval.probes.readout_carriers import (
     _prepare_literal_blind,
     _qwen_per_image_features,
     _run_minicpm_allowed,
+    _run_qwen_allowed,
     _run_qwen_embedded_standard,
     _score_values,
     _single_edit_spec,
@@ -100,6 +101,64 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
         self.assertIs(calls[0]["attention_mask"], attention)
         self.assertIsNone(calls[0]["input_ids"])
         torch.testing.assert_close(logits, (embeds[:, -1, :] + 1).sum(dim=-1))
+
+    def test_qwen_masks_run_as_independent_single_examples(self):
+        class FakeLanguageModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                visible = float((kwargs["attention_mask"] == 0).sum())
+                return SimpleNamespace(
+                    last_hidden_state=kwargs["inputs_embeds"] + visible
+                )
+
+        language_model = FakeLanguageModel()
+        model = SimpleNamespace(
+            model=SimpleNamespace(language_model=language_model),
+            lm_head=lambda value: value.sum(dim=-1, keepdim=True),
+        )
+        embeds = torch.zeros((1, 3, 2))
+        positions = torch.arange(3).reshape(1, 1, 3).repeat(3, 1, 1)
+        state = {
+            "inputs_embeds": embeds,
+            "position_ids": positions,
+            "public_meta": {},
+        }
+        allowed = torch.stack(
+            [
+                torch.eye(3, dtype=torch.bool),
+                torch.tril(torch.ones((3, 3), dtype=torch.bool)),
+                torch.ones((3, 3), dtype=torch.bool),
+            ]
+        )
+        logits, _, _ = _run_qwen_allowed(model, {}, allowed, state=state)
+
+        self.assertEqual(len(language_model.calls), 3)
+        self.assertEqual(
+            [tuple(call["inputs_embeds"].shape) for call in language_model.calls],
+            [(1, 3, 2)] * 3,
+        )
+        self.assertEqual(
+            [tuple(call["attention_mask"].shape) for call in language_model.calls],
+            [(1, 1, 3, 3)] * 3,
+        )
+        self.assertTrue(
+            all(call["inputs_embeds"] is embeds for call in language_model.calls)
+        )
+        self.assertTrue(
+            all(call["position_ids"] is positions for call in language_model.calls)
+        )
+        expected_masks = torch.where(
+            allowed,
+            torch.tensor(0.0),
+            torch.tensor(torch.finfo(torch.float32).min),
+        ).unsqueeze(1)
+        for idx, call in enumerate(language_model.calls):
+            torch.testing.assert_close(call["attention_mask"], expected_masks[idx : idx + 1])
+        self.assertEqual(tuple(logits.shape), (3, 1))
+        torch.testing.assert_close(logits[:, 0], torch.tensor([6.0, 12.0, 18.0]))
 
     def test_qwen_images_are_encoded_one_at_a_time(self):
         class FakeModel:

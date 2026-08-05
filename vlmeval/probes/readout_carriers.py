@@ -1523,21 +1523,20 @@ def _run_qwen_allowed(
     state = state or _prepare_qwen_state(model, inputs)
     embeds = state["inputs_embeds"]
     position_ids = state["position_ids"]
-    batch = int(allowed.shape[0])
-    repeated_embeds = embeds.repeat(batch, 1, 1)
-    repeated_positions = position_ids.repeat(1, batch, 1)
-    attention = _additive_mask(allowed, repeated_embeds.dtype, repeated_embeds.device)
-    with torch.inference_mode():
-        outputs = model.model.language_model(
-            input_ids=None,
-            inputs_embeds=repeated_embeds,
-            position_ids=repeated_positions,
-            attention_mask=attention,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
-    return logits, state["public_meta"], state
+    logits = []
+    for mask in allowed:
+        attention = _additive_mask(mask.unsqueeze(0), embeds.dtype, embeds.device)
+        with torch.inference_mode():
+            outputs = model.model.language_model(
+                input_ids=None,
+                inputs_embeds=embeds,
+                position_ids=position_ids,
+                attention_mask=attention,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits.append(model.lm_head(outputs.last_hidden_state[:, -1, :])[0])
+    return torch.stack(logits), state["public_meta"], state
 
 
 def _run_qwen_standard(model: Any, inputs: dict[str, Any]) -> torch.Tensor:
