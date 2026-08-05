@@ -114,6 +114,7 @@ MODEL_FAMILIES = {
     "qwen25vl_32b": "qwen25vl",
     "minicpm_v_45": "minicpmv45",
     "minicpm_o_45": "minicpmo45",
+    "gemma3_12b": "gemma3",
 }
 MINICPM_FAMILIES = frozenset({"minicpmv45", "minicpmo45"})
 LOREM_TEXT = (
@@ -483,6 +484,8 @@ def _load_probe_model(env: dict[str, str], registry_name: str, family: str) -> A
         wrapper = cfg.supported_VLM[registry_name](use_vllm=False)
         if family == "qwen25vl":
             refresh_replay_runtime(wrapper, env)
+        elif family == "gemma3":
+            wrapper.model.model.language_model.config._attn_implementation = "eager"
         if hasattr(wrapper, "model") and hasattr(wrapper.model, "eval"):
             wrapper.model.eval()
         return wrapper
@@ -554,6 +557,7 @@ def _splice_ids_2d(
     token_ids: list[int],
     *,
     recompute_position_ids: bool,
+    sequence_replacements: dict[str, list[int]] | None = None,
 ) -> dict[str, Any]:
     out = dict(inputs)
     old_ids = inputs["input_ids"]
@@ -568,6 +572,7 @@ def _splice_ids_2d(
         )
     extra = torch.tensor([token_ids], dtype=old_ids.dtype, device=old_ids.device)
     out["input_ids"] = torch.cat([old_ids[:, :start], extra, old_ids[:, end:]], dim=-1)
+    sequence_replacements = sequence_replacements or {}
     for key, value in inputs.items():
         if key == "input_ids" or not isinstance(value, torch.Tensor):
             continue
@@ -581,6 +586,19 @@ def _splice_ids_2d(
                 out[key] = torch.cat([value[:, :start], fill, value[:, end:]], dim=-1)
             elif key == "position_ids" and recompute_position_ids:
                 continue
+            elif key in sequence_replacements:
+                replacement = sequence_replacements[key]
+                if len(replacement) != len(token_ids):
+                    raise RuntimeError(
+                        f"Sequence replacement length mismatch for {key}: "
+                        f"{len(replacement)} != {len(token_ids)}"
+                    )
+                fill = torch.tensor(
+                    [replacement], dtype=value.dtype, device=value.device
+                )
+                out[key] = torch.cat(
+                    [value[:, :start], fill, value[:, end:]], dim=-1
+                )
             else:
                 raise RuntimeError(
                     f"Sequence tensor {key} requires explicit insertion semantics: {tuple(value.shape)}"
@@ -598,7 +616,11 @@ def _splice_ids_2d(
 
 
 def _append_ids(
-    inputs: dict[str, Any], token_ids: list[int], *, recompute_position_ids: bool
+    inputs: dict[str, Any],
+    token_ids: list[int],
+    *,
+    recompute_position_ids: bool,
+    sequence_replacements: dict[str, list[int]] | None = None,
 ) -> dict[str, Any]:
     position = int(inputs["input_ids"].shape[-1])
     return _splice_ids_2d(
@@ -607,6 +629,7 @@ def _append_ids(
         position,
         token_ids,
         recompute_position_ids=recompute_position_ids,
+        sequence_replacements=sequence_replacements,
     )
 
 
@@ -680,12 +703,23 @@ def _insert_matched_text_ids_carrier(
     if int(spec["edit_start"]) + len(replacement) > int(reference.prefill_len):
         raise RuntimeError("Carrier edit crosses the IQI prefill boundary")
     out = copy.copy(base)
+    sequence_replacements = None
+    if family == "gemma3":
+        reference_types = reference.inputs["token_type_ids"][0]
+        expanded_end = int(spec["edit_start"]) + len(spec["expanded_ids"])
+        replacement_types = reference_types[
+            int(spec["edit_start"]) : expanded_end
+        ].detach().cpu().tolist()
+        core_offset = len(spec["prefix_envelope_ids"])
+        replacement_types[core_offset : core_offset + target_n] = [0] * target_n
+        sequence_replacements = {"token_type_ids": replacement_types}
     out.inputs = _splice_ids_2d(
         base.inputs,
         int(spec["edit_start"]),
         int(spec["source_end"]),
         replacement,
         recompute_position_ids=_is_minicpm_family(family),
+        sequence_replacements=sequence_replacements,
     )
     out.prefill_len = int(base.prefill_len) - len(spec["source_ids"]) + len(replacement)
     readout_start = int(spec["edit_start"]) + len(spec["prefix_envelope_ids"])
@@ -1003,6 +1037,239 @@ def _prepare_qwen_sequences(
             carrier_token_ids=token_ids,
             carrier=carrier,
             family="qwen25vl",
+            carrier_metadata=metadata,
+        )
+        prepared.metadata.update(
+            {
+                "standard_prompt": prompt_summary,
+                "standard_prompt_sha256": sha256_json(prompt_summary),
+            }
+        )
+        sequences[carrier] = prepared
+
+    _validate_matched_readout_counts(sequences)
+    return sequences
+
+
+def _gemma_image_spans(input_ids: torch.Tensor, image_token_id: int) -> list[tuple[int, int]]:
+    positions = (input_ids[0] == image_token_id).nonzero().flatten().tolist()
+    spans: list[list[int]] = []
+    for position in positions:
+        if not spans or position != spans[-1][-1] + 1:
+            spans.append([position])
+        else:
+            spans[-1].append(position)
+    return [(span[0], span[-1] + 1) for span in spans]
+
+
+def _prepare_gemma_content(
+    wrapper: Any,
+    content: list[dict[str, Any]],
+    *,
+    expected_images: int,
+) -> PreparedSequence:
+    messages = []
+    if getattr(wrapper, "system_prompt", None):
+        messages.append(
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": wrapper.system_prompt}],
+            }
+        )
+    messages.append({"role": "user", "content": content})
+    prompt_text = wrapper.processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    generation_text = wrapper.processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_inputs = wrapper.processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        add_generation_prompt=False,
+    )
+    generation_inputs = wrapper.processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        add_generation_prompt=True,
+    )
+    prompt_ids = prompt_inputs["input_ids"][0].tolist()
+    generation_ids = generation_inputs["input_ids"][0].tolist()
+    if generation_ids[: len(prompt_ids)] != prompt_ids:
+        raise RuntimeError("Gemma generation prompt is not prefixed by its user prompt")
+    if not torch.all(generation_inputs["attention_mask"] == 1):
+        raise RuntimeError("Gemma carrier path unexpectedly contains padding")
+
+    device = next(wrapper.model.parameters()).device
+    inputs = {}
+    for key, value in generation_inputs.items():
+        if isinstance(value, torch.Tensor):
+            value = value.to(device)
+            if value.is_floating_point():
+                value = value.to(torch.bfloat16)
+        inputs[key] = value
+    image_token_id = int(wrapper.model.config.image_token_id)
+    spans = _gemma_image_spans(inputs["input_ids"], image_token_id)
+    tokens_per_image = int(wrapper.model.config.mm_tokens_per_image)
+    if len(spans) != expected_images or any(
+        end - start != tokens_per_image for start, end in spans
+    ):
+        raise RuntimeError(
+            f"Expected {expected_images} Gemma images with {tokens_per_image} tokens, got {spans}"
+        )
+    if int(inputs["pixel_values"].shape[0]) != expected_images:
+        raise RuntimeError(
+            "Gemma carrier experiment requires exactly one processor crop per source image"
+        )
+    token_type_ids = inputs["token_type_ids"]
+    if int((token_type_ids == 1).sum()) != expected_images * tokens_per_image:
+        raise RuntimeError("Gemma token_type_ids do not exactly mark the visual cores")
+    for start, end in spans:
+        if not torch.all(token_type_ids[:, start:end] == 1):
+            raise RuntimeError("Gemma visual core has non-image token_type_ids")
+
+    roles = [
+        "prefill" if idx < len(prompt_ids) else "decode_prefix"
+        for idx in range(len(generation_ids))
+    ]
+    return PreparedSequence(
+        inputs=inputs,
+        prefill_len=len(prompt_ids),
+        readout_indices=[],
+        prompt_text=str(prompt_text),
+        generation_text=str(generation_text),
+        token_roles=roles,
+        metadata={
+            "model_family": "gemma3",
+            "image_spans": [list(span) for span in spans],
+            "image_token_id": image_token_id,
+            "tokens_per_image": tokens_per_image,
+            "vision_image_size": int(wrapper.model.config.vision_config.image_size),
+            "vision_patch_size": int(wrapper.model.config.vision_config.patch_size),
+            "sliding_window": int(wrapper.model.config.text_config.sliding_window),
+            "layer_types": list(wrapper.model.config.text_config.layer_types),
+            "vision_encode_mode": "per_image_batch_one",
+        },
+    )
+
+
+def _gemma_replay_content(
+    wrapper: Any, dataset: Any, dataset_name: str, row: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    prompt = build_standard_prompt(wrapper, dataset, dataset_name, row)
+    replayed = wrapper._apply_replay_pipeline(prompt, dataset=dataset_name)
+    types = [str(item.get("type")) for item in replayed]
+    if types != ["image", "text", "image"]:
+        raise RuntimeError(f"Expected exact Gemma IQI order, got {types}")
+    content = []
+    for item in replayed:
+        if item["type"] == "text":
+            content.append({"type": "text", "text": str(item["value"])})
+        else:
+            content.append(
+                {
+                    "type": "image",
+                    "url": str(item["value"]),
+                }
+            )
+    return content, [copy.deepcopy(content[0]), copy.deepcopy(content[1])], prompt
+
+
+def _prepare_gemma_sequences(
+    wrapper: Any, dataset: Any, dataset_name: str, row: Any
+) -> dict[str, PreparedSequence]:
+    replayed, base, standard_prompt = _gemma_replay_content(
+        wrapper, dataset, dataset_name, row
+    )
+    reference = _prepare_gemma_content(wrapper, replayed, expected_images=2)
+    full = _prepare_gemma_content(wrapper, base, expected_images=1)
+    prompt_summary = summarize_prompt_items(standard_prompt)
+    full.metadata.update(
+        {
+            "standard_prompt": prompt_summary,
+            "standard_prompt_sha256": sha256_json(prompt_summary),
+        }
+    )
+    sequences: dict[str, PreparedSequence] = {"full": full}
+    second_start, second_end = reference.metadata["image_spans"][1]
+    edit_spec = _single_edit_spec(
+        full.inputs["input_ids"],
+        reference.inputs["input_ids"],
+        int(second_start),
+        int(second_end),
+    )
+    source_image = Image.open(replayed[2]["url"]).convert("RGB")
+    for carrier in VISUAL_CARRIERS:
+        replacement = _visual_carrier_image(source_image, carrier)
+        content = copy.deepcopy(replayed)
+        content[2] = {"type": "image", "image": replacement}
+        prepared = _prepare_gemma_content(wrapper, content, expected_images=2)
+        if prepared.metadata["image_spans"] != reference.metadata["image_spans"]:
+            raise RuntimeError(
+                f"Gemma {carrier} changed image spans: "
+                f"{prepared.metadata['image_spans']} != {reference.metadata['image_spans']}"
+            )
+        start, end = prepared.metadata["image_spans"][1]
+        prepared.readout_indices = list(range(int(start), int(end)))
+        for idx in prepared.readout_indices:
+            prepared.token_roles[idx] = f"readout:{carrier}"
+        prepared.metadata.update(
+            {
+                "carrier": carrier,
+                "carrier_kind": "gemma_projected_visual_core",
+                "reference_image_spans": reference.metadata["image_spans"],
+                "raw_source_size": list(source_image.size),
+                "standard_prompt": prompt_summary,
+                "standard_prompt_sha256": sha256_json(prompt_summary),
+                "source_prefix_sha256": edit_spec["source_prefix_sha256"],
+                "edit_position": edit_spec["edit_start"],
+                "replaced_source_token_count": len(edit_spec["source_ids"]),
+                "replacement_token_count": len(edit_spec["expanded_ids"]),
+                "prefix_envelope_token_count": len(edit_spec["prefix_envelope_ids"]),
+                "suffix_envelope_token_count": len(edit_spec["suffix_envelope_ids"]),
+            }
+        )
+        prepared.metadata.update(_visual_carrier_metadata(carrier, replacement))
+        prepared.artifact_images[carrier] = replacement
+        prepared.artifact_images["source_readout_image"] = source_image
+        sequences[carrier] = prepared
+
+    tokenizer = wrapper.processor.tokenizer
+    for carrier, literal in (("dot_text", "."), ("space_text", " ")):
+        token = _literal_token_id(tokenizer, literal)
+        prepared = _insert_matched_text_carrier(
+            full,
+            reference,
+            core_start=int(second_start),
+            core_end_exclusive=int(second_end),
+            literal_token_id=token,
+            carrier=carrier,
+            family="gemma3",
+        )
+        prepared.metadata.update(
+            {
+                "literal": literal,
+                "standard_prompt": prompt_summary,
+                "standard_prompt_sha256": sha256_json(prompt_summary),
+            }
+        )
+        sequences[carrier] = prepared
+
+    target_n = len(sequences["blank_image"].readout_indices)
+    for carrier in ("ordered_lorem", *SHUFFLED_LOREM_SEEDS):
+        token_ids, metadata = _lorem_carrier_token_ids(tokenizer, target_n, carrier)
+        prepared = _insert_matched_text_ids_carrier(
+            full,
+            reference,
+            core_start=int(second_start),
+            core_end_exclusive=int(second_end),
+            carrier_token_ids=token_ids,
+            carrier=carrier,
+            family="gemma3",
             carrier_metadata=metadata,
         )
         prepared.metadata.update(
@@ -1432,6 +1699,81 @@ def _carrier_masks(
     return masks, checks
 
 
+def _carrier_masks_from_base(
+    base: torch.Tensor, prefill_len: int, readout_indices: list[int]
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if base.ndim != 2 or base.shape[0] != base.shape[1]:
+        raise RuntimeError(f"Expected square native mask, got {tuple(base.shape)}")
+    seq_len = int(base.shape[0])
+    readout = sorted(set(int(item) for item in readout_indices))
+    if not readout or readout[-1] >= prefill_len:
+        raise RuntimeError(f"Invalid readout indices: {readout} prefill={prefill_len}")
+    readout_tensor = torch.tensor(readout, dtype=torch.long)
+
+    aware = base.clone()
+    aware[prefill_len:, :prefill_len] = False
+    aware[prefill_len:, readout_tensor] = base[prefill_len:, readout_tensor]
+
+    no_write = aware.clone()
+    no_write[readout_tensor, :prefill_len] = False
+    no_write[readout_tensor[:, None], readout_tensor] = base[
+        readout_tensor[:, None], readout_tensor
+    ]
+
+    position_null = base.clone()
+    position_null[prefill_len:, :prefill_len] = False
+    masks = torch.stack([aware, no_write, position_null], dim=0)
+    checks = {
+        "native_shape": [seq_len, seq_len],
+        "prefill_len": prefill_len,
+        "readout_indices": readout,
+        "readout_count": len(readout),
+        "aware_decode_non_readout_prefill_visible": int(
+            aware[prefill_len:, :prefill_len].sum()
+            - aware[prefill_len:, readout_tensor].sum()
+        ),
+        "no_write_readout_to_non_readout_prefill_visible": int(
+            no_write[readout_tensor, :prefill_len].sum()
+            - no_write[readout_tensor[:, None], readout_tensor].sum()
+        ),
+        "position_null_decode_prefill_visible": int(
+            position_null[prefill_len:, :prefill_len].sum()
+        ),
+    }
+    if any(
+        checks[key] != 0
+        for key in (
+            "aware_decode_non_readout_prefill_visible",
+            "no_write_readout_to_non_readout_prefill_visible",
+            "position_null_decode_prefill_visible",
+        )
+    ):
+        raise RuntimeError(f"Native carrier mask constraint failed: {checks}")
+    return masks, checks
+
+
+def _gemma_carrier_masks(
+    state: dict[str, Any], prefill_len: int, readout_indices: list[int]
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    seq_len = int(state["inputs_embeds"].shape[1])
+    full_masks, full_checks = _carrier_masks(
+        seq_len, prefill_len, readout_indices
+    )
+    window = int(state["public_meta"]["sliding_window"])
+    query = torch.arange(seq_len)[:, None]
+    key = torch.arange(seq_len)[None, :]
+    sliding_base = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool))
+    sliding_base &= key > query - window
+    sliding_masks, sliding_checks = _carrier_masks_from_base(
+        sliding_base, prefill_len, readout_indices
+    )
+    return torch.stack([full_masks, sliding_masks], dim=1), {
+        "carrier_topology": "matched_strict_causal_full_and_sliding",
+        "full_attention": full_checks,
+        "sliding_attention": sliding_checks,
+    }
+
+
 def _additive_mask(
     allowed: torch.Tensor, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -1607,6 +1949,170 @@ def _run_qwen_embedded_standard(
             return_dict=True,
         )
         logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
+    return logits[0]
+
+
+def _gemma_per_image_features(
+    model: Any, pixel_values: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    expected = int(model.config.mm_tokens_per_image)
+    parts = []
+    for image_idx in range(int(pixel_values.shape[0])):
+        output = model.model.get_image_features(
+            pixel_values[image_idx : image_idx + 1], return_dict=True
+        ).pooler_output
+        if tuple(output.shape[:2]) != (1, expected):
+            raise RuntimeError(
+                f"Unexpected Gemma projected image shape: {tuple(output.shape)}"
+            )
+        parts.append(output[0])
+    return tuple(parts)
+
+
+@torch.no_grad()
+def _prepare_gemma_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
+    input_ids = inputs["input_ids"]
+    image_token_id = int(model.config.image_token_id)
+    llm_input_ids = input_ids.clone()
+    if image_token_id >= int(model.config.text_config.vocab_size):
+        llm_input_ids[llm_input_ids == image_token_id] = 0
+    embeds = model.get_input_embeddings()(llm_input_ids)
+    feature_parts: tuple[torch.Tensor, ...] = ()
+    core_parts: list[torch.Tensor] = []
+    feature_stats = []
+    scatter_max_abs_diff = 0.0
+    pixel_values = inputs.get("pixel_values")
+    if pixel_values is not None:
+        feature_parts = _gemma_per_image_features(model, pixel_values)
+        feature_parts = tuple(
+            part.to(device=embeds.device, dtype=embeds.dtype) for part in feature_parts
+        )
+        features = torch.cat(feature_parts, dim=0)
+        mask = input_ids == image_token_id
+        if int(mask.sum()) != int(features.shape[0]):
+            raise RuntimeError(
+                f"Gemma image token/feature mismatch: {int(mask.sum())} != {features.shape[0]}"
+            )
+        embeds = embeds.masked_scatter(mask.unsqueeze(-1).expand_as(embeds), features)
+        scatter_max_abs_diff = float((embeds[mask] - features).abs().max())
+        feature_stats = [_tensor_runtime_stats(part) for part in feature_parts]
+        flat_core = embeds[mask]
+        offset = 0
+        for part in feature_parts:
+            length = int(part.shape[0])
+            core_parts.append(flat_core[offset : offset + length])
+            offset += length
+
+    position_ids = torch.arange(
+        input_ids.shape[-1], dtype=torch.long, device=input_ids.device
+    ).unsqueeze(0)
+    from transformers.models.gemma3.modeling_gemma3 import create_causal_mask_mapping
+
+    text_config = model.model.language_model.config
+    with _attention_backend(text_config, "eager"):
+        native_mapping = create_causal_mask_mapping(
+            model.config,
+            embeds,
+            inputs["attention_mask"],
+            None,
+            position_ids,
+            inputs["token_type_ids"],
+            pixel_values,
+            is_training=False,
+        )
+    names = ("full_attention", "sliding_attention")
+    native_additive = {name: native_mapping[name] for name in names}
+    native_allowed = torch.stack(
+        [native_additive[name][0, 0] == 0 for name in names], dim=0
+    ).cpu()
+    raw_tensors = {
+        "inputs_embeds": embeds,
+        "position_ids": position_ids,
+        "token_type_ids": inputs["token_type_ids"],
+        "native_allowed_full_attention": native_allowed[0],
+        "native_allowed_sliding_attention": native_allowed[1],
+    }
+    for idx, (feature, core) in enumerate(zip(feature_parts, core_parts)):
+        raw_tensors[f"visual_feature_{idx}"] = feature
+        raw_tensors[f"visual_core_{idx}"] = core
+    return {
+        "inputs_embeds": embeds,
+        "position_ids": position_ids,
+        "native_additive_masks": native_additive,
+        "native_allowed_masks": native_allowed,
+        "raw_tensors": raw_tensors,
+        "public_meta": {
+            "position_ids": position_ids,
+            "inputs_embeds_sha256": _tensor_sha256(embeds),
+            "visual_features": feature_stats,
+            "visual_scatter_max_abs_diff": scatter_max_abs_diff,
+            "vision_encode_mode": "per_image_batch_one",
+            "native_mask_shapes": {
+                name: list(native_additive[name].shape) for name in names
+            },
+            "sliding_window": int(text_config.sliding_window),
+            "layer_types": list(text_config.layer_types),
+        },
+    }
+
+
+def _gemma_additive_mapping(
+    allowed_pair: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> dict[str, torch.Tensor]:
+    return {
+        name: _additive_mask(allowed_pair[idx].unsqueeze(0), dtype, device)
+        for idx, name in enumerate(("full_attention", "sliding_attention"))
+    }
+
+
+def _run_gemma_allowed(
+    model: Any,
+    inputs: dict[str, Any],
+    allowed: torch.Tensor,
+    state: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
+    state = state or _prepare_gemma_state(model, inputs)
+    embeds = state["inputs_embeds"]
+    logits = []
+    with _attention_backend(model.model.language_model.config, "eager"):
+        for allowed_pair in allowed:
+            outputs = model.model.language_model(
+                input_ids=None,
+                inputs_embeds=embeds,
+                position_ids=state["position_ids"],
+                attention_mask=_gemma_additive_mapping(
+                    allowed_pair, embeds.dtype, embeds.device
+                ),
+                use_cache=False,
+                return_dict=True,
+            )
+            logits.append(model.lm_head(outputs.last_hidden_state[:, -1, :])[0])
+    return torch.stack(logits), state["public_meta"], state
+
+
+def _run_gemma_standard(
+    model: Any, inputs: dict[str, Any], state: dict[str, Any] | None = None
+) -> torch.Tensor:
+    with _attention_backend(model.model.language_model.config, "eager"):
+        with torch.inference_mode():
+            outputs = model(**inputs, use_cache=False, return_dict=True)
+    return outputs.logits[0, -1, :]
+
+
+def _run_gemma_embedded_standard(
+    model: Any, state: dict[str, Any]
+) -> torch.Tensor:
+    with _attention_backend(model.model.language_model.config, "eager"):
+        with torch.inference_mode():
+            outputs = model.model.language_model(
+                input_ids=None,
+                inputs_embeds=state["inputs_embeds"],
+                position_ids=state["position_ids"],
+                attention_mask=state["native_additive_masks"],
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
     return logits[0]
 
 
@@ -1833,6 +2339,8 @@ def _run_minicpm_standard(
 def _llm_attention_config(wrapper: Any, family: str) -> Any:
     if family == "qwen25vl":
         return wrapper.model.model.language_model.config
+    if family == "gemma3":
+        return wrapper.model.model.language_model.config
     return wrapper.model.llm.config
 
 
@@ -1999,6 +2507,11 @@ def _extend_prepared(
         sequence.inputs,
         prefix_ids,
         recompute_position_ids=_is_minicpm_family(family),
+        sequence_replacements=(
+            {"token_type_ids": [0] * len(prefix_ids)}
+            if family == "gemma3"
+            else None
+        ),
     )
     out.token_roles = list(sequence.token_roles) + ["answer_prefix"] * len(prefix_ids)
     out.metadata = copy.deepcopy(sequence.metadata)
@@ -2022,6 +2535,8 @@ def _prepare_literal_blind(
         inputs["position_ids"] = torch.arange(
             input_ids.shape[-1], dtype=torch.long, device=device
         ).unsqueeze(0)
+    elif family == "gemma3":
+        inputs["token_type_ids"] = torch.zeros_like(input_ids)
     text = tokenizer.decode(
         prefix_ids,
         skip_special_tokens=False,
@@ -2074,6 +2589,8 @@ def _run_allowed(
 ) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
     if family == "qwen25vl":
         return _run_qwen_allowed(wrapper.model, inputs, masks, state=state)
+    if family == "gemma3":
+        return _run_gemma_allowed(wrapper.model, inputs, masks, state=state)
     if _is_minicpm_family(family):
         return _run_minicpm_allowed(
             wrapper.model,
@@ -2093,6 +2610,8 @@ def _run_standard(
 ) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_standard(wrapper.model, inputs)
+    if family == "gemma3":
+        return _run_gemma_standard(wrapper.model, inputs, state=state)
     if _is_minicpm_family(family):
         return _run_minicpm_standard(
             wrapper.model,
@@ -2111,6 +2630,8 @@ def _run_embedded_standard(
 ) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_embedded_standard(wrapper.model, inputs, state)
+    if family == "gemma3":
+        return _run_gemma_embedded_standard(wrapper.model, state)
     if _is_minicpm_family(family):
         return _run_minicpm_standard(
             wrapper.model,
@@ -2126,6 +2647,8 @@ def _run_literal_blind(
 ) -> torch.Tensor:
     if family == "qwen25vl":
         return _run_qwen_standard(wrapper.model, sequence.inputs)
+    if family == "gemma3":
+        return _run_gemma_standard(wrapper.model, sequence.inputs)
     if _is_minicpm_family(family):
         inputs = sequence.inputs
         with torch.inference_mode():
@@ -2150,6 +2673,8 @@ def _prepare_sequences(
 ) -> dict[str, PreparedSequence]:
     if family == "qwen25vl":
         return _prepare_qwen_sequences(wrapper, dataset, dataset_name, row)
+    if family == "gemma3":
+        return _prepare_gemma_sequences(wrapper, dataset, dataset_name, row)
     if _is_minicpm_family(family):
         return _prepare_minicpm_sequences(
             wrapper, dataset, dataset_name, row, family=family
@@ -2187,6 +2712,10 @@ def _runtime_identity(wrapper: Any, family: str) -> dict[str, Any]:
     llm_config = _llm_attention_config(wrapper, family)
     if family == "qwen25vl":
         attention_backend = getattr(wrapper.model.config, "_attn_implementation", None)
+    elif family == "gemma3":
+        attention_backend = getattr(
+            wrapper.model.model.language_model.config, "_attn_implementation", None
+        )
     else:
         attention_backend = getattr(
             wrapper.model.llm.config, "_attn_implementation", None
@@ -2202,7 +2731,7 @@ def _runtime_identity(wrapper: Any, family: str) -> dict[str, Any]:
         "processor_class": wrapper.processor.__class__.__name__,
         "tokenizer_class": (
             wrapper.processor.tokenizer.__class__.__name__
-            if family == "qwen25vl"
+            if family in {"qwen25vl", "gemma3"}
             else wrapper.tokenizer.__class__.__name__
         ),
         "hidden_size": int(llm_config.hidden_size),
@@ -2236,7 +2765,9 @@ def score_record(
         row=row,
     )
     tokenizer = (
-        wrapper.processor.tokenizer if family == "qwen25vl" else wrapper.tokenizer
+        wrapper.processor.tokenizer
+        if family in {"qwen25vl", "gemma3"}
+        else wrapper.tokenizer
     )
     labels = list(manifest_record["choice_labels"])
     plan = candidate_token_plan(tokenizer, labels)
@@ -2260,6 +2791,8 @@ def score_record(
     if dump_dir is not None:
         if family == "qwen25vl":
             full_dump_state = _prepare_qwen_state(wrapper.model, full.inputs)
+        elif family == "gemma3":
+            full_dump_state = _prepare_gemma_state(wrapper.model, full.inputs)
         elif _is_minicpm_family(family):
             full_dump_state = _prepare_minicpm_state(
                 wrapper.model,
@@ -2274,6 +2807,13 @@ def score_record(
         "blind": blind_cache[cache_key]["logits"],
         "full": full_logits.detach().float().cpu(),
     }
+    if family == "gemma3" and full_dump_state is not None:
+        full_embedded_logits = _run_gemma_embedded_standard(
+            wrapper.model, full_dump_state
+        )
+        raw_logits["full_embedded_native"] = (
+            full_embedded_logits.detach().float().cpu()
+        )
     raw_masks: dict[str, torch.Tensor] = {}
     runtime_meta: dict[str, Any] = {}
     raw_runtime_tensors: dict[str, np.ndarray] = {}
@@ -2286,7 +2826,17 @@ def score_record(
             )
             for key, value in full_dump_state["public_meta"].items()
         }
-        for tensor_name in ("visual_feature_0", "visual_core_0"):
+        full_tensor_names = ["visual_feature_0", "visual_core_0"]
+        if family == "gemma3":
+            full_tensor_names.extend(
+                [
+                    "position_ids",
+                    "token_type_ids",
+                    "native_allowed_full_attention",
+                    "native_allowed_sliding_attention",
+                ]
+            )
+        for tensor_name in full_tensor_names:
             raw_runtime_tensors[f"full__{tensor_name}"] = _tensor_dump_numpy(
                 full_dump_state["raw_tensors"][tensor_name]
             )
@@ -2294,11 +2844,18 @@ def score_record(
     for carrier in CARRIERS:
         sequence = _extend_prepared(sequences[carrier], prefix_ids, family)
         seq_len = int(sequence.inputs["input_ids"].shape[-1])
-        masks, checks = _carrier_masks(
-            seq_len, sequence.prefill_len, sequence.readout_indices
-        )
+        state = None
+        if family == "gemma3":
+            state = _prepare_gemma_state(wrapper.model, sequence.inputs)
+            masks, checks = _gemma_carrier_masks(
+                state, sequence.prefill_len, sequence.readout_indices
+            )
+        else:
+            masks, checks = _carrier_masks(
+                seq_len, sequence.prefill_len, sequence.readout_indices
+            )
         logits, model_meta, state = _run_allowed(
-            family, wrapper, sequence.inputs, masks
+            family, wrapper, sequence.inputs, masks, state=state
         )
         carrier_scores = {
             condition: _score_values(_candidate_values(logits[idx], plan), answer_key)
@@ -2341,7 +2898,7 @@ def score_record(
         if diagnostics and carrier in TEXT_CARRIERS:
             embedding_layer = (
                 wrapper.model.get_input_embeddings()
-                if family == "qwen25vl"
+                if family in {"qwen25vl", "gemma3"}
                 else wrapper.model.llm.get_input_embeddings()
             )
             readout_ids = sequence.inputs["input_ids"][:, sequence.readout_indices]
@@ -2370,12 +2927,17 @@ def score_record(
             null_diff = (logits[2].float() - corrupted_logits[2].float()).abs()
             aware_diff = (logits[0].float() - corrupted_logits[0].float()).abs()
 
-            causal = torch.tril(
-                torch.ones((seq_len, seq_len), dtype=torch.bool)
-            ).unsqueeze(0)
+            if family == "gemma3":
+                manual_baseline = state["native_allowed_masks"].unsqueeze(0)
+                manual_baseline_semantics = "gemma_native_full_and_sliding"
+            else:
+                manual_baseline = torch.tril(
+                    torch.ones((seq_len, seq_len), dtype=torch.bool)
+                ).unsqueeze(0)
+                manual_baseline_semantics = "strict_causal"
             with _attention_backend(_llm_attention_config(wrapper, family), "eager"):
                 manual_causal_logits, _, _ = _run_allowed(
-                    family, wrapper, sequence.inputs, causal, state=state
+                    family, wrapper, sequence.inputs, manual_baseline, state=state
                 )
                 standard_causal_logits = _run_embedded_standard(
                     family, wrapper, sequence.inputs, state
@@ -2428,6 +2990,7 @@ def score_record(
                     float(null_diff.max()) <= BLOCKED_PREFIX_ATOL
                 ),
                 "same_state_standard_2d_vs_manual_causal_4d": causal_parity,
+                "manual_baseline_semantics": manual_baseline_semantics,
                 "batch_vs_single_4d": batch_single_parity,
             }
 
@@ -2923,17 +3486,66 @@ def _independent_expected_masks(
     seq_len: int, prefill_len: int, readout_indices: list[int]
 ) -> np.ndarray:
     causal = np.tri(seq_len, seq_len, dtype=bool)
+    return _independent_expected_masks_from_base(
+        causal, prefill_len, readout_indices
+    )
+
+
+def _independent_expected_masks_from_base(
+    base: np.ndarray, prefill_len: int, readout_indices: list[int]
+) -> np.ndarray:
+    seq_len = int(base.shape[0])
     readout = sorted(set(int(item) for item in readout_indices))
-    aware = causal.copy()
+    aware = base.copy()
     aware[prefill_len:, :prefill_len] = False
-    aware[prefill_len:, readout] = True
+    aware[prefill_len:, readout] = base[prefill_len:, readout]
     no_write = aware.copy()
     for query in readout:
         no_write[query, :prefill_len] = False
-        no_write[query, [key for key in readout if key <= query]] = True
-    position_null = causal.copy()
+        no_write[query, readout] = base[query, readout]
+    position_null = base.copy()
     position_null[prefill_len:, :prefill_len] = False
     return np.stack([aware, no_write, position_null], axis=0)
+
+
+def _independent_expected_gemma_masks(
+    seq_len: int,
+    prefill_len: int,
+    readout_indices: list[int],
+    sliding_window: int,
+) -> np.ndarray:
+    query = np.arange(seq_len)[:, None]
+    key = np.arange(seq_len)[None, :]
+    causal = np.tri(seq_len, seq_len, dtype=bool)
+    sliding = causal & (key > query - int(sliding_window))
+    return np.stack(
+        [
+            _independent_expected_masks_from_base(
+                causal, prefill_len, readout_indices
+            ),
+            _independent_expected_masks_from_base(
+                sliding, prefill_len, readout_indices
+            ),
+        ],
+        axis=1,
+    )
+
+
+def _independent_gemma_native_masks(
+    token_type_ids: np.ndarray, sliding_window: int
+) -> np.ndarray:
+    token_types = np.asarray(token_type_ids).reshape(-1)
+    seq_len = int(token_types.size)
+    query = np.arange(seq_len)[:, None]
+    key = np.arange(seq_len)[None, :]
+    causal = np.tri(seq_len, seq_len, dtype=bool)
+    sliding = causal & (key > query - int(sliding_window))
+    image = token_types == 1
+    starts = image & ~np.pad(image[:-1], (1, 0), constant_values=False)
+    groups = np.cumsum(starts.astype(np.int64)) - 1
+    groups[~image] = -1
+    same_image = (groups[:, None] == groups[None, :]) & (groups[:, None] >= 0)
+    return np.stack([causal | same_image, sliding | same_image], axis=0)
 
 
 def _validate_raw_score(
@@ -3170,9 +3782,10 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             runtime_identity, dict
         ) or not required_runtime_fields.issubset(runtime_identity):
             raise RuntimeError(f"Incomplete runtime identity in {path}")
-        expected_transformers = (
-            "4.53.3" if artifact.get("model_family") == "qwen25vl" else "4.51.0"
-        )
+        expected_transformers = {
+            "qwen25vl": "4.53.3",
+            "gemma3": "5.6.0.dev0",
+        }.get(artifact.get("model_family"), "4.51.0")
         if runtime_identity.get("transformers") != expected_transformers:
             raise RuntimeError(
                 f"Unexpected transformers runtime in {path}: "
@@ -3224,6 +3837,25 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         f"MiniCPM-V static-image temporal IDs mismatch: "
                         f"{path} {sequence_name} {temporal_ids}"
                     )
+        if artifact.get("model_family") == "gemma3":
+            if runtime_identity["model_class"] != "Gemma3ForConditionalGeneration":
+                raise RuntimeError(f"Unexpected Gemma model class in {path}")
+            if runtime_identity["processor_class"] != "Gemma3Processor":
+                raise RuntimeError(f"Unexpected Gemma processor class in {path}")
+            if runtime_identity["tokenizer_class"] != "GemmaTokenizerFast":
+                raise RuntimeError(f"Unexpected Gemma tokenizer class in {path}")
+            if runtime_identity["attention_backend"] != "eager":
+                raise RuntimeError(f"Gemma carrier probe did not freeze eager attention: {path}")
+            if (
+                int(runtime_identity["hidden_size"]) != 3840
+                or int(runtime_identity["num_hidden_layers"]) != 48
+            ):
+                raise RuntimeError(f"Unexpected Gemma3-12B architecture in {path}")
+            device_targets = set(runtime_identity["hf_device_map"].values())
+            if not device_targets or any(
+                target in {"cpu", "disk"} for target in device_targets
+            ):
+                raise RuntimeError(f"Gemma checkpoint was offloaded in {path}")
         entry_environment = artifact.get("entry_environment", {})
         if entry_environment.get("REPLAY_MODE") != "image_text_image":
             raise RuntimeError(f"Smoke replay mode is not IQI: {path}")
@@ -3251,6 +3883,15 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
         _validate_raw_score(
             artifact["full"], logits["full"], plan, context=f"{path}:full"
         )
+        if artifact["model_family"] == "gemma3":
+            if "full_embedded_native" not in logits:
+                raise RuntimeError(f"Gemma native Full parity logits missing: {path}")
+            _validate_raw_parity(
+                logits["full"],
+                logits["full_embedded_native"],
+                plan,
+                context=f"{path}:gemma-full-native-parity",
+            )
 
         blind_ids = np.load(path.parent / artifact["raw_files"]["input_ids"]["blind"])
         forced_prefix = np.asarray([plan["forced_prefix_ids"]], dtype=blind_ids.dtype)
@@ -3309,6 +3950,36 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     f"Smoke carrier {invariant_name} mismatch in {path}: {invariant}"
                 )
         full_ids = np.load(path.parent / artifact["raw_files"]["input_ids"]["full"])
+        if artifact["model_family"] == "gemma3":
+            full_types = np.asarray(runtime_tensors["full__token_type_ids"])
+            full_native = np.stack(
+                [
+                    np.asarray(
+                        runtime_tensors["full__native_allowed_full_attention"],
+                        dtype=bool,
+                    ),
+                    np.asarray(
+                        runtime_tensors["full__native_allowed_sliding_attention"],
+                        dtype=bool,
+                    ),
+                ],
+                axis=0,
+            )
+            full_expected = _independent_gemma_native_masks(
+                full_types,
+                int(artifact["sequences"]["full"]["metadata"]["sliding_window"]),
+            )
+            if not np.array_equal(full_native, full_expected):
+                raise RuntimeError(f"Gemma Full native mask oracle mismatch: {path}")
+            full_image_spans = _contiguous_value_spans(
+                full_ids[0],
+                int(artifact["sequences"]["full"]["metadata"]["image_token_id"]),
+            )
+            first, last = full_image_spans[0][0], full_image_spans[0][1] - 1
+            if not bool(full_native[0, first, last]):
+                raise RuntimeError(
+                    f"Gemma Full did not retain native image bidirectionality: {path}"
+                )
         prompt_hashes = {
             name: artifact["sequences"][name]["metadata"].get("standard_prompt_sha256")
             for name in ("full", *CARRIERS)
@@ -3321,6 +3992,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
         artifact_has_diagnostics = True
         text_readout_ids: dict[str, np.ndarray] = {}
         readout_embedding_stats: dict[str, dict[str, float]] = {}
+        gemma_mask_reference: np.ndarray | None = None
         for carrier in CARRIERS:
             carrier_record = artifact["carriers"][carrier]
             sequence = artifact["sequences"][carrier]
@@ -3342,12 +4014,40 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             raw_mask = np.load(
                 path.parent / artifact["raw_files"]["masks"][carrier]
             ).astype(bool)
-            expected_mask = _independent_expected_masks(seq_len, prefill_len, readout)
+            if artifact["model_family"] == "gemma3":
+                expected_mask = _independent_expected_gemma_masks(
+                    seq_len,
+                    prefill_len,
+                    readout,
+                    int(sequence["metadata"]["sliding_window"]),
+                )
+                if (
+                    carrier_record["mask_checks"].get("carrier_topology")
+                    != "matched_strict_causal_full_and_sliding"
+                ):
+                    raise RuntimeError(
+                        f"Gemma carrier topology is not modality-matched: {path} {carrier}"
+                    )
+            else:
+                expected_mask = _independent_expected_masks(
+                    seq_len, prefill_len, readout
+                )
             if not np.array_equal(raw_mask, expected_mask):
                 mismatch = int(np.count_nonzero(raw_mask != expected_mask))
                 raise RuntimeError(
                     f"Raw mask oracle mismatch for {path} {carrier}: {mismatch} cells"
                 )
+            if artifact["model_family"] == "gemma3":
+                if gemma_mask_reference is None:
+                    gemma_mask_reference = raw_mask
+                elif not np.array_equal(raw_mask, gemma_mask_reference):
+                    raise RuntimeError(
+                        f"Gemma effective carrier masks differ by modality: {path} {carrier}"
+                    )
+                if bool(raw_mask[:, :, readout[0], readout[-1]].any()):
+                    raise RuntimeError(
+                        f"Gemma carrier retained a visual future edge: {path} {carrier}"
+                    )
             token_table = sequence["token_table"]
             table_readout = [
                 int(item["position"]) for item in token_table if item["is_readout"]
@@ -3466,6 +4166,83 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                             f"Qwen visual mRoPE has no spatial variation: "
                             f"{path} {carrier} {(span_start, span_end)}"
                         )
+            elif artifact["model_family"] == "gemma3":
+                if (
+                    sequence["metadata"].get("vision_encode_mode")
+                    != "per_image_batch_one"
+                    or model_meta.get("vision_encode_mode")
+                    != "per_image_batch_one"
+                ):
+                    raise RuntimeError(
+                        f"Gemma images were not encoded independently: {path} {carrier}"
+                    )
+                if positions.shape != (1, seq_len) or not np.array_equal(
+                    positions[0], np.arange(seq_len, dtype=positions.dtype)
+                ):
+                    raise RuntimeError(
+                        f"Gemma position IDs are not exact arange: {path} {carrier}"
+                    )
+                token_types_key = f"{carrier}__token_type_ids"
+                native_full_key = f"{carrier}__native_allowed_full_attention"
+                native_sliding_key = (
+                    f"{carrier}__native_allowed_sliding_attention"
+                )
+                if any(
+                    key not in runtime_tensors
+                    for key in (token_types_key, native_full_key, native_sliding_key)
+                ):
+                    raise RuntimeError(
+                        f"Gemma raw token types/native masks missing: {path} {carrier}"
+                    )
+                token_types = np.asarray(runtime_tensors[token_types_key])
+                if token_types.shape != (1, seq_len):
+                    raise RuntimeError(
+                        f"Gemma token type shape mismatch: {path} {carrier} {token_types.shape}"
+                    )
+                native_raw = np.stack(
+                    [
+                        np.asarray(runtime_tensors[native_full_key], dtype=bool),
+                        np.asarray(runtime_tensors[native_sliding_key], dtype=bool),
+                    ],
+                    axis=0,
+                )
+                native_expected = _independent_gemma_native_masks(
+                    token_types,
+                    int(sequence["metadata"]["sliding_window"]),
+                )
+                if not np.array_equal(native_raw, native_expected):
+                    raise RuntimeError(
+                        f"Gemma native full/sliding mask oracle mismatch: {path} {carrier}"
+                    )
+                image_token_id = int(sequence["metadata"]["image_token_id"])
+                image_spans = _contiguous_value_spans(input_ids[0], image_token_id)
+                expected_images = 2 if carrier in VISUAL_CARRIERS else 1
+                if len(image_spans) != expected_images or any(
+                    end - start != 256 for start, end in image_spans
+                ):
+                    raise RuntimeError(
+                        f"Gemma image core count/length mismatch: {path} {carrier} {image_spans}"
+                    )
+                if carrier in VISUAL_CARRIERS:
+                    if tuple(readout) != tuple(range(*image_spans[1])):
+                        raise RuntimeError(
+                            f"Gemma readout is not image core 2: {path} {carrier}"
+                        )
+                    if np.any(token_types[0, readout] != 1):
+                        raise RuntimeError(
+                            f"Gemma visual carrier lost visual token types: {path} {carrier}"
+                        )
+                elif np.any(token_types[0, readout] != 0):
+                    raise RuntimeError(
+                        f"Gemma text carrier retained visual token types: {path} {carrier}"
+                    )
+                if model_meta.get("native_mask_shapes") != {
+                    "full_attention": [1, 1, seq_len, seq_len],
+                    "sliding_attention": [1, 1, seq_len, seq_len],
+                }:
+                    raise RuntimeError(
+                        f"Gemma native additive mask shapes mismatch: {path} {carrier}"
+                    )
             else:
                 if (
                     sequence["metadata"].get("vision_encode_mode")
@@ -3705,7 +4482,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     "mean_tokenwise_variance": float(np.mean(centered * centered)),
                 }
 
-        if artifact["model_family"] == "qwen25vl":
+        if artifact["model_family"] in {"qwen25vl", "gemma3"}:
             source_features = {}
             for name in ("full", *CARRIERS):
                 if (
@@ -3713,7 +4490,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     != "per_image_batch_one"
                 ):
                     raise RuntimeError(
-                        f"Qwen images were not encoded independently: {path} {name}"
+                        f"Source images were not encoded independently: {path} {name}"
                     )
                 feature_key = f"{name}__visual_feature_0"
                 core_key = f"{name}__visual_core_0"
@@ -3738,7 +4515,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         np.max(np.abs(reference_source - source_features[name]))
                     )
                     raise RuntimeError(
-                        f"Qwen source visual feature changed across carriers: "
+                        f"Source visual feature changed across carriers: "
                         f"{path} full vs {name} max={max_diff}"
                     )
 
@@ -3816,11 +4593,10 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 f"Raw source readout image is missing: {source_image_path}"
             )
 
-        layout_key = (
-            "image_grid_thw"
-            if artifact["model_family"] == "qwen25vl"
-            else "image_bound"
-        )
+        layout_key = {
+            "qwen25vl": "image_grid_thw",
+            "gemma3": "image_spans",
+        }.get(artifact["model_family"], "image_bound")
         layouts = {
             carrier: artifact["sequences"][carrier]["metadata"][layout_key]
             for carrier in VISUAL_CARRIERS

@@ -14,8 +14,11 @@ from vlmeval.probes.readout_carriers import (
     _candidate_parity,
     _candidate_values,
     _carrier_masks,
+    _carrier_masks_from_base,
     _validate_corruption_control,
     _independent_expected_masks,
+    _independent_expected_gemma_masks,
+    _independent_gemma_native_masks,
     _insert_matched_text_carrier,
     _independent_qwen_mrope,
     _insert_matched_text_ids_carrier,
@@ -25,6 +28,7 @@ from vlmeval.probes.readout_carriers import (
     _minicpm_content_to_prompt,
     _minicpm_processor_call,
     _minicpm_v_per_image_vision_states,
+    _gemma_image_spans,
     _model_family,
     _natural_noise_image,
     _nested_input_summary,
@@ -79,12 +83,65 @@ class ReadoutCarrierMaskTest(unittest.TestCase):
         oracle = _independent_expected_masks(13, 9, [5, 6, 7])
         np.testing.assert_array_equal(masks.numpy(), oracle)
 
+    def test_native_mask_constraints_preserve_visual_bidirectionality(self):
+        base = torch.tril(torch.ones((8, 8), dtype=torch.bool))
+        base[3:5, 3:5] = True
+        masks, checks = _carrier_masks_from_base(base, 6, [3, 4])
+
+        self.assertTrue(masks[0, 3, 4])
+        self.assertTrue(masks[1, 3, 4])
+        self.assertFalse(masks[1, 3, 2])
+        self.assertEqual(masks[0, 7].nonzero().flatten().tolist(), [3, 4, 6, 7])
+        self.assertEqual(masks[2, 7].nonzero().flatten().tolist(), [6, 7])
+        self.assertEqual(checks["no_write_readout_to_non_readout_prefill_visible"], 0)
+
+    def test_gemma_effective_masks_match_topology_across_modalities(self):
+        masks = _independent_expected_gemma_masks(12, 9, [6, 7, 8], 5)
+        self.assertEqual(masks.shape, (3, 2, 12, 12))
+        self.assertFalse(masks[:, :, 6, 8].any())
+        self.assertFalse(masks[0, 0, 11, 5])
+        self.assertTrue(masks[0, 0, 11, 8])
+        self.assertFalse(masks[0, 1, 11, 6])
+
+    def test_gemma_native_oracle_adds_only_same_image_future_edges(self):
+        token_types = np.array([[0, 1, 1, 1, 0, 1, 1, 0]])
+        masks = _independent_gemma_native_masks(token_types, 4)
+        self.assertTrue(masks[0, 1, 3])
+        self.assertFalse(masks[0, 1, 5])
+        self.assertTrue(masks[0, 5, 1])
+        self.assertTrue(masks[1, 1, 3])
+        self.assertFalse(masks[1, 7, 1])
+
 
 class ReadoutCarrierSequenceTest(unittest.TestCase):
     def test_expanded_model_keys_use_the_intended_semantic_family(self):
         self.assertEqual(_model_family("qwen25vl_32b"), "qwen25vl")
         self.assertEqual(_model_family("minicpm_v_45"), "minicpmv45")
         self.assertEqual(_model_family("minicpm_o_45"), "minicpmo45")
+        self.assertEqual(_model_family("gemma3_12b"), "gemma3")
+
+    def test_gemma_image_spans_are_exact_contiguous_runs(self):
+        ids = torch.tensor([[7, 9, 9, 9, 4, 9, 9, 3]])
+        self.assertEqual(_gemma_image_spans(ids, 9), [(1, 4), (5, 7)])
+
+    def test_gemma_text_splice_updates_only_sequence_token_types(self):
+        inputs = {
+            "input_ids": torch.tensor([[10, 11, 12, 13]]),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+            "token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+            "pixel_values": torch.zeros((1, 3, 2, 2)),
+        }
+        out = _splice_ids_2d(
+            inputs,
+            1,
+            3,
+            [21, 22],
+            recompute_position_ids=False,
+            sequence_replacements={"token_type_ids": [0, 0]},
+        )
+        self.assertEqual(out["input_ids"].tolist(), [[10, 21, 22, 13]])
+        self.assertEqual(out["token_type_ids"].tolist(), [[0, 0, 0, 0]])
+        self.assertIs(out["pixel_values"], inputs["pixel_values"])
 
     def test_qwen_embedded_standard_reuses_precomputed_state(self):
         calls = []
