@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${ROOT:-/user/zyc1781/vlmevalkit-release-readout-gemma3}"
-PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/vlmeval_gemma4_vllm/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/user/zhangyicheng/models/gemma-3-12b-it}"
 LMU_DATA="${LMUData:-/user/zyc1781/LMUData}"
 MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"

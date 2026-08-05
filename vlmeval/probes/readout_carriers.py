@@ -1959,8 +1959,8 @@ def _gemma_per_image_features(
     parts = []
     for image_idx in range(int(pixel_values.shape[0])):
         output = model.model.get_image_features(
-            pixel_values[image_idx : image_idx + 1], return_dict=True
-        ).pooler_output
+            pixel_values[image_idx : image_idx + 1]
+        )
         if tuple(output.shape[:2]) != (1, expected):
             raise RuntimeError(
                 f"Unexpected Gemma projected image shape: {tuple(output.shape)}"
@@ -2006,20 +2006,33 @@ def _prepare_gemma_state(model: Any, inputs: dict[str, Any]) -> dict[str, Any]:
     position_ids = torch.arange(
         input_ids.shape[-1], dtype=torch.long, device=input_ids.device
     ).unsqueeze(0)
-    from transformers.models.gemma3.modeling_gemma3 import create_causal_mask_mapping
+    from transformers.models.gemma3.modeling_gemma3 import (
+        create_causal_mask,
+        create_sliding_window_causal_mask,
+        token_type_ids_mask_function,
+    )
 
     text_config = model.model.language_model.config
+    cache_position = torch.arange(
+        input_ids.shape[-1], dtype=torch.long, device=input_ids.device
+    )
+    mask_kwargs = {
+        "config": text_config,
+        "input_embeds": embeds,
+        "attention_mask": inputs["attention_mask"],
+        "cache_position": cache_position,
+        "past_key_values": None,
+        "position_ids": position_ids,
+        "or_mask_function": token_type_ids_mask_function(
+            inputs["token_type_ids"].to(cache_position.device),
+            int(model.config.mm_tokens_per_image),
+        ),
+    }
     with _attention_backend(text_config, "eager"):
-        native_mapping = create_causal_mask_mapping(
-            model.config,
-            embeds,
-            inputs["attention_mask"],
-            None,
-            position_ids,
-            inputs["token_type_ids"],
-            pixel_values,
-            is_training=False,
-        )
+        native_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        }
     names = ("full_attention", "sliding_attention")
     native_additive = {name: native_mapping[name] for name in names}
     native_allowed = torch.stack(
@@ -2720,7 +2733,19 @@ def _runtime_identity(wrapper: Any, family: str) -> dict[str, Any]:
         attention_backend = getattr(
             wrapper.model.llm.config, "_attn_implementation", None
         )
-    return {
+    device_map = {
+        str(key): str(value)
+        for key, value in getattr(wrapper.model, "hf_device_map", {}).items()
+    }
+    if family == "gemma3" and not device_map:
+        device_map = {
+            "actual_parameters": ",".join(
+                sorted(
+                    {str(parameter.device) for parameter in wrapper.model.parameters()}
+                )
+            )
+        }
+    identity = {
         "python": sys.version,
         "torch": torch.__version__,
         "transformers": transformers.__version__,
@@ -2736,11 +2761,13 @@ def _runtime_identity(wrapper: Any, family: str) -> dict[str, Any]:
         ),
         "hidden_size": int(llm_config.hidden_size),
         "num_hidden_layers": int(llm_config.num_hidden_layers),
-        "hf_device_map": {
-            str(key): str(value)
-            for key, value in getattr(wrapper.model, "hf_device_map", {}).items()
-        },
+        "hf_device_map": device_map,
     }
+    if family == "gemma3":
+        identity["checkpoint_loading_info"] = getattr(
+            wrapper.model, "_replay_checkpoint_loading_info", None
+        )
+    return identity
 
 
 def score_record(
@@ -3784,7 +3811,7 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(f"Incomplete runtime identity in {path}")
         expected_transformers = {
             "qwen25vl": "4.53.3",
-            "gemma3": "5.6.0.dev0",
+            "gemma3": "4.53.3",
         }.get(artifact.get("model_family"), "4.51.0")
         if runtime_identity.get("transformers") != expected_transformers:
             raise RuntimeError(
@@ -3838,6 +3865,14 @@ def validate_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         f"{path} {sequence_name} {temporal_ids}"
                     )
         if artifact.get("model_family") == "gemma3":
+            loading_info = runtime_identity.get("checkpoint_loading_info")
+            if loading_info != {
+                "missing_keys": [],
+                "unexpected_keys": [],
+                "mismatched_keys": [],
+                "error_msgs": [],
+            }:
+                raise RuntimeError(f"Gemma checkpoint load was not exact in {path}")
             if runtime_identity["model_class"] != "Gemma3ForConditionalGeneration":
                 raise RuntimeError(f"Unexpected Gemma model class in {path}")
             if runtime_identity["processor_class"] != "Gemma3Processor":

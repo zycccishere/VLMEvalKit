@@ -77,9 +77,10 @@ def _load_gemma3_transformers_model(model_path: str):
         "torch_dtype": torch.bfloat16,
     }
     try:
-        model = Gemma3ForConditionalGeneration.from_pretrained(
+        model, loading_info = Gemma3ForConditionalGeneration.from_pretrained(
             model_path,
             attn_implementation="flash_attention_2",
+            output_loading_info=True,
             **base_kwargs,
         )
     except Exception as err:
@@ -89,7 +90,18 @@ def _load_gemma3_transformers_model(model_path: str):
             type(err).__name__,
             err,
         )
-        model = Gemma3ForConditionalGeneration.from_pretrained(model_path, **base_kwargs)
+        model, loading_info = Gemma3ForConditionalGeneration.from_pretrained(
+            model_path,
+            output_loading_info=True,
+            **base_kwargs,
+        )
+    loading_errors = {
+        key: list(loading_info.get(key, []))
+        for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+    }
+    if any(loading_errors.values()):
+        raise RuntimeError(f"Gemma3 checkpoint did not load exactly: {loading_errors}")
+    model._replay_checkpoint_loading_info = loading_errors
     return model.to("cuda").eval()
 
 

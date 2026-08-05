@@ -59,7 +59,7 @@ case "${MODEL_KEY}" in
   gemma3_12b)
     DEFAULT_ROOT="/user/zyc1781/vlmevalkit-release-readout-gemma3"
     DEFAULT_WORKERS_PER_GPU=1
-    PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/vlmeval_gemma4_vllm/bin/python}"
+    PYTHON_BIN="${PYTHON_BIN:-/user/zhangyicheng/miniconda3/envs/duplex_mm_eval310/bin/python}"
     MODEL_PATH="${MODEL_PATH:-/user/zhangyicheng/models/gemma-3-12b-it}"
     SMOKE_VALIDATION="${SMOKE_VALIDATION:-/user/zyc1781/outputs/readout_random_carriers/readout_carrier_gemma3_smoke_20260805/gemma3_12b/validation.json}"
     DEFAULT_MANIFEST="/user/zyc1781/outputs/readout_random_carriers/readout_carrier_gemma3_smoke_20260805/manifests/gemma3_12b.json"
