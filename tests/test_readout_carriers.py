@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from types import SimpleNamespace
 
@@ -408,6 +409,12 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
         self.assertIn("sha256", summary[0][0])
         self.assertNotIn("value", summary[0][0])
 
+    def test_nested_input_summary_supports_scalar_temporal_ids(self):
+        summary = _nested_input_summary([[torch.tensor(-1, dtype=torch.long)]])
+        self.assertEqual(summary[0][0]["shape"], [])
+        self.assertEqual(summary[0][0]["dtype"], "torch.int64")
+        self.assertIn("sha256", summary[0][0])
+
     def test_text_core_replaces_visual_core_inside_identical_envelope(self):
         base = PreparedSequence(
             inputs={
@@ -608,6 +615,11 @@ class ReadoutCarrierSequenceTest(unittest.TestCase):
     def test_tensor_hash_supports_bfloat16(self):
         digest = _tensor_sha256(torch.arange(8, dtype=torch.bfloat16))
         self.assertEqual(len(digest), 64)
+
+    def test_tensor_hash_supports_scalar_long(self):
+        value = torch.tensor(-1, dtype=torch.long)
+        digest = _tensor_sha256(value)
+        self.assertEqual(digest, hashlib.sha256(value.numpy().tobytes()).hexdigest())
 
     def test_independent_qwen_mrope_reconstructs_all_three_axes(self):
         positions, delta = _independent_qwen_mrope(

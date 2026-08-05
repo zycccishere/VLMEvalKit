@@ -1849,7 +1849,9 @@ def _attention_backend(config: Any, backend: str):
 
 def _tensor_sha256(value: torch.Tensor) -> str:
     cpu = value.detach().cpu().contiguous()
-    return hashlib.sha256(cpu.view(torch.uint8).numpy().tobytes()).hexdigest()
+    return hashlib.sha256(
+        cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
 
 
 def _tensor_dump_numpy(value: torch.Tensor) -> np.ndarray:
