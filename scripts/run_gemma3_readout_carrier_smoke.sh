@@ -9,7 +9,7 @@ MATRIX_CONFIG="${MATRIX_CONFIG:-${ROOT}/configs/matrix.yaml}"
 OUT_ROOT="${OUT_ROOT:-/user/zyc1781/outputs/readout_random_carriers/readout_carrier_gemma3_smoke_20260805}"
 MANIFEST="${OUT_ROOT}/manifests/gemma3_12b.json"
 GPU_ID="${GPU_ID:-0}"
-NUM_SHARDS="${NUM_SHARDS:-24}"
+NUM_SHARDS="${NUM_SHARDS:-8}"
 MANIFEST_DATASETS="${MANIFEST_DATASETS:-DynaMath,WeMath,MMBench_DEV_EN_V11,MMStar,AI2D_TEST}"
 SMOKE_DATASET="${SMOKE_DATASET:-DynaMath}"
 
