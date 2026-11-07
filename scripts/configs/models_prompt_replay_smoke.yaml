@@ -1,0 +1,36 @@
+# Machine-local model/env profile for the prompt-replay shared venv.
+# Used by matrix_datasets_adapt_smoke_20261107.yaml (new-dataset smoke).
+# Pass explicitly: --model-config scripts/configs/models_prompt_replay_smoke.yaml
+env_profiles:
+  prompt_replay_vlmeval:
+    python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HOME: /data/local/yicheng/temporary/scratch/prompt-replay/hf-cache
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+models:
+  gemma4_e4b:
+    display_name: Gemma4-E4B-it
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/gemma-4-E4B-it'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 8
+      max_num_seqs: 16
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.0
+    task_env:
+      GEMMA4_USE_VLLM: '1'
+      MODEL_PATH: '{model_root}/gemma-4-E4B-it'
+      MODEL_PATH_GEMMA4_E4B: '{model_root}/gemma-4-E4B-it'
