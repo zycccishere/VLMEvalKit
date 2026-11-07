@@ -7,10 +7,12 @@
 # `prompt-replay-vlmeval` venv (vllm 0.31.0+cu129, torch 2.13.0+cu129,
 # transformers 5.17.0) is used read-only via PYTHONPATH; no pip install.
 #
-# MiniCPM-o 4.5 runtime values below mirror configs/models.yaml on main
-# (infer_batch_size 64 / max_num_seqs 64 / tp 1 / max_model_len 32768);
-# the tuned values from the parallel blank-tier tuning will replace them in
-# the JobPack matrix/models config before the formal submission.
+# MiniCPM-o 4.5 runtime: gmu 0.9 / max_model_len 32768 / max_images 4 / tp 1
+# adopted from the blank-tier runtime contract
+# (e4-blank-tiers/minicpmo_runtime.json, same checkpoint+stack for
+# comparability). max_num_seqs / infer_batch_size stay at 64 (main's
+# models.yaml default) until main confirms the blank-tier mns: their sweep
+# never saturated the scheduler (running_max 49/86/124 vs mns 64/128/256).
 env_profiles:
   prompt_replay_vlmeval:
     python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
@@ -42,6 +44,8 @@ models:
     task_env:
       MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
       MINICPM45_MAX_NEW_TOKENS: '16384'
+      MINICPM45_VLLM_GPU_MEMORY_UTILIZATION: '0.9'
+      MINICPM45_VLLM_MAX_IMAGES: '4'
   minicpm_o_45_no_reasoning:
     display_name: MiniCPM-o-4_5 no reasoning
     registry_name: MiniCPM-o-4_5-Replay
@@ -56,8 +60,10 @@ models:
       estimated_dataset_cost: 1.2
     task_env:
       MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
-      MINICPM45_MAX_NEW_TOKENS: '16384'
       MINICPM45_REASONING_MODE: no_thinking
+      MINICPM45_MAX_NEW_TOKENS: '16384'
+      MINICPM45_VLLM_GPU_MEMORY_UTILIZATION: '0.9'
+      MINICPM45_VLLM_MAX_IMAGES: '4'
   minicpm_o_45_regular_reasoning:
     display_name: MiniCPM-o-4_5 regular reasoning
     registry_name: MiniCPM-o-4_5-Replay
@@ -72,8 +78,10 @@ models:
       estimated_dataset_cost: 1.2
     task_env:
       MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
-      MINICPM45_MAX_NEW_TOKENS: '16384'
       MINICPM45_REASONING_MODE: regular_cot
+      MINICPM45_MAX_NEW_TOKENS: '16384'
+      MINICPM45_VLLM_GPU_MEMORY_UTILIZATION: '0.9'
+      MINICPM45_VLLM_MAX_IMAGES: '4'
   gemma3_12b:
     display_name: Gemma3-12B-it
     registry_name: Gemma3-12B-Replay
