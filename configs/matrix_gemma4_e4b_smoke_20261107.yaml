@@ -1,0 +1,51 @@
+# Gemma4-E4B-it replay adaptation smoke: 16 samples x {MathVision, AI2D_TEST}
+# x {image_text, image_text_image_text}. Thinking on/off is controlled by
+# GEMMA4_ENABLE_THINKING in the model task_env (default '0'); flip it to '1'
+# (or export it before launching) for the thinking-on pass.
+name: gemma4_e4b_smoke_20261107
+repo_root: "{repo_root}"
+results_root: /data/local/yicheng/temporary/scratch/prompt-replay/gemma4-adapt/smoke/gemma4_e4b_smoke_nothink
+node_gpu_ids: "5"
+scheduler: gpu_pool
+datasets:
+  - MathVision
+  - AI2D_TEST
+dataset_index_allowlists:
+  MathVision: "{repo_root}/configs/index_allowlists/gemma4_smoke_mathvision_16_20261107.txt"
+  AI2D_TEST: "{repo_root}/configs/index_allowlists/gemma4_smoke_ai2d_test_16_20261107.txt"
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text
+  - image_text_image_text
+image_transforms:
+  - baseline
+models:
+  - gemma4_e4b
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  strict_batch: 1
+  stage_debug: 1
+  stage_debug_samples: 4
+  prompt_audit: 1
+  prompt_audit_print: 0
+trace:
+  level: summary
+  samples: 4
+  dump_max_chars: 12000
+  prompt_audit_print: 0
+answer_format:
+  enable: 0
+evaluation:
+  launch_mode: skip
+worker_monitor:
+  enable: true
+  interval_seconds: 60
+resume_infer_default: false
+resume_infer_start_delay_seconds: 0
