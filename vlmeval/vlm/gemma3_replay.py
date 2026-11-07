@@ -16,11 +16,19 @@ from .qwen2_vl.replay_prompt_template import (
 )
 from .qwen3_vl.prompt import Qwen3VLPromptMixin
 from .replay_policy import (
+    REPLAY_IMAGE_TEXT_FILLER_TEXT,
     apply_replay,
     canonicalize_replay_mode,
     is_noop_replay_mode,
     maybe_debug_print_replay,
     read_replay_config_from_env,
+)
+from .replay_text_filler import (
+    SPACE_FILLER_LITERAL,
+    TextFillerAudit,
+    build_space_filler,
+    count_filler_tokens,
+    tokenize_length,
 )
 
 
@@ -184,6 +192,9 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         self.replay_cfg = read_replay_config_from_env()
         self.prompt_template_cfg = read_prompt_template_config_from_env()
         self.template_on_last_replay_text = _env_bool("REPLAY_TEMPLATE_ON_LAST_REPLAY_TEXT", True)
+        self._text_filler_audit = TextFillerAudit(self.__class__.__name__)
+        self._gemma3_model_config = None
+        self._gemma3_image_expansion_delta_cache = None
 
     def _resolve_vllm_tp_size(self, explicit_tp_size: int | None = None) -> int:
         gpu_count = max(1, torch.cuda.device_count())
@@ -227,6 +238,13 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
 
     def _apply_replay_pipeline(self, message, dataset=None):
         mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+        if mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
+            return self._apply_text_filler_replay(message, dataset=dataset)
+        return self._apply_replay_pipeline_mode(message, dataset=dataset, mode=mode)
+
+    def _apply_replay_pipeline_mode(self, message, dataset=None, mode=None):
+        if mode is None:
+            mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
 
         if self.template_on_last_replay_text and not is_noop_replay_mode(mode):
             replay_source = message
@@ -251,6 +269,185 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             repeat_times=self.replay_cfg.get("repeat_times", 1),
             image_copy_mode=self.replay_cfg.get("image_copy_mode", "reuse_path"),
         )
+
+    def _gemma3_model_config_lazy(self):
+        if self._gemma3_model_config is None:
+            from transformers import AutoConfig
+
+            self._gemma3_model_config = AutoConfig.from_pretrained(
+                self.model_path, trust_remote_code=True
+            )
+        return self._gemma3_model_config
+
+    def _gemma3_visual_core_tokens_per_image(self) -> int:
+        per_image = int(getattr(self.processor, "image_seq_length", 0) or 0)
+        if per_image <= 0:
+            config = self._gemma3_model_config_lazy()
+            per_image = int(getattr(config, "mm_tokens_per_image", 0) or 0)
+        if per_image <= 0:
+            raise RuntimeError(
+                f"Gemma3 processor/config at {self.model_path} lack a positive per-image token count"
+            )
+        return per_image
+
+    def _gemma3_image_expansion_delta(self) -> int:
+        """Engine-side prompt growth per image placeholder.
+
+        vLLM (model_executor/models/gemma3_mm.py Gemma3ProcessingInfo
+        .get_image_repl) replaces the single ``<start_of_image>`` placeholder
+        token with ``processor.full_image_sequence`` tokenized without
+        special tokens. Pan-and-scan would add crop images and scaffold
+        text; the shared checkpoint resolves ``do_pan_and_scan`` falsy, and
+        any truthy value fails loudly here instead of silently mismatching.
+        """
+        if self._gemma3_image_expansion_delta_cache is None:
+            image_processor = getattr(self.processor, "image_processor", None)
+            if image_processor is not None and getattr(
+                image_processor, "do_pan_and_scan", None
+            ):
+                raise RuntimeError(
+                    "Gemma3 pan-and-scan is enabled in this checkpoint's image "
+                    "processor config; visual core would include crops and the "
+                    "filler audit does not model it. Refusing to continue."
+                )
+            tokenizer = self.processor.tokenizer
+            replacement = tokenize_length(tokenizer, str(self.processor.full_image_sequence))
+            placeholder = tokenize_length(tokenizer, str(self.processor.boi_token))
+            self._gemma3_image_expansion_delta_cache = replacement - placeholder
+            logging.info(
+                "Gemma3 image placeholder expansion delta measured: %s tokens per image",
+                self._gemma3_image_expansion_delta_cache,
+            )
+        return self._gemma3_image_expansion_delta_cache
+
+    def _apply_text_filler_replay(self, message, dataset=None):
+        """⟨V,T,F,T⟩: the ⟨V,T,T⟩ pipeline with a token-matched spaces block
+        inserted between the two text halves.
+
+        The Gemma chat template trims every text part and concatenates parts
+        without separators, so a standalone spaces item would be trimmed to
+        the empty string; the filler is therefore embedded inside a single
+        merged text item (first text half + F + second text half), which
+        renders identically to the ⟨V,T,T⟩ baseline plus F.
+        """
+        base = self._apply_replay_pipeline_mode(message, dataset=dataset, mode="image_text_text")
+        text_positions = [
+            idx
+            for idx, item in enumerate(base)
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if not text_positions or len(text_positions) % 2 != 0:
+            raise RuntimeError(
+                f"Gemma3 filler mode expected an even number of text items after "
+                f"image_text_text expansion, got {len(text_positions)}"
+            )
+        half = len(text_positions) // 2
+        first_text = "".join(str(base[idx]["value"]) for idx in text_positions[:half])
+        second_text = "".join(str(base[idx]["value"]) for idx in text_positions[half:])
+        image_items = [
+            item
+            for item in base
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        if not image_items:
+            raise RuntimeError("Gemma3 filler mode requires at least one image item")
+        per_image_core = self._gemma3_visual_core_tokens_per_image()
+        visual_core = per_image_core * len(image_items)
+        baseline_prompt = self._message_to_vllm_payload(base)["prompt"]
+        baseline_local_tokens = tokenize_length(self.processor.tokenizer, baseline_prompt)
+        text_positions_set = set(text_positions)
+        first_text_position = text_positions[0]
+
+        def build_merged_message(filler_value):
+            merged_value = first_text + filler_value + second_text
+            merged_item = None
+            out = []
+            for idx, item in enumerate(base):
+                if idx == first_text_position:
+                    merged_item = {"type": "text", "value": merged_value}
+                    out.append(merged_item)
+                elif idx in text_positions_set:
+                    continue
+                else:
+                    out.append(item)
+            return out
+
+        def count_fn(filler_value):
+            prompt = self._message_to_vllm_payload(build_merged_message(filler_value))["prompt"]
+            return count_filler_tokens(self.processor.tokenizer, prompt, baseline_prompt)
+
+        tag = f"Gemma3 dataset={dataset}"
+        spec = build_space_filler(count_fn, visual_core, tag=tag)
+        filler_value = SPACE_FILLER_LITERAL * int(spec["chars"])
+        filler_message = build_merged_message(filler_value)
+        meta = {
+            "dataset": str(dataset) if dataset is not None else None,
+            "mode": REPLAY_IMAGE_TEXT_FILLER_TEXT,
+            "image_count": len(image_items),
+            "per_image_core": per_image_core,
+            "visual_core_tokens": visual_core,
+            "filler_chars": int(spec["chars"]),
+            "filler_tokens_local": int(spec["tokens"]),
+            "baseline_local_tokens": baseline_local_tokens,
+            "chat_template": "gemma3-packaged",
+        }
+        for item in filler_message:
+            if isinstance(item, dict) and item.get("type") == "text":
+                item["text_filler_meta"] = dict(meta)
+                break
+        self._text_filler_audit.log_construction({**meta, "phase_detail": "constructed"})
+        return filler_message
+
+    def _audit_text_filler_engine_outputs(self, messages, outputs, dataset=None):
+        if not any(
+            isinstance(item, dict) and item.get("text_filler_meta")
+            for message in messages
+            for item in message
+        ):
+            return
+        config = self._gemma3_model_config_lazy()
+        image_token_id = int(getattr(config, "image_token_id", -1))
+        delta = self._gemma3_image_expansion_delta()
+        for message, output in zip(messages, outputs):
+            meta = next(
+                (
+                    item["text_filler_meta"]
+                    for item in message
+                    if isinstance(item, dict) and item.get("text_filler_meta")
+                ),
+                None,
+            )
+            if meta is None:
+                continue
+            ids = list(output.prompt_token_ids or [])
+            engine_len = len(ids)
+            image_token_count = sum(1 for token_id in ids if token_id == image_token_id)
+            predicted_len = (
+                int(meta["baseline_local_tokens"])
+                + int(meta["image_count"]) * delta
+                + int(meta["visual_core_tokens"])
+            )
+            filler_engine = engine_len - int(meta["baseline_local_tokens"]) - int(meta["image_count"]) * delta
+            record = {
+                **{k: v for k, v in meta.items() if k != "phase_detail"},
+                "engine_prompt_len": engine_len,
+                "engine_prompt_len_predicted": predicted_len,
+                "engine_image_token_count": image_token_count,
+                "filler_tokens_engine": filler_engine,
+            }
+            if engine_len != predicted_len:
+                raise RuntimeError(
+                    f"[text-filler] ENGINE AUDIT MISMATCH (Gemma3, dataset={dataset}): "
+                    f"engine prompt len {engine_len} != predicted {predicted_len} "
+                    f"(image expansion delta {delta}); record={record}"
+                )
+            if image_token_count != int(meta["visual_core_tokens"]):
+                raise RuntimeError(
+                    f"[text-filler] ENGINE AUDIT MISMATCH (Gemma3, dataset={dataset}): "
+                    f"engine image token count {image_token_count} != visual core "
+                    f"{meta['visual_core_tokens']}; record={record}"
+                )
+            self._text_filler_audit.log_engine(record)
 
     def _message_to_hf_messages(self, message):
         content = []
@@ -383,6 +580,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         sampling_params = self._build_sampling_params()
         requests = [self._message_to_vllm_payload(message) for message in messages]
         outputs = self.llm.generate(requests, sampling_params=sampling_params)
+        self._audit_text_filler_engine_outputs(messages, outputs, dataset=dataset)
         return [
             self._build_result(output.outputs[0].text if getattr(output, "outputs", None) else "", dataset=dataset)
             for output in outputs

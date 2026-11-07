@@ -12,6 +12,12 @@ REPLAY_IMAGE_TEXT_TEXT = "image_text_text"
 REPLAY_IMAGE_TEXT_IMAGE_TEXT = "image_text_image_text"
 REPLAY_IMAGE_TEXT_IMAGE = "image_text_image"
 REPLAY_IMAGE_IMAGE_TEXT = "image_image_text"
+# ⟨V,T,F,T⟩ generation-time text filler. The filler block F is model-aware
+# (its in-context token count is matched per sample to the image's core
+# visual token count), so this mode is canonicalized here but constructed
+# inside the model wrappers (see vlmeval/vlm/replay_text_filler.py);
+# apply_replay refuses it loudly instead of degrading to a no-op.
+REPLAY_IMAGE_TEXT_FILLER_TEXT = "image_text_filler_text"
 
 # Backward-compatible aliases.
 REPLAY_PROMPT = REPLAY_IMAGE_TEXT_TEXT
@@ -25,6 +31,7 @@ CANONICAL_REPLAY_MODES = {
     REPLAY_IMAGE_TEXT_IMAGE_TEXT,
     REPLAY_IMAGE_TEXT_IMAGE,
     REPLAY_IMAGE_IMAGE_TEXT,
+    REPLAY_IMAGE_TEXT_FILLER_TEXT,
 }
 SUPPORTED_REPLAY_MODES = CANONICAL_REPLAY_MODES | {REPLAY_NONE}
 
@@ -128,6 +135,12 @@ def _reorder_to_image_image_text_once(content: list[dict[str, Any]], image_copy_
 
 def apply_replay(content: list[dict[str, Any]], mode: str, repeat_times: int = 1, image_copy_mode: str = "reuse_path") -> list[dict[str, Any]]:
     mode = canonicalize_replay_mode(mode)
+    if mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
+        raise RuntimeError(
+            "image_text_filler_text requires model-aware filler construction "
+            "(in-context token matching against the sample's visual core "
+            "count); the wrappers intercept this mode before apply_replay"
+        )
     if is_noop_replay_mode(mode) or repeat_times <= 0:
         return content
 

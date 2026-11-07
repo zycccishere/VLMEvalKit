@@ -1,0 +1,91 @@
+# Runtime models config for the ICLR rebuttal text-filler experiment
+# (⟨V,T,F,T⟩ generation-time spaces block; run id family e5-spaces-*).
+#
+# Single combined minimal registry (VLMEVAL_USE_TEXT_FILLER_MINIMAL_CONFIG)
+# carries both Gemma3Replay and MiniCPM_V_4_5_Replay so one runner invocation
+# can schedule the mixed-model task grid on one 8xH100 node. The shared
+# `prompt-replay-vlmeval` venv (vllm 0.31.0+cu129, torch 2.13.0+cu129,
+# transformers 5.17.0) is used read-only via PYTHONPATH; no pip install.
+#
+# MiniCPM-o 4.5 runtime values below mirror configs/models.yaml on main
+# (infer_batch_size 64 / max_num_seqs 64 / tp 1 / max_model_len 32768);
+# the tuned values from the parallel blank-tier tuning will replace them in
+# the JobPack matrix/models config before the formal submission.
+env_profiles:
+  prompt_replay_vlmeval:
+    python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      VLMEVAL_USE_TEXT_FILLER_MINIMAL_CONFIG: '1'
+models:
+  minicpm_o_45:
+    display_name: MiniCPM-o-4_5
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/MiniCPM-o-4_5'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
+      MINICPM45_MAX_NEW_TOKENS: '16384'
+  minicpm_o_45_no_reasoning:
+    display_name: MiniCPM-o-4_5 no reasoning
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/MiniCPM-o-4_5'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
+      MINICPM45_MAX_NEW_TOKENS: '16384'
+      MINICPM45_REASONING_MODE: no_thinking
+  minicpm_o_45_regular_reasoning:
+    display_name: MiniCPM-o-4_5 regular reasoning
+    registry_name: MiniCPM-o-4_5-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/MiniCPM-o-4_5'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_MINICPMO45: '{model_root}/MiniCPM-o-4_5'
+      MINICPM45_MAX_NEW_TOKENS: '16384'
+      MINICPM45_REASONING_MODE: regular_cot
+  gemma3_12b:
+    display_name: Gemma3-12B-it
+    registry_name: Gemma3-12B-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/gemma-3-12b-it'
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 64
+      max_num_seqs: 64
+      tp_size: 1
+      max_model_len: 32768
+      estimated_dataset_cost: 1.8
+    task_env:
+      MODEL_PATH_GEMMA3_12B: '{model_root}/gemma-3-12b-it'
+      GEMMA3_MAX_NEW_TOKENS: '4096'

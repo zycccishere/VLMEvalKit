@@ -18,6 +18,7 @@ def _minimal_runtime_registry_enabled():
         'VLMEVAL_USE_API_REPLAY_MINIMAL_CONFIG',
         'VLMEVAL_USE_MINICPM45_MINIMAL_CONFIG',
         'VLMEVAL_USE_GEMMA3_MINIMAL_CONFIG',
+        'VLMEVAL_USE_TEXT_FILLER_MINIMAL_CONFIG',
     )
     truthy = {'1', 'true', 'yes', 'on'}
     return any(str(os.environ.get(flag, '0')).strip().lower() in truthy for flag in flags)

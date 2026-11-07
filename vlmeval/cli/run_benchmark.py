@@ -875,6 +875,10 @@ class BenchmarkRunner:
                 raise FileNotFoundError(f"blank image asset not found: {blank_asset}")
             env["REPLAY_BLANK_IMAGE_POSITIONS"] = "2"
             env["REPLAY_BLANK_IMAGE_PATH"] = str(blank_asset)
+        if task.mode == "image_text_filler_text":
+            env["REPLAY_TEXT_FILLER_AUDIT_FILE"] = str(
+                self.task_root(task) / "_filler_audit" / "audit.jsonl"
+            )
         max_num_seqs = self.max_num_seqs_for_task(model, task)
         env["MINICPM45_VLLM_TP_SIZE"] = str(model.tp_size)
         env["MINICPM45_VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
