@@ -2,6 +2,8 @@ import warnings
 
 from .babyvision import BabyVision
 from .charxiv import CharXiv
+from .erqa import ERQADataset
+from .erqabench import ERQABench, ERQASingleImage
 from .image_base import img_root_map, ImageBaseDataset
 from .image_caption import ImageCaptionDataset
 from .image_yorn import ImageYORNDataset
@@ -124,7 +126,7 @@ IMAGE_DATASET = [
     MMMUDataset, MMMUSingleImageDataset, OCRBench, MathVista, MathVistaSample, MathVistaHalf, LLaVABench, MMVet,
     MTVQADataset, TableVQABench, HallucinationBench, LogicVista, MMLongBench, VCRDataset, MMDUDataset, DUDE,
     SlideVQA, MUIRDataset, GMAIMMBenchDataset, MMERealWorld, HRBenchDataset, VisuLogic, VisualPuzzles, WeMath,
-    BabyVision, CharXiv
+    BabyVision, CharXiv, ERQADataset, ERQABench, ERQASingleImage
 ]
 
 VIDEO_DATASET = [
