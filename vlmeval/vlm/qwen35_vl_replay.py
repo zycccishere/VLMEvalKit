@@ -75,6 +75,7 @@ def resolve_qwen35_generation_profile(
     thinking_top_k: int = 20,
     repetition_penalty: float = 1.0,
     presence_penalty: float = 1.5,
+    thinking_presence_penalty: float = 0.0,
 ) -> dict[str, int | float | bool]:
     # Explicit per-entry thinking control (Qwen3.8 / Qwen3.5-MoE replay
     # entries). `thinking='on'` keeps thinking enabled for every dataset and
@@ -82,6 +83,15 @@ def resolve_qwen35_generation_profile(
     # registry entry; `thinking='off'` uses the model-card non-thinking
     # parameters (identical for Qwen3.8-27B and Qwen3.5-35B-A3B). Empty or
     # 'auto' keeps the historical dataset/policy-dependent behavior.
+    #
+    # presence_penalty keeps its historical 1.5 default for the legacy
+    # branches below. The thinking branch uses its own
+    # thinking_presence_penalty, whose 0.0 default follows the Qwen3.8-27B
+    # model card's thinking-mode recommendation (presence_penalty=0.0;
+    # 1.5 is the card's non-thinking value). Qwen3.5-35B-A3B's card
+    # recommends 1.5 for thinking as well, so its registry entry passes
+    # 1.5 explicitly; both think entries therefore run with their own
+    # card values.
     mode = str(thinking_mode or '').strip().lower()
     if mode == 'on':
         return {
@@ -91,7 +101,7 @@ def resolve_qwen35_generation_profile(
             'top_k': thinking_top_k,
             'min_p': 0.0,
             'repetition_penalty': repetition_penalty,
-            'presence_penalty': presence_penalty,
+            'presence_penalty': thinking_presence_penalty,
             'max_new_tokens': max_new_tokens,
         }
     if mode == 'off':
@@ -470,6 +480,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             thinking_top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
             presence_penalty=self.presence_penalty,
+            thinking_presence_penalty=self.presence_penalty,
         )
 
     def _build_transformers_generate_kwargs(self, dataset: str | None = None):
