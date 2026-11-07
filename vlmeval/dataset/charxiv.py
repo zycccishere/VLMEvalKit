@@ -1,14 +1,15 @@
-import os
 import json
-from typing import Dict, List, Tuple, Any, Union
-import pandas as pd
+import os
 import warnings
+from typing import Any, Dict, List, Tuple, Union
 
-from vlmeval.dataset.image_base import ImageBaseDataset
-from vlmeval.smp import misc, file
-from vlmeval.smp.file import get_intermediate_file_path
+import pandas as pd
+
 from vlmeval import utils
+from vlmeval.dataset.image_base import ImageBaseDataset
 from vlmeval.dataset.utils import build_judge
+from vlmeval.smp import file, misc
+from vlmeval.smp.file import get_intermediate_file_path
 
 
 def auxeval(judge_model: Any, line: pd.Series, **kwargs: Any) -> Dict[str, Any]:
@@ -102,6 +103,8 @@ def qid2category(mode: str) -> Tuple[Dict[int, str], str]:
 
 
 class CharXiv(ImageBaseDataset):
+    DEFAULT_JUDGE_MODEL = 'gpt-4o-mini'
+
     TYPE = "VQA"
     DATASET_URL = {
         "CharXiv_descriptive_val": "https://opencompass.openxlab.space/utils/VLMEval/CharXiv_descriptive_val.tsv",
@@ -193,7 +196,7 @@ class CharXiv(ImageBaseDataset):
         if "LOCAL_LLM" in os.environ:
             judge_model = os.path.basename(os.environ.get("LOCAL_LLM"))
         else:
-            judge_model = judge_kwargs.pop("model", "gpt-4o-mini")
+            judge_model = judge_kwargs.pop("model", self.DEFAULT_JUDGE_MODEL)
 
         if judge_model != "gpt-4o-mini":
             warnings.warn(
