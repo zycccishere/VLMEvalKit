@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import torch
@@ -47,6 +49,18 @@ def _env_optional_int(*names: str) -> int | None:
             return int(raw)
         except Exception:
             continue
+    return None
+
+
+def _env_optional_float(*names: str) -> float | None:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return float(raw)
+        except ValueError:
+            logging.warning("Ignoring invalid float env %s=%r", name, raw)
     return None
 
 
@@ -136,7 +150,14 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
         self.model_path = model_path
         self.system_prompt = system_prompt
         self.use_vllm = use_vllm if use_vllm is not None else _env_bool("GEMMA4_USE_VLLM", True)
-        self.gpu_utils = float(kwargs.pop("gpu_utils", gpu_utils))
+        env_gpu_utils = _env_optional_float("GEMMA4_VLLM_GPU_MEMORY_UTILIZATION", "VLLM_GPU_MEMORY_UTILIZATION")
+        self.gpu_utils = float(
+            kwargs.pop("gpu_utils", env_gpu_utils if env_gpu_utils is not None else gpu_utils)
+        )
+        self.vllm_max_num_batched_tokens = _env_optional_int(
+            "GEMMA4_VLLM_MAX_NUM_BATCHED_TOKENS",
+            "VLLM_MAX_NUM_BATCHED_TOKENS",
+        )
         self.max_new_tokens = int(
             kwargs.pop("max_new_tokens", _env_int("GEMMA4_MAX_NEW_TOKENS", max_new_tokens))
         )
@@ -197,6 +218,8 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
                     "reasoning_start_str": "<|channel>",
                     "reasoning_end_str": "<channel|>",
                 }
+            if self.vllm_max_num_batched_tokens:
+                llm_kwargs["max_num_batched_tokens"] = int(self.vllm_max_num_batched_tokens)
             self.llm = LLM(
                 model=self.model_path,
                 trust_remote_code=True,
@@ -209,12 +232,17 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
                 **llm_kwargs,
             )
             logging.info(
-                "Using vLLM for Gemma4 %s with tp=%s max_model_len=%s max_num_seqs=%s skip_special_tokens=%s thinking_budget=%s",
+                "Using vLLM for Gemma4 %s with tp=%s max_model_len=%s max_num_seqs=%s "
+                "max_num_batched_tokens=%s gpu_memory_utilization=%s skip_special_tokens=%s "
+                "thinking=%s thinking_budget=%s",
                 self.model_path,
                 tp_size,
                 self.vllm_max_model_len,
                 self.vllm_max_num_seqs,
+                self.vllm_max_num_batched_tokens,
+                self.gpu_utils,
                 self.vllm_skip_special_tokens,
+                self.enable_thinking,
                 self.vllm_thinking_token_budget,
             )
         else:
@@ -224,6 +252,24 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
         self.replay_cfg = read_replay_config_from_env()
         self.prompt_template_cfg = read_prompt_template_config_from_env()
         self.template_on_last_replay_text = _env_bool("REPLAY_TEMPLATE_ON_LAST_REPLAY_TEXT", True)
+
+        # Prompt audit / stage debug switches, shared with Qwen2VLChatReplay and
+        # Qwen35VLChatReplay (see vlmeval/vlm/qwen2_vl/model.py): REPLAY_STAGE_DEBUG,
+        # REPLAY_STAGE_DEBUG_SAMPLES, REPLAY_PROMPT_AUDIT, REPLAY_PROMPT_AUDIT_PRINT,
+        # REPLAY_DUMP_DIR, REPLAY_DUMP_MAX_CHARS. Disabled by default.
+        self._stage_debug_enabled = _env_bool("REPLAY_STAGE_DEBUG", False)
+        self._stage_debug_max_samples = _env_int("REPLAY_STAGE_DEBUG_SAMPLES", 3)
+        self._stage_debug_seen_samples = 0
+        self._prompt_audit_enabled = _env_bool("REPLAY_PROMPT_AUDIT", False)
+        self._prompt_audit_print = _env_bool("REPLAY_PROMPT_AUDIT_PRINT", False)
+        self._replay_dump_dir = os.environ.get("REPLAY_DUMP_DIR", "").strip()
+        self._replay_dump_file = None
+        self._replay_dump_max_chars = _env_int("REPLAY_DUMP_MAX_CHARS", 0)
+        self._image_token_id_cache = None
+        if self._replay_dump_dir:
+            os.makedirs(self._replay_dump_dir, exist_ok=True)
+            self._replay_dump_file = os.path.join(self._replay_dump_dir, f"{self.__class__.__name__}.jsonl")
+            print(f"[replay-dump] enabled. Writing to {self._replay_dump_file}", flush=True)
 
     def _resolve_vllm_tp_size(self, explicit_tp_size: int | None = None) -> int:
         gpu_count = max(1, torch.cuda.device_count())
@@ -237,6 +283,116 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
         if tp_size is None:
             tp_size = 1
         return max(1, min(int(tp_size), gpu_count))
+
+    # ------------------------------------------------------------------
+    # Prompt audit / stage debug (reuses the shared REPLAY_* switches).
+    # ------------------------------------------------------------------
+    def _audit_enabled(self) -> bool:
+        return self._stage_debug_enabled or self._prompt_audit_enabled
+
+    def _begin_audit_sample(self) -> bool:
+        if self._audit_enabled() and self._stage_debug_seen_samples < self._stage_debug_max_samples:
+            self._stage_debug_seen_samples += 1
+            return True
+        return False
+
+    def _clip_text(self, text: str) -> str:
+        if not isinstance(text, str):
+            text = str(text)
+        max_chars = self._replay_dump_max_chars
+        if max_chars > 0 and len(text) > max_chars:
+            return text[:max_chars] + f"\n...[TRUNCATED {len(text) - max_chars} chars]"
+        return text
+
+    def _write_replay_dump(self, record: dict) -> None:
+        if not self._replay_dump_file:
+            return
+        payload = {"ts": time.time(), "model_class": self.__class__.__name__}
+        payload.update(record)
+        with open(self._replay_dump_file, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _resolve_image_token_id(self) -> int | None:
+        if self._image_token_id_cache is not None:
+            return self._image_token_id_cache
+        image_token_id = None
+        try:
+            image_token = getattr(self.processor, "image_token", "<|image|>")
+            tokenizer = getattr(self.processor, "tokenizer", None)
+            if tokenizer is not None and image_token:
+                converted = tokenizer.convert_tokens_to_ids(str(image_token))
+                if isinstance(converted, int) and converted >= 0:
+                    image_token_id = converted
+        except Exception as err:
+            logging.debug("Gemma4 image token id resolution failed: %s: %s", type(err).__name__, err)
+        self._image_token_id_cache = image_token_id
+        return image_token_id
+
+    def _audit_prompt(
+        self,
+        *,
+        dataset: str | None,
+        source_message: list[dict[str, Any]] | None,
+        replayed_message: list[dict[str, Any]] | None,
+        prompt: str | None,
+        input_ids: list[int] | None,
+    ) -> None:
+        """Emit one prompt-audit record for a rendered Gemma4 prompt.
+
+        Counting rules:
+        - ``image_placeholder_count``: occurrences of the ``<|image|>`` marker in the
+          rendered prompt string (one per image copy fed to the model).
+        - ``image_soft_tokens`` / ``prompt_total_tokens``: from engine-side
+          ``prompt_token_ids`` when available, else from processor ``input_ids``.
+          The processor expands each ``<|image|>`` to the per-image soft-token
+          budget (default 280 for Gemma-4-E4B), so SLP must show exactly 2x the
+          baseline image token count.
+        - ``user_turn_marker_count``: occurrences of ``<|turn>user`` — the chat
+          template must be applied exactly once.
+        """
+        from .replay_policy import count_modalities
+
+        record: dict[str, Any] = {
+            "phase": "gemma4_prompt_audit",
+            "dataset": dataset,
+            "replay_mode": canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text")),
+            "enable_thinking": bool(self.enable_thinking),
+            "sampling": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "repetition_penalty": self.repetition_penalty,
+                "max_new_tokens": self.max_new_tokens,
+            },
+        }
+        if source_message is not None:
+            record["source_modal_counts"] = count_modalities(source_message)
+        if replayed_message is not None:
+            record["replayed_modal_counts"] = count_modalities(replayed_message)
+        if prompt is not None:
+            record["prompt_chars"] = len(prompt)
+            record["image_placeholder_count"] = prompt.count("<|image|>")
+            record["user_turn_marker_count"] = prompt.count("<|turn>user")
+            record["thinking_marker_present"] = "<|think|>" in prompt
+            record["prompt_preview"] = self._clip_text(prompt)
+        if input_ids is not None:
+            ids = list(input_ids)
+            record["prompt_total_tokens"] = len(ids)
+            image_token_id = self._resolve_image_token_id()
+            if image_token_id is not None:
+                record["image_soft_tokens"] = sum(1 for token in ids if token == image_token_id)
+
+        info = dict(record)
+        info.pop("prompt_preview", None)
+        try:
+            print("[STAGE_DEBUG] " + json.dumps(info, ensure_ascii=False), flush=True)
+        except Exception:
+            print(f"[STAGE_DEBUG] phase=gemma4_prompt_audit model={self.__class__.__name__}", flush=True)
+        if self._prompt_audit_enabled or self._stage_debug_enabled:
+            self._write_replay_dump(record)
+            if self._prompt_audit_print:
+                print("[PROMPT_AUDIT] " + json.dumps(info, ensure_ascii=False), flush=True)
+
 
     def _apply_prompt_template_to_message(self, message, dataset=None):
         template_text = self.prompt_template_cfg.get("template", "{problem}")
@@ -386,21 +542,36 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
 
     def _strip_reasoning_tags(self, text: str) -> str:
         cleaned = str(text)
+        # Block-level removal must run before the prefix-only fallbacks below,
+        # otherwise the opening tag is stripped and the block pattern no longer
+        # matches (which would leak reasoning text into the final answer).
+        # Aligned with upstream Gemma4 extract_response_for_eval (open-compass
+        # VLMEvalKit commit 8044745b): Gemma-4 emits
+        # <|channel>thought\n ... <channel|> and may wrap the answer in
+        # <|channel>final\n ... <channel|>.
+        cleaned = re.sub(r"(?is)<\|channel\>\s*thought\s*\n.*?<channel\|>", "", cleaned, count=1)
+        final_match = re.search(r"(?is)<\|channel\>\s*final\s*\n(?P<answer>.*?)(?:<channel\|>|$)", cleaned)
+        if final_match:
+            cleaned = final_match.group("answer")
+        cleaned = re.sub(r"(?is)<think>\s*.*?\s*</think>\s*", "", cleaned, count=1)
+        # Fallbacks for partial / legacy markers.
         cleaned = re.sub(r"(?is)^<\|channel\>\s*thought\s*", "", cleaned, count=1)
         cleaned = re.sub(r"(?is)^<\|channel\>\s*response\s*", "", cleaned, count=1)
-        cleaned = cleaned.replace("<channel|>", "")
         cleaned = re.sub(
             r"(?is)<\|?channel\|?>thought\s*<\|?channel\|?>.*?(?:<\|?channel\|?>response\s*<\|?channel\|?>)?",
             "",
             cleaned,
             count=1,
         )
-        cleaned = re.sub(r"(?is)<think>\s*.*?\s*</think>\s*", "", cleaned, count=1)
+        cleaned = cleaned.replace("<channel|>", "")
         cleaned = cleaned.replace("<|channel|>response<|channel|>", "")
         cleaned = cleaned.replace("<|channel>response", "")
         cleaned = cleaned.replace("<|channel>thought", "")
+        cleaned = cleaned.replace("<|channel>final", "")
+        cleaned = cleaned.replace("<|think|>", "")
         cleaned = cleaned.replace("<end_of_turn>", "")
         cleaned = cleaned.replace("<start_of_turn>model", "")
+        cleaned = cleaned.replace("<turn|>", "")
         return cleaned.strip()
 
     def _parse_vllm_reasoning_output(self, text: str) -> tuple[str, str] | None:
@@ -433,10 +604,22 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
         if vllm_parsed is not None:
             return vllm_parsed
         if hasattr(self.processor, "parse_response"):
+            # In transformers 5.17.0 ProcessorMixin exposes a generic
+            # parse_response that delegates to tokenizer.parse_response, which
+            # raises AttributeError for Gemma4 (no response_template). Treat an
+            # unusable parse_response as absent and fall back to the vLLM
+            # gemma4_utils result plus _strip_reasoning_tags below.
+            parsed = None
             try:
                 parsed = self.processor.parse_response(raw, return_response_as_dict=True)
             except TypeError:
-                parsed = self.processor.parse_response(raw)
+                try:
+                    parsed = self.processor.parse_response(raw)
+                except Exception as err:
+                    logging.warning(
+                        "Gemma4 processor.parse_response failed: %s: %s", type(err).__name__, err
+                    )
+                    parsed = None
             except Exception as err:
                 logging.warning("Gemma4 processor.parse_response failed: %s: %s", type(err).__name__, err)
                 parsed = None
@@ -488,6 +671,23 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
     def _generate_inner_transformers(self, message, dataset=None):
         inputs = self._build_transformers_inputs(message)
         input_len = inputs["input_ids"].shape[-1]
+        if self._begin_audit_sample():
+            try:
+                rendered = self._apply_chat_template(
+                    self._message_to_hf_messages(message),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                rendered = None
+            input_ids = inputs["input_ids"][0].tolist() if inputs["input_ids"].dim() > 1 else inputs["input_ids"].tolist()
+            self._audit_prompt(
+                dataset=dataset,
+                source_message=None,
+                replayed_message=message,
+                prompt=rendered,
+                input_ids=input_ids,
+            )
         generate_kwargs = dict(
             max_new_tokens=self.max_new_tokens,
             do_sample=self.temperature > 0,
@@ -503,10 +703,22 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
         decoded = self.processor.decode(generation, skip_special_tokens=True)
         return self._build_result(decoded, dataset=dataset)
 
-    def _generate_batch_inner_vllm(self, messages, dataset=None):
+    def _generate_batch_inner_vllm(self, messages, dataset=None, source_messages=None):
         sampling_params = self._build_sampling_params()
         requests = [self._message_to_vllm_payload(message) for message in messages]
         outputs = self.llm.generate(requests, sampling_params=sampling_params)
+        if self._audit_enabled():
+            for idx, output in enumerate(outputs):
+                if not self._begin_audit_sample():
+                    break
+                engine_ids = getattr(output, "prompt_token_ids", None)
+                self._audit_prompt(
+                    dataset=dataset,
+                    source_message=source_messages[idx] if source_messages else None,
+                    replayed_message=messages[idx],
+                    prompt=requests[idx].get("prompt"),
+                    input_ids=engine_ids,
+                )
         return [
             self._build_result(output.outputs[0].text if getattr(output, "outputs", None) else "", dataset=dataset)
             for output in outputs
@@ -522,7 +734,7 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
             tag=self.__class__.__name__,
         )
         if self.use_vllm:
-            return self._generate_batch_inner_vllm([replayed], dataset=dataset)[0]
+            return self._generate_batch_inner_vllm([replayed], dataset=dataset, source_messages=[message])[0]
         return self._generate_inner_transformers(replayed, dataset=dataset)
 
     def generate_batch_inner(self, messages, dataset=None):
@@ -531,5 +743,5 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
             for message in messages
         ]
         if self.use_vllm:
-            return self._generate_batch_inner_vllm(replayed_messages, dataset=dataset)
+            return self._generate_batch_inner_vllm(replayed_messages, dataset=dataset, source_messages=messages)
         return [self._generate_inner_transformers(message, dataset=dataset) for message in replayed_messages]
