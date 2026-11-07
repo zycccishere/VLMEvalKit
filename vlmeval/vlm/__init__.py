@@ -23,8 +23,8 @@ else:
     from .emu import Emu
     from .idefics import IDEFICS, IDEFICS2
     from .instructblip import InstructBLIP
-    from .llava import LLaVA, LLaVA_Replay, LLaVA_HF, LLaVA_HF_Replay, LLaVA_Next, LLaVA_XTuner, LLaVA_Next2, LLaVA_OneVision
-    from .minicpm_v import MiniCPM_V, MiniCPM_Llama3_V, MiniCPM_V_2_6, MiniCPM_V_2_6_Replay
+    from .llava import LLaVA, LLaVA_Next, LLaVA_XTuner, LLaVA_Next2, LLaVA_OneVision
+    from .minicpm_v import MiniCPM_V, MiniCPM_Llama3_V, MiniCPM_V_2_6
     from .minicpm_v_4_5_replay import MiniCPM_V_4_5, MiniCPM_V_4_5_Replay
     from .minigpt4 import MiniGPT4
     from .mmalaya import MMAlaya, MMAlaya2
