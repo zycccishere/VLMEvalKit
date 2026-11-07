@@ -1,0 +1,72 @@
+# Runtime models for the Qwen3.8-27B / Qwen3.5-35B-A3B replay adaptation on the
+# 2026-11 development machine (8x H100, driver CUDA 12.9). The shared
+# `prompt-replay-vlmeval` uv venv is used by all parallel replay agents; each
+# worktree injects its own code through `pythonpath: ['{repo_root}']`.
+# max_model_len 40960 covers SLP prompts (~2x image+question tokens) plus the
+# card-recommended 32768-token output budget without truncating generation.
+env_profiles:
+  prompt_replay_vlmeval:
+    python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      # Route run.py's supported_VLM to the Qwen-family minimal registry,
+      # which carries the Qwen3.8-27B / Qwen3.5-35B-A3B replay entries.
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: '1'
+models:
+  qwen38_27b:
+    display_name: Qwen3.8-27B
+    registry_name: Qwen3.8-27B-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: /cloud/oss_checkpoints/Qwen3/Qwen3.8-27B
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 40960
+      estimated_dataset_cost: 1.0
+  qwen38_27b_think:
+    display_name: Qwen3.8-27B (thinking)
+    registry_name: Qwen3.8-27B-Think-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: /cloud/oss_checkpoints/Qwen3/Qwen3.8-27B
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 40960
+      estimated_dataset_cost: 1.0
+  qwen35moe_35b:
+    display_name: Qwen3.5-35B-A3B
+    registry_name: Qwen3.5-35B-A3B-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/Qwen3.5-35B-A3B'
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 40960
+      estimated_dataset_cost: 1.0
+  qwen35moe_35b_think:
+    display_name: Qwen3.5-35B-A3B (thinking)
+    registry_name: Qwen3.5-35B-A3B-Think-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: '{model_root}/Qwen3.5-35B-A3B'
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 16
+      max_num_seqs: 16
+      tp_size: 2
+      max_model_len: 40960
+      estimated_dataset_cost: 1.0
