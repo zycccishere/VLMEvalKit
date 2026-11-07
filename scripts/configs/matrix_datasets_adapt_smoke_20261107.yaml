@@ -1,9 +1,11 @@
 # Smoke for newly adapted single-image datasets (BabyVision, ERQA_SINGLE,
-# RealWorldQA, CharXiv_reasoning_val) on Gemma4-E4B-it-Replay, GPU 7 only.
+# RealWorldQA, CharXiv_reasoning_val) on Qwen2.5-VL-3B-Instruct-Replay, GPU 7 only.
+# Model fallback: Gemma4-E4B-it-Replay is unreachable on main (full registry only;
+# see the note in models_prompt_replay_smoke.yaml and the config commit message).
 # ~12 samples per dataset via dataset_index_allowlists; both replay modes.
 name: datasets_adapt_smoke_20261107
 repo_root: "{repo_root}"
-results_root: /data/local/yicheng/temporary/scratch/prompt-replay/datasets-adapt/runs/smoke_datasets_adapt_20261107
+results_root: /data/local/yicheng/temporary/scratch/prompt-replay/datasets-adapt/runs/smoke2_datasets_adapt_20261107
 node_gpu_ids: "7"
 datasets:
   - BabyVision
@@ -22,7 +24,7 @@ replay_modes:
   - image_text
   - image_text_image_text
 models:
-  - gemma4_e4b
+  - qwen25vl_3b
 replay:
   replay_times: 1
   template_on_last_replay_text: 1
