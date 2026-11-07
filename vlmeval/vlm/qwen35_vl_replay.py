@@ -35,6 +35,18 @@ QWEN35_GENERAL_DATASETS = {"AI2D_TEST", "OCRBench", "SEEDBench2_Plus"}
 # Qwen3.8-27B / Qwen3.5-35B-A3B).
 QWEN35_THINKING_MODES = {'', 'auto', 'on', 'off'}
 
+# Non-thinking decoding presets for the explicit thinking='off' profile
+# (rebuttal run, 2026-11-07; final choice pending user decision):
+# - 'vendor' (historical default): model-card non-thinking sampling
+#   temperature=0.7 / top_p=0.8 / top_k=20 / presence_penalty=1.5;
+# - 'greedy': temperature=0.0 while KEEPING the vendor presence_penalty=1.5
+#   (Qwen3.8 README:505 recommends presence_penalty=1.5 to reduce endless
+#   repetition; vLLM 0.31 applies penalties to the logits before the greedy
+#   argmax, vllm/v1/sample/sampler.py:404 -> :296-301, so the penalty stays
+#   meaningful at temperature=0). top_p/top_k keep the vendor values: they are
+#   argmax-invariant, so they cannot change the greedy token.
+QWEN35_NONTHINK_SAMPLING_PRESETS = {'vendor', 'greedy'}
+
 _THINK_BLOCK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
 
 
@@ -76,6 +88,7 @@ def resolve_qwen35_generation_profile(
     repetition_penalty: float = 1.0,
     presence_penalty: float = 1.5,
     thinking_presence_penalty: float = 0.0,
+    nonthink_sampling: str = 'vendor',
 ) -> dict[str, int | float | bool]:
     # Explicit per-entry thinking control (Qwen3.8 / Qwen3.5-MoE replay
     # entries). `thinking='on'` keeps thinking enabled for every dataset and
@@ -92,7 +105,18 @@ def resolve_qwen35_generation_profile(
     # recommends 1.5 for thinking as well, so its registry entry passes
     # 1.5 explicitly; both think entries therefore run with their own
     # card values.
+    #
+    # nonthink_sampling selects the decoding preset for the explicit
+    # thinking='off' branch only ('vendor' historical default, 'greedy' for
+    # the rebuttal G option); the legacy branches below keep their historical
+    # values regardless of this switch.
     mode = str(thinking_mode or '').strip().lower()
+    nonthink_preset = str(nonthink_sampling or '').strip().lower() or 'vendor'
+    if nonthink_preset not in QWEN35_NONTHINK_SAMPLING_PRESETS:
+        raise ValueError(
+            f'Invalid nonthink_sampling={nonthink_sampling!r}; '
+            f'expected one of {sorted(QWEN35_NONTHINK_SAMPLING_PRESETS)}'
+        )
     if mode == 'on':
         return {
             'enable_thinking': True,
@@ -107,7 +131,7 @@ def resolve_qwen35_generation_profile(
     if mode == 'off':
         return {
             'enable_thinking': False,
-            'temperature': 0.7,
+            'temperature': 0.0 if nonthink_preset == 'greedy' else 0.7,
             'top_p': 0.8,
             'top_k': 20,
             'min_p': 0.0,
@@ -296,6 +320,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 1.5,
         thinking: str | None = None,
+        nonthink_sampling: str | None = None,
         use_custom_prompt: bool = False,
         system_prompt: str | None = None,
         post_process: bool = False,
@@ -320,6 +345,25 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             )
         if self.thinking in {'on', 'off'}:
             print(f'[Qwen35VLChatReplay] explicit thinking mode: {self.thinking}', flush=True)
+        # Non-thinking decoding preset (G=greedy vs S=vendor sampling, see
+        # QWEN35_NONTHINK_SAMPLING_PRESETS above). Constructor arg wins over
+        # the QWEN35_NONTHINK_SAMPLING env var; unset means the historical
+        # 'vendor' default, so every existing entry behaves unchanged.
+        self.nonthink_sampling = (
+            str(nonthink_sampling).strip().lower()
+            if nonthink_sampling is not None
+            else os.environ.get('QWEN35_NONTHINK_SAMPLING', '').strip().lower()
+        ) or 'vendor'
+        if self.nonthink_sampling not in QWEN35_NONTHINK_SAMPLING_PRESETS:
+            raise ValueError(
+                f'Invalid nonthink_sampling={self.nonthink_sampling!r}; '
+                f'expected one of {sorted(QWEN35_NONTHINK_SAMPLING_PRESETS)}'
+            )
+        if self.thinking == 'off':
+            print(
+                f'[Qwen35VLChatReplay] non-thinking sampling preset: {self.nonthink_sampling}',
+                flush=True,
+            )
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
@@ -481,6 +525,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             repetition_penalty=self.repetition_penalty,
             presence_penalty=self.presence_penalty,
             thinking_presence_penalty=self.presence_penalty,
+            nonthink_sampling=self.nonthink_sampling,
         )
 
     def _build_transformers_generate_kwargs(self, dataset: str | None = None):

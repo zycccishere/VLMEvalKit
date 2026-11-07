@@ -300,6 +300,9 @@ models:
       GEMMA4_MAX_NEW_TOKENS: '4096'
       GEMMA4_ENABLE_THINKING: '0'
       GEMMA4_VLLM_GPU_MEMORY_UTILIZATION: '0.9'
+      # User decision 2026-11-07: rebuttal runs decode Gemma-4 non-thinking
+      # greedily (paper protocol; k=1). Wrapper default remains 'official'.
+      GEMMA4_SAMPLING_PRESET: 'greedy'
   gpt_4o_mini:
     display_name: gpt-4o-mini
     registry_name: gpt-4o-mini

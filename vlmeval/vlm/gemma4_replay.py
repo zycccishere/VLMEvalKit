@@ -165,6 +165,32 @@ class Gemma4Replay(Qwen3VLPromptMixin, BaseModel):
         self.top_p = float(kwargs.pop("top_p", top_p))
         self.top_k = int(kwargs.pop("top_k", top_k))
         self.repetition_penalty = float(kwargs.pop("repetition_penalty", repetition_penalty))
+        # Decoding preset switch (user decision 2026-11-07): the rebuttal runs
+        # Gemma-4 non-thinking with greedy decoding to match the paper protocol
+        # (Gemma-3 temp=0.0, Qwen2.5-VL temp=0.0). The default stays
+        # 'official' (temp 1.0 / top_p 0.95 / top_k 64 -- the card's
+        # generation_config.json recommendation), so every entry that does not
+        # opt in keeps its historical sampling behavior. Under temperature=0
+        # vLLM takes the greedy argmax of the (penalized) logits
+        # (vllm/v1/sample/sampler.py:296-301) and top_p/top_k are
+        # argmax-invariant, so only the temperature is overridden. The HF path
+        # follows automatically via do_sample=self.temperature > 0.
+        self.sampling_preset = str(
+            kwargs.pop("sampling_preset", None)
+            or os.environ.get("GEMMA4_SAMPLING_PRESET", "")
+            or "official"
+        ).strip().lower()
+        if self.sampling_preset not in {"official", "greedy"}:
+            raise ValueError(
+                f"Invalid sampling_preset={self.sampling_preset!r}; expected 'official' or 'greedy'"
+            )
+        if self.sampling_preset == "greedy":
+            self.temperature = 0.0
+        print(
+            f"[Gemma4Replay] sampling preset: {self.sampling_preset} "
+            f"(temperature={self.temperature}, top_p={self.top_p}, top_k={self.top_k})",
+            flush=True,
+        )
         self.enable_thinking = (
             enable_thinking
             if enable_thinking is not None
