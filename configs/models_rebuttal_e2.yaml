@@ -1,0 +1,88 @@
+# Runtime models for the ICLR rebuttal E2 platform runs (2026-11-07), on the
+# dev/new-model-runs integration branch. One file serves both JobPacks:
+#   - e2-qwen35moe-gemma4 (node 2): qwen35moe_35b (3x TP2 replicas via gpu_pool)
+#     + gemma4_e4b (2x TP1 replicas) over 8 GPUs.
+#   - e2-qwen38 (node 3): qwen38_27b over 8 GPUs (TP by dev measurement).
+# Runtime blocks carry the dev-measured concurrency (GPUs 1-4/7, 2026-11-07
+# evening sweep; see rebuttal-runs journal). Decoding:
+#   - Gemma-4: greedy, DECIDED (GEMMA4_SAMPLING_PRESET=greedy, k=1).
+#   - Qwen non-thinking: G (greedy, temp 0 + vendor presence 1.5, k=1) vs
+#     S (vendor 0.7/0.8/20/1.5, k=3) PENDING the user decision. The switch is
+#     the single QWEN35_NONTHINK_SAMPLING line below (greedy -> remove for
+#     vendor). It currently holds greedy = main's recommendation.
+env_profiles:
+  qwen_replay_vlmeval:
+    python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      VLMEVAL_USE_QWEN_MINIMAL_CONFIG: '1'
+      QWEN35_NONTHINK_SAMPLING: 'greedy'
+  gemma4_replay_vlmeval:
+    python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HOME: /data/local/yicheng/temporary/scratch/prompt-replay/hf-cache
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_USE_GEMMA4_MINIMAL_CONFIG: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      GEMMA4_USE_VLLM: '1'
+models:
+  qwen38_27b:
+    display_name: Qwen3.8-27B
+    registry_name: Qwen3.8-27B-Replay
+    env_profile: qwen_replay_vlmeval
+    model_path: /cloud/oss_checkpoints/Qwen3/Qwen3.8-27B
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 128
+      max_num_seqs: 128
+      tp_size: 2
+      max_model_len: 40960
+      estimated_dataset_cost: 1.0
+  qwen35moe_35b:
+    display_name: Qwen3.5-35B-A3B
+    registry_name: Qwen3.5-35B-A3B-Replay
+    env_profile: qwen_replay_vlmeval
+    model_path: '{model_root}/Qwen3.5-35B-A3B'
+    runtime:
+      gpus_per_job: 2
+      infer_batch_size: 256
+      max_num_seqs: 256
+      tp_size: 2
+      max_model_len: 40960
+      estimated_dataset_cost: 1.0
+  gemma4_e4b:
+    display_name: Gemma4-E4B-it
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: gemma4_replay_vlmeval
+    model_path: /cloud/oss_checkpoints/google/gemma-4-E4B-it
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 256
+      max_num_seqs: 256
+      tp_size: 1
+      max_model_len: 8192
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_GEMMA4_E4B: /cloud/oss_checkpoints/google/gemma-4-E4B-it
+      GEMMA4_MAX_NEW_TOKENS: '4096'
+      GEMMA4_ENABLE_THINKING: '0'
+      GEMMA4_VLLM_GPU_MEMORY_UTILIZATION: '0.9'
+      GEMMA4_SAMPLING_PRESET: 'greedy'
