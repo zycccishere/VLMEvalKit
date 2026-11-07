@@ -7,12 +7,18 @@
 # `prompt-replay-vlmeval` venv (vllm 0.31.0+cu129, torch 2.13.0+cu129,
 # transformers 5.17.0) is used read-only via PYTHONPATH; no pip install.
 #
-# MiniCPM-o 4.5 runtime: gmu 0.9 / max_model_len 32768 / max_images 4 / tp 1
-# adopted from the blank-tier runtime contract
-# (e4-blank-tiers/minicpmo_runtime.json, same checkpoint+stack for
-# comparability). max_num_seqs / infer_batch_size stay at 64 (main's
-# models.yaml default) until main confirms the blank-tier mns: their sweep
-# never saturated the scheduler (running_max 49/86/124 vs mns 64/128/256).
+# MiniCPM-o 4.5 runtime per main's confirmed contract (2026-11-07, matching
+# node 1's ⟨V,T,T⟩ for comparability): max_num_seqs/infer_batch_size 256,
+# gmu 0.9, TP1, max_model_len 32768, max_images 4 (task_env). mns=256
+# validated at sustained load by the blank-tier agent (1024-sample MathVision
+# blank3 + long-CoT: running_max=129, waiting_max=104, preempt=0, OOM=0,
+# KV 39.17 GiB; full-window steady rate 1.165 samples/s).
+#
+# Gemma-3-12B: mns/infer_batch_size 128, gmu 0.9 (constructor default), TP1.
+# Chosen within measurement noise on a 256-sample sweep (109 s vs 141 s gen
+# window at mns 128/256 is inside the stated +/-20%), NOT
+# saturation-validated; the node is tail-limited by MiniCPM MathVision, so
+# this setting barely moves the makespan (main accepted it on that basis).
 env_profiles:
   prompt_replay_vlmeval:
     python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
@@ -36,8 +42,8 @@ models:
     model_path: '{model_root}/MiniCPM-o-4_5'
     runtime:
       gpus_per_job: 1
-      infer_batch_size: 64
-      max_num_seqs: 64
+      infer_batch_size: 256
+      max_num_seqs: 256
       tp_size: 1
       max_model_len: 32768
       estimated_dataset_cost: 1.2
@@ -53,8 +59,8 @@ models:
     model_path: '{model_root}/MiniCPM-o-4_5'
     runtime:
       gpus_per_job: 1
-      infer_batch_size: 64
-      max_num_seqs: 64
+      infer_batch_size: 256
+      max_num_seqs: 256
       tp_size: 1
       max_model_len: 32768
       estimated_dataset_cost: 1.2
@@ -71,8 +77,8 @@ models:
     model_path: '{model_root}/MiniCPM-o-4_5'
     runtime:
       gpus_per_job: 1
-      infer_batch_size: 64
-      max_num_seqs: 64
+      infer_batch_size: 256
+      max_num_seqs: 256
       tp_size: 1
       max_model_len: 32768
       estimated_dataset_cost: 1.2
@@ -89,8 +95,8 @@ models:
     model_path: '{model_root}/gemma-3-12b-it'
     runtime:
       gpus_per_job: 1
-      infer_batch_size: 64
-      max_num_seqs: 64
+      infer_batch_size: 128
+      max_num_seqs: 128
       tp_size: 1
       max_model_len: 32768
       estimated_dataset_cost: 1.8
