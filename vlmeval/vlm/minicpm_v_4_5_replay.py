@@ -742,6 +742,11 @@ class MiniCPM_V_4_5(BaseModel):
         chat_template_kwargs = {}
         if enable_thinking is not None:
             chat_template_kwargs["enable_thinking"] = bool(enable_thinking)
+        print(
+            f"[MiniCPM_V_4_5] dataset={dataset} vLLM SamplingParams: {sampling_params} "
+            f"chat_template_kwargs={chat_template_kwargs or None}",
+            flush=True,
+        )
         return sampling_params, chat_template_kwargs or None
 
     def _normalize_official_output(self, text):
