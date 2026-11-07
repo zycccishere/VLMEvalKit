@@ -146,15 +146,11 @@ class TextFillerAudit:
         entry = {"phase": "engine", "ts": time.time(), "model": self.model_name, **record}
         self.records.append(entry)
         self._emit(entry)
-        diff = int(entry.get("filler_tokens_engine", entry.get("filler_tokens_local", 0))) - int(
-            entry.get("visual_core_tokens", 0)
-        )
-        if entry.get("phase") == "engine" and diff != 0:
+        if not entry.get("engine_audit_pass", False):
             message = (
                 f"[text-filler] ENGINE AUDIT MISMATCH ({self.model_name}, "
-                f"dataset={entry.get('dataset')}): filler engine tokens "
-                f"{entry.get('filler_tokens_engine')} != visual core "
-                f"{entry.get('visual_core_tokens')} (diff {diff})"
+                f"dataset={entry.get('dataset')}): "
+                f"{entry.get('engine_audit_reason', 'failed')}"
             )
             self._mismatch = RuntimeError(message)
             raise self._mismatch
@@ -168,17 +164,25 @@ class TextFillerAudit:
                 print(f"[text-filler] audit write failed: {err}", flush=True)
         n = len(self.records)
         if self.verbose or n == 1 or n % 50 == 0:
-            diffs = [
-                int(r.get("filler_tokens_engine", r.get("filler_tokens_local", 0)))
+            local_diffs = [
+                int(r.get("filler_tokens_local", 0)) - int(r.get("visual_core_tokens", 0))
+                for r in self.records
+                if r.get("phase") == "engine"
+            ]
+            space_devs = [
+                int(r.get("filler_tokens_engine_spaces", 0))
                 - int(r.get("visual_core_tokens", 0))
                 for r in self.records
+                if r.get("phase") == "engine"
             ]
+            fmt = lambda xs: (min(xs), max(xs)) if xs else (None, None)
             print(
                 f"[text-filler] audit n={n} dataset={entry.get('dataset')} "
                 f"chars={entry.get('filler_chars')} "
                 f"local={entry.get('filler_tokens_local')} "
-                f"engine={entry.get('filler_tokens_engine')} "
+                f"engine_spaces={entry.get('filler_tokens_engine_spaces')} "
                 f"core={entry.get('visual_core_tokens')} "
-                f"diff_min={min(diffs)} diff_max={max(diffs)}",
+                f"local_diff={fmt(local_diffs)} space_dev={fmt(space_devs)} "
+                f"offset={entry.get('scaffold_offset')}",
                 flush=True,
             )

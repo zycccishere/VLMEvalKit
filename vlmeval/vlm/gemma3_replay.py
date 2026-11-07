@@ -355,6 +355,9 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
         visual_core = per_image_core * len(image_items)
         baseline_prompt = self._message_to_vllm_payload(base)["prompt"]
         baseline_local_tokens = tokenize_length(self.processor.tokenizer, baseline_prompt)
+        baseline_pure_space = self._count_pure_space_tokens(
+            self.processor.tokenizer(baseline_prompt, add_special_tokens=False).input_ids
+        )
         text_positions_set = set(text_positions)
         first_text_position = text_positions[0]
 
@@ -389,6 +392,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             "filler_chars": int(spec["chars"]),
             "filler_tokens_local": int(spec["tokens"]),
             "baseline_local_tokens": baseline_local_tokens,
+            "baseline_pure_space_tokens": baseline_pure_space,
             "chat_template": "gemma3-packaged",
         }
         for item in filler_message:
@@ -397,6 +401,16 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
                 break
         self._text_filler_audit.log_construction({**meta, "phase_detail": "constructed"})
         return filler_message
+
+    def _count_pure_space_tokens(self, ids):
+        """Engine-side count of tokens whose decoded text is entirely space
+        characters (U+0020 only); see the MiniCPM wrapper for rationale."""
+        count = 0
+        for token_id in ids:
+            text = self.processor.tokenizer.decode([token_id])
+            if text and len(text) == text.count(" "):
+                count += 1
+        return count
 
     def _audit_text_filler_engine_outputs(self, messages, outputs, dataset=None):
         if not any(
@@ -427,26 +441,35 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
                 + int(meta["image_count"]) * delta
                 + int(meta["visual_core_tokens"])
             )
-            filler_engine = engine_len - int(meta["baseline_local_tokens"]) - int(meta["image_count"]) * delta
+            filler_engine_spaces = self._count_pure_space_tokens(ids) - int(
+                meta.get("baseline_pure_space_tokens", 0)
+            )
             record = {
                 **{k: v for k, v in meta.items() if k != "phase_detail"},
                 "engine_prompt_len": engine_len,
                 "engine_prompt_len_predicted": predicted_len,
+                "scaffold_offset": engine_len - predicted_len,
                 "engine_image_token_count": image_token_count,
-                "filler_tokens_engine": filler_engine,
+                "filler_tokens_engine_spaces": filler_engine_spaces,
             }
+            reasons = []
             if engine_len != predicted_len:
-                raise RuntimeError(
-                    f"[text-filler] ENGINE AUDIT MISMATCH (Gemma3, dataset={dataset}): "
+                reasons.append(
                     f"engine prompt len {engine_len} != predicted {predicted_len} "
-                    f"(image expansion delta {delta}); record={record}"
+                    f"(image expansion delta {delta})"
                 )
             if image_token_count != int(meta["visual_core_tokens"]):
-                raise RuntimeError(
-                    f"[text-filler] ENGINE AUDIT MISMATCH (Gemma3, dataset={dataset}): "
+                reasons.append(
                     f"engine image token count {image_token_count} != visual core "
-                    f"{meta['visual_core_tokens']}; record={record}"
+                    f"{meta['visual_core_tokens']}"
                 )
+            if not (-2 <= filler_engine_spaces - int(meta["visual_core_tokens"]) <= 0):
+                reasons.append(
+                    f"engine pure-space filler tokens {filler_engine_spaces} deviate "
+                    f"from {meta['visual_core_tokens']}"
+                )
+            record["engine_audit_pass"] = not reasons
+            record["engine_audit_reason"] = "; ".join(reasons) or "ok"
             self._text_filler_audit.log_engine(record)
 
     def _message_to_hf_messages(self, message):

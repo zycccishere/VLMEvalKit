@@ -879,6 +879,9 @@ class BenchmarkRunner:
             env["REPLAY_TEXT_FILLER_AUDIT_FILE"] = str(
                 self.task_root(task) / "_filler_audit" / "audit.jsonl"
             )
+            env["REPLAY_TEXT_FILLER_DEBUG_DIR"] = str(
+                self.task_root(task) / "_filler_audit" / "debug"
+            )
         max_num_seqs = self.max_num_seqs_for_task(model, task)
         env["MINICPM45_VLLM_TP_SIZE"] = str(model.tp_size)
         env["MINICPM45_VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
