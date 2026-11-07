@@ -1,0 +1,52 @@
+# Smoke: reasoning set (LogicVista), inference + answer-format checks only.
+# LogicVista scoring requires an LLM judge (gpt-4o-mini style extraction); this
+# machine has no OPENAI_* credentials, so eval is skipped and the judge path is
+# explicitly left unverified.
+name: qwen3835moe_smoke_reasoning
+results_root: runs/qwen3835moe_smoke_reasoning_20261107
+node_gpu_ids: "1,2,3,4"
+datasets:
+  - LogicVista
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text
+  - image_text_image_text
+models:
+  - qwen38_27b
+  - qwen38_27b_think
+  - qwen35moe_35b
+  - qwen35moe_35b_think
+dataset_index_allowlists:
+  LogicVista: configs/index_allowlists/qwen3835moe_smoke_logicvista_20261107.txt
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  stage_debug: 1
+  stage_debug_samples: 8
+  prompt_audit: 1
+  prompt_audit_print: 1
+  strict_batch: 1
+answer_format:
+  enable: 1
+  require_boxed: 0
+  response_col: prediction
+  fallback_col: detailed_prediction
+  max_fails: 50
+evaluation:
+  launch_mode: skip
+  nproc: 4
+  judge: exact_matching
+trace:
+  level: summary
+  samples: 4
+  dump_max_chars: 2000
+worker_monitor:
+  enable: true
+  interval_seconds: 600
+resume_infer_default: false

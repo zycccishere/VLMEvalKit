@@ -34,6 +34,9 @@ model_path_qwen2 = os.getenv('MODEL_PATH_QWEN2') or f'{model_root}/Qwen2-VL-7B-I
 model_path_qwen35_4b = os.getenv('MODEL_PATH_QWEN35_4B') or f'{model_root}/Qwen3.5-4B'
 model_path_qwen35_9b = os.getenv('MODEL_PATH_QWEN35_9B') or f'{model_root}/Qwen3.5-9B'
 model_path_qwen35_27b = os.getenv('MODEL_PATH_QWEN35_27B') or f'{model_root}/Qwen3.5-27B'
+model_path_qwen35_moe_35b = os.getenv('MODEL_PATH_QWEN35MOE_35B') or f'{model_root}/Qwen3.5-35B-A3B'
+# Qwen3.8-27B ships on shared read-only storage; reference it in place.
+model_path_qwen38_27b = os.getenv('MODEL_PATH_QWEN38_27B') or '/cloud/oss_checkpoints/Qwen3/Qwen3.8-27B'
 model_path_gemma3_4b = os.getenv('MODEL_PATH_GEMMA3_4B') or f'{model_root}/gemma-3-4b-it'
 model_path_gemma3_12b = os.getenv('MODEL_PATH_GEMMA3_12B') or f'{model_root}/gemma-3-12b-it'
 model_path_gemma3_27b = os.getenv('MODEL_PATH_GEMMA3_27B') or f'{model_root}/gemma-3-27b-it'
@@ -663,6 +666,72 @@ qwen2vl_series = {
         model_path=model_path_qwen35_27b,
         use_custom_prompt=False,
         use_vllm=True,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        presence_penalty=1.5,
+        repetition_penalty=1.0,
+        max_new_tokens=32768,
+    ),
+    # Qwen3.8-27B and Qwen3.5-35B-A3B replay entries with explicit thinking
+    # control. `-Replay` disables thinking via the chat template and uses the
+    # shared non-thinking sampling profile (temperature=0.7, top_p=0.8,
+    # top_k=20, presence_penalty=1.5); `-Think-Replay` keeps thinking on and
+    # takes the thinking sampling parameters from the constructor arguments
+    # below, which follow each model card:
+    # - Qwen3.8-27B thinking: temperature=1.0, top_p=0.95, top_k=20,
+    #   presence_penalty=0.0, repetition_penalty=1.0 (model card "Best
+    #   Practices", /cloud/oss_checkpoints/Qwen3/Qwen3.8-27B/README.md).
+    # - Qwen3.5-35B-A3B thinking (general tasks): temperature=1.0,
+    #   top_p=0.95, top_k=20, presence_penalty=1.5, repetition_penalty=1.0
+    #   (HF model card "Best Practices").
+    # The existing Qwen3.5-4B/9B/27B entries keep `thinking` unset and
+    # therefore their historical dataset/policy-dependent behavior.
+    "Qwen3.8-27B-Replay": partial(
+        Qwen35VLChatReplay,
+        model_path=model_path_qwen38_27b,
+        use_custom_prompt=False,
+        use_vllm=True,
+        thinking='off',
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        max_new_tokens=32768,
+    ),
+    "Qwen3.8-27B-Think-Replay": partial(
+        Qwen35VLChatReplay,
+        model_path=model_path_qwen38_27b,
+        use_custom_prompt=False,
+        use_vllm=True,
+        thinking='on',
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        max_new_tokens=32768,
+    ),
+    "Qwen3.5-35B-A3B-Replay": partial(
+        Qwen35VLChatReplay,
+        model_path=model_path_qwen35_moe_35b,
+        use_custom_prompt=False,
+        use_vllm=True,
+        thinking='off',
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        presence_penalty=1.5,
+        repetition_penalty=1.0,
+        max_new_tokens=32768,
+    ),
+    "Qwen3.5-35B-A3B-Think-Replay": partial(
+        Qwen35VLChatReplay,
+        model_path=model_path_qwen35_moe_35b,
+        use_custom_prompt=False,
+        use_vllm=True,
+        thinking='on',
         temperature=1.0,
         top_p=0.95,
         top_k=20,

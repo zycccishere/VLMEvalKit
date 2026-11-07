@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import warnings
 
@@ -27,6 +28,37 @@ from ..smp import get_gpu_memory, listinstr
 VLLM_MAX_IMAGE_INPUT_NUM = 24
 QWEN35_GENERAL_DATASETS = {"AI2D_TEST", "OCRBench", "SEEDBench2_Plus"}
 
+# Explicit thinking control for the Qwen3.5/Qwen3.8 chat template. The template
+# keeps thinking on when `enable_thinking` is undefined, pre-fills an empty
+# `<think>\n\n</think>\n\n` block when it is False, and pre-fills the opening
+# `<think>\n` in the prompt when it is True (see chat_template.jinja of
+# Qwen3.8-27B / Qwen3.5-35B-A3B).
+QWEN35_THINKING_MODES = {'', 'auto', 'on', 'off'}
+
+_THINK_BLOCK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
+
+
+def strip_qwen_thinking(text: str) -> str:
+    """Drop Qwen thinking content so only the final answer remains.
+
+    With `enable_thinking=True` the chat template pre-fills `<think>\\n` in the
+    prompt, so the raw generation is `reasoning...\\n</think>\\n\\nanswer` and the
+    answer is everything after the last `</think>`. A generation that hit the
+    token cap inside thinking has no `</think>` at all and yields no answer.
+    The complete-block form is also handled defensively (e.g. omni variants
+    that emit the opening tag themselves).
+    """
+    if not isinstance(text, str):
+        return text
+    if '</think>' in text:
+        return text.rsplit('</think>', 1)[1].strip()
+    if '<think>' in text:
+        stripped = _THINK_BLOCK_RE.sub('', text)
+        if '<think>' in stripped:
+            stripped = stripped.split('<think>')[0]
+        return stripped.strip()
+    return text
+
 
 def qwen35_is_general_dataset(dataset: str | None) -> bool:
     return (dataset or "").strip() in QWEN35_GENERAL_DATASETS
@@ -36,6 +68,7 @@ def resolve_qwen35_generation_profile(
     dataset: str | None,
     *,
     force_no_thinking: bool = False,
+    thinking_mode: str | None = None,
     max_new_tokens: int = 32768,
     thinking_temperature: float = 1.0,
     thinking_top_p: float = 0.95,
@@ -43,6 +76,35 @@ def resolve_qwen35_generation_profile(
     repetition_penalty: float = 1.0,
     presence_penalty: float = 1.5,
 ) -> dict[str, int | float | bool]:
+    # Explicit per-entry thinking control (Qwen3.8 / Qwen3.5-MoE replay
+    # entries). `thinking='on'` keeps thinking enabled for every dataset and
+    # policy with the model-card thinking sampling parameters supplied by the
+    # registry entry; `thinking='off'` uses the model-card non-thinking
+    # parameters (identical for Qwen3.8-27B and Qwen3.5-35B-A3B). Empty or
+    # 'auto' keeps the historical dataset/policy-dependent behavior.
+    mode = str(thinking_mode or '').strip().lower()
+    if mode == 'on':
+        return {
+            'enable_thinking': True,
+            'temperature': thinking_temperature,
+            'top_p': thinking_top_p,
+            'top_k': thinking_top_k,
+            'min_p': 0.0,
+            'repetition_penalty': repetition_penalty,
+            'presence_penalty': presence_penalty,
+            'max_new_tokens': max_new_tokens,
+        }
+    if mode == 'off':
+        return {
+            'enable_thinking': False,
+            'temperature': 0.7,
+            'top_p': 0.8,
+            'top_k': 20,
+            'min_p': 0.0,
+            'repetition_penalty': 1.0,
+            'presence_penalty': 1.5,
+            'max_new_tokens': max_new_tokens,
+        }
     if force_no_thinking:
         return {
             'enable_thinking': False,
@@ -223,6 +285,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         temperature: float = 1.0,
         repetition_penalty: float = 1.0,
         presence_penalty: float = 1.5,
+        thinking: str | None = None,
         use_custom_prompt: bool = False,
         system_prompt: str | None = None,
         post_process: bool = False,
@@ -240,6 +303,13 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         self.repetition_penalty = repetition_penalty
         self.presence_penalty = presence_penalty
         self.temperature = temperature
+        self.thinking = str(thinking or '').strip().lower()
+        if self.thinking not in QWEN35_THINKING_MODES:
+            raise ValueError(
+                f'Invalid thinking={thinking!r}; expected one of {sorted(QWEN35_THINKING_MODES)}'
+            )
+        if self.thinking in {'on', 'off'}:
+            print(f'[Qwen35VLChatReplay] explicit thinking mode: {self.thinking}', flush=True)
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
@@ -287,6 +357,14 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
                 os.environ.get('QWEN35_VLLM_MAX_NUM_SEQS', '').strip()
                 or os.environ.get('VLLM_MAX_NUM_SEQS', '').strip()
             )
+            env_gpu_util = (
+                os.environ.get('QWEN35_VLLM_GPU_UTIL', '').strip()
+                or os.environ.get('VLLM_GPU_UTIL', '').strip()
+            )
+            env_max_num_batched_tokens = (
+                os.environ.get('QWEN35_VLLM_MAX_NUM_BATCHED_TOKENS', '').strip()
+                or os.environ.get('VLLM_MAX_NUM_BATCHED_TOKENS', '').strip()
+            )
             tp_size = resolve_vllm_tp_size(
                 self.model_path,
                 gpu_count,
@@ -296,6 +374,20 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             if max_model_len is None:
                 max_model_len = int(env_max_model_len) if env_max_model_len.isdigit() else 32768
             max_num_seqs = int(env_max_num_seqs) if env_max_num_seqs.isdigit() else 2
+            gpu_utils = kwargs.get('gpu_utils', 0.9)
+            if env_gpu_util:
+                try:
+                    gpu_utils = float(env_gpu_util)
+                except ValueError:
+                    logging.warning(f'Ignoring invalid QWEN35_VLLM_GPU_UTIL={env_gpu_util!r}')
+            llm_kwargs = {}
+            if env_max_num_batched_tokens:
+                if env_max_num_batched_tokens.isdigit():
+                    llm_kwargs['max_num_batched_tokens'] = int(env_max_num_batched_tokens)
+                else:
+                    logging.warning(
+                        f'Ignoring invalid QWEN35_VLLM_MAX_NUM_BATCHED_TOKENS={env_max_num_batched_tokens!r}'
+                    )
             env_enforce_eager = (
                 os.environ.get('QWEN35_VLLM_ENFORCE_EAGER', '').strip().lower()
                 or os.environ.get('VLLM_ENFORCE_EAGER', '').strip().lower()
@@ -314,10 +406,11 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
                     limit_mm_per_prompt=limit_mm,
                     tensor_parallel_size=tp_size,
                     enable_expert_parallel=enable_expert_parallel,
-                    gpu_memory_utilization=kwargs.get('gpu_utils', 0.9),
+                    gpu_memory_utilization=gpu_utils,
                     trust_remote_code=True,
                     enforce_eager=enforce_eager,
                     seed=0,
+                    **llm_kwargs,
                 )
             except Exception as err:
                 print(f'[Qwen35VLChatReplay] vLLM init failed, fallback to transformers: {type(err).__name__}: {err}', flush=True)
@@ -370,6 +463,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         return resolve_qwen35_generation_profile(
             dataset,
             force_no_thinking=self._prefer_direct_answer_mode(),
+            thinking_mode=self.thinking,
             max_new_tokens=self.max_new_tokens,
             thinking_temperature=self.temperature,
             thinking_top_p=self.top_p,
@@ -569,6 +663,28 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         return self._apply_template_replay_pipeline(content, dataset=dataset)
 
     def _post_process_response(self, response: str) -> str:
+        # Entries with explicit thinking control strip model-emitted thinking
+        # content before scoring. This is not limited to thinking='on': with
+        # thinking='off' the chat template pre-fills an empty think block, but
+        # Qwen3.8/Qwen3.5 occasionally open a new implicit thinking block
+        # anyway (observed on LogicVista); `</think>` then unambiguously
+        # separates reasoning from the final answer. Legacy entries (thinking
+        # unset) keep the historical behavior unchanged.
+        if self.thinking in {'on', 'off'} and isinstance(response, str):
+            raw_response = response
+            response = strip_qwen_thinking(response)
+            audit_info = {
+                'thinking_mode': self.thinking,
+                'raw_chars': len(raw_response),
+                'answer_chars': len(response),
+                'raw_has_think_close': '</think>' in raw_response,
+                'raw_has_think_open': '<think>' in raw_response,
+                'raw_preview': self._clip_text(raw_response),
+                'answer_preview': self._clip_text(response),
+            }
+            self._stage_debug('response_thinking_stripped', audit_info)
+            if self._prompt_audit_enabled:
+                self._write_replay_dump({'phase': 'response_thinking_stripped', **audit_info})
         if self.post_process:
             resp = response.split('\boxed{')[-1]
             lt = len(resp)
@@ -730,10 +846,35 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             return output.outputs[0].text
         return ''
 
+    def _audit_vllm_outputs(self, outputs, dataset: str | None = None) -> None:
+        """Record per-request finish reasons and token counts for the replay
+        prompt audit (REPLAY_PROMPT_AUDIT + REPLAY_DUMP_DIR), so length-cap
+        truncations inside thinking are visible without reading raw dumps."""
+        if not self._prompt_audit_enabled:
+            return
+        try:
+            stats = []
+            for output in outputs:
+                for comp in getattr(output, 'outputs', []) or []:
+                    token_ids = getattr(comp, 'token_ids', None)
+                    stats.append({
+                        'finish_reason': getattr(comp, 'finish_reason', None),
+                        'stop_reason': str(getattr(comp, 'stop_reason', None)),
+                        'generated_tokens': len(token_ids) if token_ids is not None else None,
+                    })
+            self._write_replay_dump({
+                'phase': 'vllm_generation_stats',
+                'dataset': str(dataset) if dataset is not None else None,
+                'requests': stats,
+            })
+        except Exception as err:
+            logging.warning(f'vllm generation audit failed: {type(err).__name__}: {err}')
+
     def _generate_inner_vllm_once(self, message, dataset=None):
         sampling_params = self._build_vllm_sampling_params(dataset)
         req = self._build_vllm_request(message, dataset=dataset)
         outputs = self.llm.generate([req], sampling_params=sampling_params)
+        self._audit_vllm_outputs(outputs, dataset=dataset)
         generated_text = self._extract_vllm_output_text(outputs[0])
         return self._post_process_response(generated_text)
 
@@ -741,6 +882,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         sampling_params = self._build_vllm_sampling_params()
         reqs = [self._build_vllm_request(message, dataset=dataset) for message in messages]
         outputs = self.llm.generate(reqs, sampling_params=sampling_params)
+        self._audit_vllm_outputs(outputs, dataset=dataset)
         return [self._post_process_response(self._extract_vllm_output_text(output)) for output in outputs]
 
     def _run_with_replay_cfg(self, message, dataset, *, replay_mode: str, repeat_times: int) -> str:
