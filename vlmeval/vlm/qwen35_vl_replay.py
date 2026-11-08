@@ -35,6 +35,13 @@ QWEN35_GENERAL_DATASETS = {"AI2D_TEST", "OCRBench", "SEEDBench2_Plus"}
 # Qwen3.8-27B / Qwen3.5-35B-A3B).
 QWEN35_THINKING_MODES = {'', 'auto', 'on', 'off'}
 
+# Official reasoning-effort levels of the Qwen3.8/Qwen3.5 chat template
+# (Qwen3.8-27B README: "official support for reasoning_effort ... xhigh
+# (default), medium, low"; the template itself hard-errors on other values).
+# Empty string means "leave the template default" (xhigh), so existing entries
+# behave unchanged. Only read when thinking is on; ignored otherwise.
+QWEN35_REASONING_EFFORTS = {'', 'low', 'medium', 'xhigh'}
+
 # Non-thinking decoding presets for the explicit thinking='off' profile
 # (rebuttal run, 2026-11-07; final choice pending user decision):
 # - 'vendor' (historical default): model-card non-thinking sampling
@@ -89,7 +96,8 @@ def resolve_qwen35_generation_profile(
     presence_penalty: float = 1.5,
     thinking_presence_penalty: float = 0.0,
     nonthink_sampling: str = 'vendor',
-) -> dict[str, int | float | bool]:
+    reasoning_effort: str | None = None,
+) -> dict[str, int | float | bool | None]:
     # Explicit per-entry thinking control (Qwen3.8 / Qwen3.5-MoE replay
     # entries). `thinking='on'` keeps thinking enabled for every dataset and
     # policy with the model-card thinking sampling parameters supplied by the
@@ -111,6 +119,13 @@ def resolve_qwen35_generation_profile(
     # the rebuttal G option); the legacy branches below keep their historical
     # values regardless of this switch.
     mode = str(thinking_mode or '').strip().lower()
+    effort = str(reasoning_effort or '').strip().lower()
+    if effort not in QWEN35_REASONING_EFFORTS:
+        raise ValueError(
+            f'Invalid reasoning_effort={reasoning_effort!r}; '
+            f'expected one of {sorted(QWEN35_REASONING_EFFORTS)} '
+            f'(empty = template default xhigh)'
+        )
     nonthink_preset = str(nonthink_sampling or '').strip().lower() or 'vendor'
     if nonthink_preset not in QWEN35_NONTHINK_SAMPLING_PRESETS:
         raise ValueError(
@@ -120,6 +135,7 @@ def resolve_qwen35_generation_profile(
     if mode == 'on':
         return {
             'enable_thinking': True,
+            'reasoning_effort': effort or None,
             'temperature': thinking_temperature,
             'top_p': thinking_top_p,
             'top_k': thinking_top_k,
@@ -364,6 +380,23 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
                 f'[Qwen35VLChatReplay] non-thinking sampling preset: {self.nonthink_sampling}',
                 flush=True,
             )
+        # Official reasoning_effort knob (Qwen3.8-27B / Qwen3.5-35B-A3B chat
+        # template; README: xhigh default / medium / low). Env-driven so model
+        # entries select the tier via task_env without multiplying registry
+        # partials; validated here so a typo hard-fails instead of silently
+        # running the template default. Only forwarded when thinking is on.
+        self.reasoning_effort = os.environ.get('QWEN35_REASONING_EFFORT', '').strip().lower()
+        if self.reasoning_effort not in QWEN35_REASONING_EFFORTS:
+            raise ValueError(
+                f'Invalid QWEN35_REASONING_EFFORT={self.reasoning_effort!r}; '
+                f'expected one of {sorted(QWEN35_REASONING_EFFORTS)} '
+                f'(empty = template default xhigh)'
+            )
+        if self.thinking == 'on' and self.reasoning_effort:
+            print(
+                f'[Qwen35VLChatReplay] reasoning_effort: {self.reasoning_effort}',
+                flush=True,
+            )
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
@@ -526,6 +559,7 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             presence_penalty=self.presence_penalty,
             thinking_presence_penalty=self.presence_penalty,
             nonthink_sampling=self.nonthink_sampling,
+            reasoning_effort=self.reasoning_effort,
         )
 
     def _build_transformers_generate_kwargs(self, dataset: str | None = None):
@@ -542,6 +576,15 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
     def _apply_chat_template(self, messages, dataset: str | None = None, **kwargs):
         profile = self._resolve_generation_profile(dataset)
         if profile['enable_thinking']:
+            effort = profile.get('reasoning_effort')
+            if effort:
+                # The Qwen3.8/Qwen3.5 chat template accepts reasoning_effort
+                # natively (verified against chat_template.jinja); if a
+                # processor rejected it, the TypeError fallback in
+                # apply_chat_template_think would silently drop it, so the
+                # banner print above + prompt audit are the run-side evidence
+                # that the tier actually took effect.
+                kwargs.setdefault('reasoning_effort', effort)
             return apply_chat_template_think(self.processor, messages, **kwargs)
         return apply_chat_template_nothink(self.processor, messages, **kwargs)
 
