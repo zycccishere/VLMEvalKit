@@ -16,6 +16,7 @@ from transformers import StoppingCriteria
 from ..base import BaseModel
 from .prompt import Qwen2VLPromptMixin
 from ..replay_policy import (
+    REPLAY_IMAGE_TEXT_FILLER_TEXT,
     apply_replay,
     canonicalize_replay_mode,
     is_noop_replay_mode,
@@ -26,6 +27,15 @@ from ..replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
     image_rgb_sha256,
+)
+from ..replay_text_filler import (
+    SPACE_FILLER_LITERAL,
+    TextFillerAudit,
+    build_text_filler,
+    count_filler_tokens,
+    filler_literal_for,
+    read_text_filler_type,
+    tokenize_length,
 )
 from .replay_prompt_template import (
     apply_prompt_template_to_content,
@@ -1360,6 +1370,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             f"safe_fallback_truncate_chars={self.safe_fallback_truncate_chars}",
             flush=True,
         )
+        self._text_filler_audit = TextFillerAudit(self.__class__.__name__)
         self.image_transform_name = canonicalize_image_transform(os.environ.get("REPLAY_IMAGE_TRANSFORM", "baseline"))
         self.image_transform_cache_dir = os.environ.get("REPLAY_IMAGE_TRANSFORM_CACHE_DIR", "").strip()
         self.image_transform_target_position = max(
@@ -1428,24 +1439,30 @@ class Qwen2VLChatReplay(Qwen2VLChat):
                 )
         return templated
 
-    def _apply_replay_to_content(self, content: list[dict[str, str]]) -> list[dict[str, str]]:
+    def _apply_replay_to_content(
+        self,
+        content: list[dict[str, str]],
+        replay_mode: str | None = None,
+    ) -> list[dict[str, str]]:
+        if replay_mode is None:
+            replay_mode = self.replay_cfg["mode"]
         replayed = apply_replay(
             content,
-            mode=self.replay_cfg["mode"],
+            mode=replay_mode,
             repeat_times=self.replay_cfg["repeat_times"],
             image_copy_mode=self.replay_cfg["image_copy_mode"],
         )
         self._stage_debug(
             "replay_before_after",
             {
-                "replay_mode": self.replay_cfg["mode"],
+                "replay_mode": replay_mode,
                 "before_preview": str(content)[:1200],
                 "after_preview": str(replayed)[:1200],
             },
         )
         maybe_debug_print_replay(
             enabled=self.replay_cfg["debug"],
-            mode=self.replay_cfg["mode"],
+            mode=replay_mode,
             before=content,
             after=replayed,
             tag=self.__class__.__name__,
@@ -1457,12 +1474,24 @@ class Qwen2VLChatReplay(Qwen2VLChat):
         content: list[dict[str, str]],
         dataset: str | None = None,
     ) -> list[dict[str, str]]:
+        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+        if replay_mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
+            return self._apply_text_filler_replay(content, dataset=dataset)
+        return self._apply_template_replay_pipeline_mode(content, dataset=dataset, mode=replay_mode)
+
+    def _apply_template_replay_pipeline_mode(
+        self,
+        content: list[dict[str, str]],
+        dataset: str | None = None,
+        mode: str | None = None,
+    ) -> list[dict[str, str]]:
         # Default behavior: template first, then replay (legacy behavior).
         # Optional behavior: if replay is enabled and this flag is on,
         # replay first and template only the last text of replayed content.
+        if mode is None:
+            mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
         use_last_replay_text = getattr(self, "template_on_last_replay_text", False)
-        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
-        if use_last_replay_text and not is_noop_replay_mode(replay_mode):
+        if use_last_replay_text and not is_noop_replay_mode(mode):
             replay_source = content
             if self.prompt_template_cfg.get("name") == "directly_answer":
                 replay_source = strip_prompt_template_from_content_for_direct_answer(
@@ -1470,11 +1499,182 @@ class Qwen2VLChatReplay(Qwen2VLChat):
                     dataset=dataset,
                     text_key="text",
                 )
-            replayed = self._apply_replay_to_content(replay_source)
+            replayed = self._apply_replay_to_content(replay_source, replay_mode=mode)
             return self._apply_prompt_template_to_content(replayed, dataset=dataset)
 
         templated = self._apply_prompt_template_to_content(content, dataset=dataset)
-        return self._apply_replay_to_content(templated)
+        return self._apply_replay_to_content(templated, replay_mode=mode)
+
+    def _render_filler_payload_prompt(self, content: list[dict[str, str]]) -> str:
+        """Chat-template prompt string for ``content``, mirroring the exact
+        rendering ``_build_vllm_request`` feeds to ``llm.generate`` so the
+        filler's in-context token count is measured on the real payload
+        prompt (image parts render as constant ``<|image_pad|>`` scaffolds,
+        independent of the filler text)."""
+        messages = []
+        if self.system_prompt is not None:
+            messages.append({'role': 'system', 'content': self.system_prompt})
+        messages.append({'role': 'user', 'content': content})
+        return self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def _count_pure_space_tokens(self, ids):
+        """Engine-side count of tokens whose decoded text is entirely space
+        characters (U+0020 only); see the Gemma3 wrapper for rationale."""
+        return self._count_pure_literal_tokens(ids, SPACE_FILLER_LITERAL)
+
+    def _count_pure_literal_tokens(self, ids, literal):
+        """Engine-side count of tokens whose decoded text consists solely of
+        ``literal`` (generalizes the pure-space audit to the dots filler)."""
+        count = 0
+        for token_id in ids:
+            text = self.processor.tokenizer.decode([token_id])
+            if text and set(text) == {literal}:
+                count += 1
+        return count
+
+    def _qwen_visual_core_tokens(self, content: list[dict[str, str]]) -> tuple[int, list[dict[str, Any]]]:
+        """Core visual token count |V| for a prepared content list, using the
+        same vision extraction + processor call the vLLM request path applies.
+
+        The processor expands each single ``<|image_pad|>`` placeholder in the
+        rendered prompt to exactly the image's merged visual tokens (grid
+        ``t*h*w`` divided by ``merge_size**2``); counting the expanded
+        placeholders in the processor output is therefore the engine-side
+        in-context visual token count (the same source the blank/SLP trace
+        path reads via ``_find_image_token_spans``/``_processor_image_slices``).
+        """
+        try:
+            from qwen_vl_utils import process_vision_info
+        except Exception as err:
+            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")
+            raise err
+
+        text = self._render_filler_payload_prompt(content)
+        images, videos = process_vision_info([{'role': 'user', 'content': content}])
+        inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors="pt")
+        image_processor = getattr(self.processor, "image_processor", None)
+        merge_size = int(getattr(image_processor, "merge_size", 2) or 2)
+        grid = inputs.get("image_grid_thw") if hasattr(inputs, "get") else None
+        details: list[dict[str, Any]] = []
+        grid_total = 0
+        if grid is not None:
+            rows = grid.detach().cpu().tolist() if hasattr(grid, "detach") else list(grid)
+            for row in rows:
+                if len(row) != 3:
+                    continue
+                t, h, w = [int(x) for x in row]
+                core = (t * h * w) // (merge_size * merge_size)
+                grid_total += core
+                details.append({"grid_thw": [t, h, w], "core": core})
+        image_pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        input_ids = inputs.get("input_ids") if hasattr(inputs, "get") else None
+        pad_count = 0
+        if input_ids is not None:
+            ids = input_ids[0]
+            ids = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
+            pad_count = sum(1 for token_id in ids if token_id == image_pad_id)
+        if pad_count > 0 and pad_count != grid_total:
+            raise RuntimeError(
+                f"Qwen2VL filler mode visual core mismatch: expanded <|image_pad|> "
+                f"count {pad_count} != grid-derived count {grid_total} ({details})"
+            )
+        if grid_total <= 0:
+            raise RuntimeError("Qwen2VL filler mode found no visual tokens in the processed payload")
+        return grid_total, details
+
+    def _apply_text_filler_replay(
+        self,
+        content: list[dict[str, str]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        """⟨V,T,F,T⟩: the ⟨V,T,T⟩ pipeline with a token-matched filler block
+        inserted between the two text halves.
+
+        The Qwen2-VL chat template concatenates text parts of the user
+        content without separators (and does not trim them), so the filler is
+        embedded inside a single merged text item (first text half + F +
+        second text half), which renders byte-identically to the ⟨V,T,T⟩
+        baseline plus F. The carrier literal is selected by
+        ``REPLAY_TEXT_FILLER_TYPE`` (spaces/dots); an unknown value is a hard
+        error in the shared module.
+        """
+        base = self._apply_template_replay_pipeline_mode(content, dataset=dataset, mode="image_text_text")
+        text_positions = [
+            idx
+            for idx, item in enumerate(base)
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if not text_positions or len(text_positions) % 2 != 0:
+            raise RuntimeError(
+                f"Qwen2VL filler mode expected an even number of text items after "
+                f"image_text_text expansion, got {len(text_positions)}"
+            )
+        half = len(text_positions) // 2
+        first_text = "".join(str(base[idx].get("text", "")) for idx in text_positions[:half])
+        second_text = "".join(str(base[idx].get("text", "")) for idx in text_positions[half:])
+        image_items = [
+            item
+            for item in base
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        if not image_items:
+            raise RuntimeError("Qwen2VL filler mode requires at least one image item")
+        visual_core, image_grid_details = self._qwen_visual_core_tokens(base)
+        filler_type = read_text_filler_type()
+        filler_literal = filler_literal_for(filler_type)
+        baseline_prompt = self._render_filler_payload_prompt(base)
+        baseline_local_tokens = tokenize_length(self.processor.tokenizer, baseline_prompt)
+        baseline_ids = self.processor.tokenizer(baseline_prompt, add_special_tokens=False).input_ids
+        baseline_pure_space = self._count_pure_space_tokens(baseline_ids)
+        baseline_pure_literal = self._count_pure_literal_tokens(baseline_ids, filler_literal)
+        text_positions_set = set(text_positions)
+        first_text_position = text_positions[0]
+
+        def build_merged_content(filler_value):
+            merged_value = first_text + filler_value + second_text
+            out = []
+            for idx, item in enumerate(base):
+                if idx == first_text_position:
+                    out.append({"type": "text", "text": merged_value})
+                elif idx in text_positions_set:
+                    continue
+                else:
+                    out.append(item)
+            return out
+
+        def count_fn(filler_value):
+            prompt = self._render_filler_payload_prompt(build_merged_content(filler_value))
+            return count_filler_tokens(self.processor.tokenizer, prompt, baseline_prompt)
+
+        tag = f"{self.__class__.__name__} dataset={dataset}"
+        spec = build_text_filler(count_fn, visual_core, literal=filler_literal, tag=tag)
+        filler_value = filler_literal * int(spec["chars"])
+        filler_content = build_merged_content(filler_value)
+        meta = {
+            "dataset": str(dataset) if dataset is not None else None,
+            "mode": REPLAY_IMAGE_TEXT_FILLER_TEXT,
+            "filler_type": filler_type,
+            "filler_literal": filler_literal,
+            "image_count": len(image_items),
+            "image_grid_details": image_grid_details,
+            "visual_core_tokens": visual_core,
+            "filler_chars": int(spec["chars"]),
+            "filler_tokens_local": int(spec["tokens"]),
+            "baseline_local_tokens": baseline_local_tokens,
+            "baseline_pure_space_tokens": baseline_pure_space,
+            "baseline_pure_literal_tokens": baseline_pure_literal,
+            "chat_template": "qwen2_vl-processor-packaged",
+        }
+        for item in filler_content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                item["text_filler_meta"] = dict(meta)
+                break
+        self._text_filler_audit.log_construction({**meta, "phase_detail": "constructed"})
+        return filler_content
 
     def _apply_image_transform_pipeline(
         self,
@@ -1569,6 +1769,12 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             return super().generate_inner_vllm(message, dataset=dataset)
         except Exception as first_err:
             if not self.safe_fallback_enabled:
+                raise
+            # Text-filler construction/audit errors carry the shared module's
+            # "[text-filler]" message prefix and must stay hard errors: the
+            # fallback below would silently relabel a broken ⟨V,T,F,T⟩
+            # condition as a plain ⟨V,T⟩ run and corrupt the experiment.
+            if "[text-filler]" in str(first_err):
                 raise
 
             replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
