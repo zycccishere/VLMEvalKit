@@ -42,6 +42,15 @@ NOISE_IMAGE_TRANSFORMS = {
     "noise_image_seed29": 29,
     "noise_image_seed43": 43,
 }
+# Low-resolution replay: the target image keeps its source pixels but is
+# handed to the processor at ~fraction of V1's LLM visual tokens through the
+# qwen_vl_utils `resized_height` / `resized_width` item keys, which bypass the
+# item's min_pixels (the Qwen2.5-VL entries pin min_pixels = 1280 tokens, so a
+# pre-shrunk image would otherwise be enlarged back).
+V2_TOKEN_FRACTION_TRANSFORMS = {
+    "v2_tokens_half": 0.5,
+    "v2_tokens_quarter": 0.25,
+}
 IMAGE_TRANSFORM_ALIASES = {
     f"shift_{direction}_vit_token": f"shift_{direction}_one_vit_token"
     for direction in SHIFT_DIRECTIONS
@@ -62,6 +71,10 @@ IMAGE_TRANSFORM_PROFILES = {
         "vit_patch_size": 14,
         "spatial_merge_size": 2,
         "llm_token_stride": 28,
+        # Qwen2.5-VL checkpoint preprocessor_config.json min/max_pixels: the
+        # engine-side processor re-applies smart_resize within these bounds.
+        "processor_min_pixels": 3136,
+        "processor_max_pixels": 12845056,
     },
     "gemma3": {
         "model_family": "gemma3",
@@ -129,6 +142,7 @@ SUPPORTED_IMAGE_TRANSFORMS = {
     *PROCESSED_TOKEN_SHIFT_IMAGE_TRANSFORMS,
     *FIXED_PROCESSED_PIXEL_SHIFT_IMAGE_TRANSFORMS,
     *NOISE_IMAGE_TRANSFORMS,
+    *V2_TOKEN_FRACTION_TRANSFORMS,
     "zoom_1p5_uncropped",
 }
 
@@ -492,6 +506,61 @@ def _scale_qwen_processed_size(size: tuple[int, int], scale: float) -> tuple[int
     return int(scaled_width), int(scaled_height)
 
 
+def _v2_token_budget_grid(
+    image_size: tuple[int, int],
+    *,
+    fraction: float,
+    profile: dict[str, Any],
+    min_pixels: int | None,
+    max_pixels: int | None,
+) -> dict[str, Any]:
+    stride = int(profile["llm_token_stride"])
+    processor_min = int(profile["processor_min_pixels"])
+    processor_max = int(profile["processor_max_pixels"])
+    width, height = image_size
+    # V1 as the engine sees it: qwen_vl_utils fetch_image (item bounds, else
+    # its 4..16384-token defaults), then the checkpoint processor's bounds.
+    v1_h, v1_w = _smart_resize(
+        height,
+        width,
+        factor=stride,
+        min_pixels=int(min_pixels or 4 * stride * stride),
+        max_pixels=int(max_pixels or 16384 * stride * stride),
+    )
+    v1_h, v1_w = _smart_resize(v1_h, v1_w, factor=stride, min_pixels=processor_min, max_pixels=processor_max)
+    grid_h, grid_w = v1_h // stride, v1_w // stride
+    scale = math.sqrt(float(fraction))
+    target_h = max(1, int(math.floor(grid_h * scale + 0.5)))
+    target_w = max(1, int(math.floor(grid_w * scale + 0.5)))
+    # Hand the processor exactly what its own resize would produce, so the
+    # recorded grid is the engine grid even when the processor floor binds.
+    v2_h, v2_w = _smart_resize(
+        target_h * stride,
+        target_w * stride,
+        factor=stride,
+        min_pixels=processor_min,
+        max_pixels=processor_max,
+    )
+    v1_tokens = grid_h * grid_w
+    v2_tokens = (v2_h // stride) * (v2_w // stride)
+    return {
+        "target_fraction": float(fraction),
+        "llm_token_stride": stride,
+        "v1_resized_height": int(v1_h),
+        "v1_resized_width": int(v1_w),
+        "v1_llm_grid": [int(grid_h), int(grid_w)],
+        "v1_llm_tokens": int(v1_tokens),
+        "v2_resized_height": int(v2_h),
+        "v2_resized_width": int(v2_w),
+        "v2_llm_grid": [int(v2_h // stride), int(v2_w // stride)],
+        "v2_llm_tokens": int(v2_tokens),
+        "achieved_fraction": float(v2_tokens) / float(v1_tokens),
+        "processor_bounds_applied": bool((v2_h, v2_w) != (target_h * stride, target_w * stride)),
+        "processor_min_pixels": processor_min,
+        "processor_max_pixels": processor_max,
+    }
+
+
 def _processed_token_shift_spec(transform: str, *, profile: dict[str, Any]) -> dict[str, Any] | None:
     parts = transform.split("_")
     if len(parts) != 5 or parts[0] != "shift":
@@ -649,6 +718,23 @@ def apply_image_transform_to_content(
     }
 
     record["original_image_size"] = list(source_image.size)
+    if transform in V2_TOKEN_FRACTION_TRANSFORMS:
+        if "processor_min_pixels" not in profile:
+            raise ValueError(f"{transform} is only defined for Qwen-family profiles, got {profile['model_family']}")
+        budget = _v2_token_budget_grid(
+            source_image.size,
+            fraction=V2_TOKEN_FRACTION_TRANSFORMS[transform],
+            profile=profile,
+            min_pixels=image_item.get("min_pixels"),
+            max_pixels=image_item.get("max_pixels"),
+        )
+        out[item_index]["resized_height"] = budget["v2_resized_height"]
+        out[item_index]["resized_width"] = budget["v2_resized_width"]
+        record["v2_token_budget"] = budget
+        record["transformed_image_ref"] = original_ref
+        record["transformed_image_size"] = [budget["v2_resized_width"], budget["v2_resized_height"]]
+        return out, record
+
     output_image = source_image
     output_ref = original_ref
 
