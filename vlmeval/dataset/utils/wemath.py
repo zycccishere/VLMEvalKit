@@ -192,7 +192,7 @@ def evaluate_update_main_results_df(main_results_df, total_counts, rates):
         'CompleteMastery (Loose)': f"{rates['CompleteMastery_loose_rate']} ({total_counts['CompleteMastery_loose']})",
         'RoteMemorization (Loose)': f"{rates['RoteMemorization_loose_rate']} ({total_counts['RoteMemorization_loose']})",
     }
-    main_results_df = main_results_df._append(new_row, ignore_index=True)
+    main_results_df = pd.concat([main_results_df, pd.DataFrame([new_row])], ignore_index=True)
     return main_results_df
 
 
@@ -300,7 +300,7 @@ def accuracy_update_main_results_df(nodes, main_results_df, concatenated_data, m
     csv_final_score = pd.merge(nodes, csv_final_score, left_on='final_rode', right_on='final_key', how='left')
 
     new_row.update(csv_final_score.groupby('root2')['joker'].mean().apply(lambda x: "{:.2%}".format(x)).to_dict())
-    main_results_df = main_results_df._append(new_row, ignore_index=True)
+    main_results_df = pd.concat([main_results_df, pd.DataFrame([new_row])], ignore_index=True)
 
     return main_results_df
 

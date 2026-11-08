@@ -226,8 +226,8 @@ class ImageMCQDataset(ImageBaseDataset):
             return load(score_file)
 
         model = judge_kwargs.get('model', 'exact_matching')
-        assert model in ['chatgpt-0125', 'exact_matching', 'gpt-4-0125', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'gpt-5', 'qwen3.6-35b-a3b']
-        name_str_map = {'chatgpt-0125': 'openai', 'gpt-4-0125': 'gpt4', 'gpt-4.1': 'gpt-4.1', 'gpt-4.1-mini': 'gpt-4.1-mini', 'gpt-4.1-nano': 'gpt-4.1-nano', 'gpt-4o-mini': 'gpt-4o-mini', 'gpt-4o': 'gpt-4o', 'gpt-4-turbo': 'gpt-4-turbo', 'gpt-5': 'gpt-5', 'qwen3.6-35b-a3b': 'qwen3.6-35b-a3b'}
+        assert model in ['chatgpt-0125', 'exact_matching', 'gpt-4-0125', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'gpt-5', 'gpt-6-luna-flex', 'qwen3.6-35b-a3b']
+        name_str_map = {'chatgpt-0125': 'openai', 'gpt-4-0125': 'gpt4', 'gpt-4.1': 'gpt-4.1', 'gpt-4.1-mini': 'gpt-4.1-mini', 'gpt-4.1-nano': 'gpt-4.1-nano', 'gpt-4o-mini': 'gpt-4o-mini', 'gpt-4o': 'gpt-4o', 'gpt-4-turbo': 'gpt-4-turbo', 'gpt-5': 'gpt-5', 'gpt-6-luna-flex': 'gpt-6-luna-flex', 'qwen3.6-35b-a3b': 'qwen3.6-35b-a3b'}
         name_str = name_str_map[model] if model in name_str_map else model
 
         if model == 'exact_matching':
