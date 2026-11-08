@@ -315,6 +315,20 @@ class MiniCPM_V_4_5(BaseModel):
         # 1344x1344 with a random width, which made the runner apply a
         # model-specific test-time augmentation. Keep the old policy disabled
         # for both HF and vLLM paths.
+        if _env_truthy("MINICPM45_UPSIZE", False):
+            # 2026-11-08 upsize probe (env-gated April-era policy restore):
+            # the pre-disable form (357d93d6) applied upsize to long-CoT
+            # datasets plus AI2D/OCRBench/ChartQA/TextVQA. The resize itself
+            # lives in _message_to_content / _message_to_vllm_content:
+            # images with w*h < 1344^2 are scaled to that area with a random
+            # width (random.randint); the module seeds random at import, so
+            # runs are reproducible. Unset -> release behavior (False),
+            # byte-identical.
+            if dataset is None:
+                return False
+            if self.use_long_cot(dataset):
+                return True
+            return listinstr(["AI2D", "OCRBench", "ChartQA", "TextVQA"], dataset)
         return False
 
     def build_prompt(self, line, dataset=None):
