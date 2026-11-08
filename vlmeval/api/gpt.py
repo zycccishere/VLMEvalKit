@@ -359,6 +359,24 @@ class OpenAIWrapper(BaseAPI):
             n=1,
             temperature=temperature,
             **kwargs)
+        # Some OpenAI-compatible gateway models (e.g. gpt-6-luna-flex on
+        # api-gateway.glm.ai) reject temperature=0 outright ("Unsupported
+        # value: 'temperature' does not support 0 with this model. Only the
+        # default (1) value is supported"). VLMEVAL_OPENAI_TEMPERATURE is the
+        # environment-scoped escape hatch: "omit" drops the field so the
+        # gateway default applies; a number overrides it. Unset keeps the
+        # historical behavior byte-identical.
+        _env_temperature = os.environ.get('VLMEVAL_OPENAI_TEMPERATURE', '').strip()
+        if _env_temperature == 'omit':
+            payload.pop('temperature', None)
+        elif _env_temperature:
+            try:
+                payload['temperature'] = float(_env_temperature)
+            except ValueError:
+                self.logger.warning(
+                    f'Ignoring invalid VLMEVAL_OPENAI_TEMPERATURE={_env_temperature!r}; '
+                    'expected "omit" or a number.'
+                )
         chat_template_kwargs_raw = os.environ.get('VLMEVAL_OPENAI_CHAT_TEMPLATE_KWARGS', '').strip()
         if chat_template_kwargs_raw:
             try:
