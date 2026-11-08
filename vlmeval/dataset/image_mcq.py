@@ -67,6 +67,12 @@ class ImageMCQDataset(ImageBaseDataset):
         # 'SEEDBench_IMG': 'https://opencompass.openxlab.space/utils/VLMEval/SEEDBench_IMG.tsv',
         'SEEDBench_IMG': '/datasets/vlmeval/SEEDBench_IMG.tsv',
         'SEEDBench2': 'https://huggingface.co/datasets/VLMEval/SEEDBench2/resolve/main/SEEDBench2.tsv',
+        # SEEDBench2_Plus: upstream/main moved the file to
+        # utils/benchmarks/SEEDBench/SEEDBench2_Plus.tsv with MD5 e32d3216dc4f452b0fe497a52015d1fd;
+        # that copy re-letters 3 rows (1778/1841/1930) to options B/C/D leaving A empty, while this
+        # release-aligned copy (utils/VLMEval path + MD5 below, verified identical on the OSS bucket
+        # 2026-11-08) keeps the plain A/B/C layout used by the cluster paper runs. Keep the aligned
+        # copy for comparability; do not "refresh" the MD5 to upstream's without re-checking those rows.
         # 'SEEDBench2_Plus': 'https://opencompass.openxlab.space/utils/VLMEval/SEEDBench2_Plus.tsv',
         'SEEDBench2_Plus': '/datasets/vlmevalkit/SEEDBench2_Plus.tsv',
         # ScienceQA Series

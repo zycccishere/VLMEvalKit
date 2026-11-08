@@ -193,6 +193,12 @@ def DynaMath_local_parse(line):
 def DynaMath_auxeval(model, line):
     succeed, short_answer, pred = DynaMath_local_parse(line)
 
+    if not succeed and model is None:
+        # Rule-based (exact_matching) scoring: no auxiliary judge is available,
+        # so an unparsable prediction keeps the local-parse failure outcome,
+        # consistent with the parse failure branch below.
+        return dict(parse=False, extracted=None, correct=False)
+
     if not succeed:
         # Failed to parse the JSON, use an auxiliary LLM to get the short answer
         if line['answer_type'] == 'multiple choice':
@@ -327,7 +333,13 @@ Example of expected JSON response format:
     def evaluate(self, eval_file, **judge_kwargs):
         judge_name = judge_kwargs.pop('model', 'gpt-4o-mini')
 
-        model = build_judge(model=judge_name, **judge_kwargs)
+        if judge_name == 'exact_matching':
+            # Same convention as ImageMCQDataset.evaluate / VisualPuzzles.evaluate:
+            # rule-based scoring never builds a judge (build_judge has no
+            # 'exact_matching' entry and would raise KeyError).
+            model = None
+        else:
+            model = build_judge(model=judge_name, **judge_kwargs)
 
         storage = get_intermediate_file_path(eval_file, f'_{judge_name}')
         score_file = get_intermediate_file_path(eval_file, f'_{judge_name}_score', 'csv')
@@ -337,7 +349,8 @@ Example of expected JSON response format:
         res = load(tmp_file) if os.path.exists(tmp_file) else {}
         res = {k: v for k, v in res.items() if v is not None}
 
-        model.system_prompt = """\
+        if model is not None:
+            model.system_prompt = """\
 You are a helpful assistant that helps me to format free-form answers into a short answer according to the instruction.
 """
         if not osp.exists(storage):
@@ -345,7 +358,7 @@ You are a helpful assistant that helps me to format free-form answers into a sho
             lt = len(data)
             pending_indices = [i for i in range(lt) if data.iloc[i]['index'] not in res]
             requires_judge = any(not DynaMath_local_parse(data.iloc[i])[0] for i in pending_indices)
-            if requires_judge:
+            if requires_judge and model is not None:
                 assert model.working(), 'DynaMath evaluation requires a working OPENAI API\n' + DEBUG_MESSAGE
             payloads = [dict(model=model, line=data.iloc[i]) for i in pending_indices]
             keys = [data.iloc[i]['index'] for i in pending_indices]
