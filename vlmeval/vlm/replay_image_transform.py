@@ -13,6 +13,24 @@ from PIL import Image, ImageDraw
 
 
 BASELINE_IMAGE_TRANSFORM = "baseline"
+# Low-resolution replay: the target image keeps its source pixels but is
+# handed to the processor at ~fraction of V1's LLM visual tokens through the
+# qwen_vl_utils `resized_height` / `resized_width` item keys, which bypass the
+# item's min_pixels.
+V2_TOKEN_FRACTION_TRANSFORMS = {
+    "v2_tokens_half": 0.5,
+    "v2_tokens_quarter": 0.25,
+}
+# Engine-side processor bounds per checkpoint family (preprocessor_config.json;
+# Qwen3.8-27B: size.shortest_edge / size.longest_edge, patch 16 x merge 2).
+V2_TOKEN_BUDGET_PROFILES = {
+    "qwen3_vl": {
+        "model_family": "qwen3_vl",
+        "llm_token_stride": 32,
+        "processor_min_pixels": 65536,
+        "processor_max_pixels": 16777216,
+    },
+}
 
 SUPPORTED_IMAGE_TRANSFORMS = {
     BASELINE_IMAGE_TRANSFORM,
@@ -52,6 +70,7 @@ SUPPORTED_IMAGE_TRANSFORMS = {
     "shift_left_real_half_patch_wrap",
     "shift_right_real_half_patch_wrap",
     "zoom_1p5_uncropped",
+    *V2_TOKEN_FRACTION_TRANSFORMS,
 }
 
 MASK_GRID_ROWS = 10
@@ -276,6 +295,67 @@ def _resize_to_match(image: Image.Image, target_size: tuple[int, int]) -> Image.
     return image.resize(target_size, resample=Image.Resampling.BICUBIC)
 
 
+def _v2_token_budget_grid(
+    image_size: tuple[int, int],
+    *,
+    fraction: float,
+    profile: dict[str, Any],
+    min_pixels: int | None,
+    max_pixels: int | None,
+) -> dict[str, Any]:
+    stride = int(profile["llm_token_stride"])
+    processor_min = int(profile["processor_min_pixels"])
+    processor_max = int(profile["processor_max_pixels"])
+    width, height = image_size
+    # V1 as the engine sees it: qwen_vl_utils fetch_image (item bounds, else
+    # its 4..16384-token defaults), then the checkpoint processor's bounds.
+    v1_h, v1_w = _smart_resize(
+        height,
+        width,
+        factor=stride,
+        min_pixels=int(min_pixels or 4 * stride * stride),
+        max_pixels=int(max_pixels or 16384 * stride * stride),
+    )
+    v1_h, v1_w = _smart_resize(v1_h, v1_w, factor=stride, min_pixels=processor_min, max_pixels=processor_max)
+    grid_h, grid_w = v1_h // stride, v1_w // stride
+    scale = math.sqrt(float(fraction))
+    target_h = max(1, int(math.floor(grid_h * scale + 0.5)))
+    target_w = max(1, int(math.floor(grid_w * scale + 0.5)))
+    # Hand the processor exactly what its own resize would produce, so the
+    # recorded grid is the engine grid even when the processor floor binds.
+    v2_h, v2_w = _smart_resize(
+        target_h * stride,
+        target_w * stride,
+        factor=stride,
+        min_pixels=processor_min,
+        max_pixels=processor_max,
+    )
+    v1_tokens = grid_h * grid_w
+    v2_tokens = (v2_h // stride) * (v2_w // stride)
+    # Near the processor floor its upward rounding can overshoot V1; there
+    # is no smaller grid to offer, so V2 falls back to V1's grid.
+    capped_at_v1 = v2_tokens > v1_tokens
+    if capped_at_v1:
+        v2_h, v2_w, v2_tokens = v1_h, v1_w, v1_tokens
+    return {
+        "target_fraction": float(fraction),
+        "llm_token_stride": stride,
+        "v1_resized_height": int(v1_h),
+        "v1_resized_width": int(v1_w),
+        "v1_llm_grid": [int(grid_h), int(grid_w)],
+        "v1_llm_tokens": int(v1_tokens),
+        "v2_resized_height": int(v2_h),
+        "v2_resized_width": int(v2_w),
+        "v2_llm_grid": [int(v2_h // stride), int(v2_w // stride)],
+        "v2_llm_tokens": int(v2_tokens),
+        "achieved_fraction": float(v2_tokens) / float(v1_tokens),
+        "processor_bounds_applied": bool((v2_h, v2_w) != (target_h * stride, target_w * stride)),
+        "capped_at_v1": bool(capped_at_v1),
+        "processor_min_pixels": processor_min,
+        "processor_max_pixels": processor_max,
+    }
+
+
 def apply_image_transform_to_content(
     content: list[dict[str, Any]],
     *,
@@ -284,6 +364,7 @@ def apply_image_transform_to_content(
     cache_dir: str | Path,
     dataset_name: str,
     image_position: int = 2,
+    model_family: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     transform = canonicalize_image_transform(transform_name)
     out = [dict(item) if isinstance(item, dict) else item for item in content]
@@ -312,6 +393,24 @@ def apply_image_transform_to_content(
 
     source_image = _load_image_from_ref(original_ref)
     record["original_image_size"] = list(source_image.size)
+    if transform in V2_TOKEN_FRACTION_TRANSFORMS:
+        profile = V2_TOKEN_BUDGET_PROFILES.get(str(model_family or ""))
+        if profile is None:
+            raise ValueError(f"{transform} needs a model_family in {sorted(V2_TOKEN_BUDGET_PROFILES)}, got {model_family!r}")
+        budget = _v2_token_budget_grid(
+            source_image.size,
+            fraction=V2_TOKEN_FRACTION_TRANSFORMS[transform],
+            profile=profile,
+            min_pixels=image_item.get("min_pixels"),
+            max_pixels=image_item.get("max_pixels"),
+        )
+        out[item_index]["resized_height"] = budget["v2_resized_height"]
+        out[item_index]["resized_width"] = budget["v2_resized_width"]
+        record["v2_token_budget"] = budget
+        record["transformed_image_ref"] = original_ref
+        record["transformed_image_size"] = [budget["v2_resized_width"], budget["v2_resized_height"]]
+        return out, record
+
     output_image = source_image
     output_ref = original_ref
 

@@ -23,6 +23,12 @@ from .qwen2_vl.replay_prompt_template import (
     read_prompt_template_config_from_env,
     strip_prompt_template_from_content_for_direct_answer,
 )
+from .replay_image_transform import (
+    V2_TOKEN_BUDGET_PROFILES,
+    V2_TOKEN_FRACTION_TRANSFORMS,
+    apply_image_transform_to_content,
+    canonicalize_image_transform,
+)
 from ..smp import get_gpu_memory, listinstr
 
 VLLM_MAX_IMAGE_INPUT_NUM = 24
@@ -539,6 +545,26 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             '1', 'true', 'yes', 'on'
         }
         self.safe_fallback_truncate_chars = max(512, int(os.environ.get('REPLAY_SAFE_TRUNCATE_CHARS', '6000')))
+        self.image_transform_name = canonicalize_image_transform(os.environ.get('REPLAY_IMAGE_TRANSFORM', 'baseline'))
+        self.image_transform_cache_dir = os.environ.get('REPLAY_IMAGE_TRANSFORM_CACHE_DIR', '').strip()
+        self.image_transform_target_position = max(1, int(os.environ.get('REPLAY_IMAGE_TRANSFORM_TARGET_POSITION', '2')))
+        self._last_replay_meta = {}
+        self._last_image_transform_record = None
+        if self.image_transform_name in V2_TOKEN_FRACTION_TRANSFORMS:
+            image_processor = self.processor.image_processor
+            observed = {
+                'llm_token_stride': int(image_processor.patch_size) * int(image_processor.merge_size),
+                'processor_min_pixels': int(image_processor.size['shortest_edge']),
+                'processor_max_pixels': int(image_processor.size['longest_edge']),
+            }
+            expected = {key: V2_TOKEN_BUDGET_PROFILES['qwen3_vl'][key] for key in observed}
+            if observed != expected:
+                raise ValueError(f'{self.image_transform_name}: checkpoint processor {observed} != qwen3_vl profile {expected}')
+        print(
+            f'[Qwen35VLChatReplay] image_transform={self.image_transform_name} '
+            f'target_position={self.image_transform_target_position}',
+            flush=True,
+        )
         print(f'[Qwen35VLChatReplay] replay_cfg={self.replay_cfg}', flush=True)
         print(f'[Qwen35VLChatReplay] prompt_template_cfg={self.prompt_template_cfg}', flush=True)
         print(f'[Qwen35VLChatReplay] template_on_last_replay_text={self.template_on_last_replay_text}', flush=True)
@@ -708,6 +734,49 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         templated = self._apply_prompt_template_to_content(content, dataset=dataset)
         return self._apply_replay_to_content(templated)
 
+    def _apply_image_transform_pipeline(
+        self,
+        content: list[dict[str, str]],
+        *,
+        inputs: list[dict[str, str]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        replay_meta = next(
+            (dict(s['replay_meta']) for s in inputs if isinstance(s, dict) and isinstance(s.get('replay_meta'), dict)),
+            {},
+        )
+        self._last_replay_meta = replay_meta
+        self._last_image_transform_record = None
+        if self.image_transform_name == 'baseline':
+            return content
+        transformed, transform_record = apply_image_transform_to_content(
+            content,
+            transform_name=self.image_transform_name,
+            sample_meta=replay_meta,
+            cache_dir=self.image_transform_cache_dir or os.path.join(os.getcwd(), '.replay_transform_cache'),
+            dataset_name=str(dataset) if dataset is not None else 'unknown_dataset',
+            image_position=self.image_transform_target_position,
+            model_family='qwen3_vl',
+        )
+        self._last_image_transform_record = transform_record
+        self._stage_debug('image_transform', {'image_transform': self.image_transform_name, 'record': transform_record})
+        self._write_replay_dump({
+            'phase': 'image_transform',
+            'dataset': str(dataset) if dataset is not None else None,
+            'image_transform': self.image_transform_name,
+            'replay_meta': replay_meta,
+            'record': transform_record,
+        })
+        return transformed
+
+    def _request_audit_meta(self) -> dict:
+        meta = {'sample_index': self._last_replay_meta.get('sample_index')}
+        budget = (self._last_image_transform_record or {}).get('v2_token_budget')
+        if budget:
+            meta['v1_llm_tokens'] = budget['v1_llm_tokens']
+            meta['v2_llm_tokens'] = budget['v2_llm_tokens']
+        return meta
+
     def _prepare_content(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
         content = []
         for s in inputs:
@@ -759,7 +828,8 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             else:
                 raise ValueError(f'Invalid message type: {s["type"]}, {s}')
             content.append(item)
-        return self._apply_template_replay_pipeline(content, dataset=dataset)
+        replayed = self._apply_template_replay_pipeline(content, dataset=dataset)
+        return self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
 
     def _post_process_response(self, response: str) -> str:
         # Entries with explicit thinking control strip model-emitted thinking
@@ -945,21 +1015,28 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             return output.outputs[0].text
         return ''
 
-    def _audit_vllm_outputs(self, outputs, dataset: str | None = None) -> None:
+    def _audit_vllm_outputs(self, outputs, dataset: str | None = None, request_meta: list[dict] | None = None) -> None:
         """Record per-request finish reasons and token counts for the replay
         prompt audit (REPLAY_PROMPT_AUDIT + REPLAY_DUMP_DIR), so length-cap
-        truncations inside thinking are visible without reading raw dumps."""
+        truncations inside thinking are visible without reading raw dumps.
+        prompt_tokens is the engine-side prompt length; with request_meta it
+        is keyed by sample_index so per-sample visual-token budgets can be
+        checked across replay conditions."""
         if not self._prompt_audit_enabled:
             return
         try:
             stats = []
-            for output in outputs:
+            for idx, output in enumerate(outputs):
+                prompt_ids = getattr(output, 'prompt_token_ids', None)
+                meta = request_meta[idx] if request_meta and idx < len(request_meta) else {}
                 for comp in getattr(output, 'outputs', []) or []:
                     token_ids = getattr(comp, 'token_ids', None)
                     stats.append({
+                        **meta,
                         'finish_reason': getattr(comp, 'finish_reason', None),
                         'stop_reason': str(getattr(comp, 'stop_reason', None)),
                         'generated_tokens': len(token_ids) if token_ids is not None else None,
+                        'prompt_tokens': len(prompt_ids) if prompt_ids is not None else None,
                     })
             self._write_replay_dump({
                 'phase': 'vllm_generation_stats',
@@ -972,16 +1049,20 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
     def _generate_inner_vllm_once(self, message, dataset=None):
         sampling_params = self._build_vllm_sampling_params(dataset)
         req = self._build_vllm_request(message, dataset=dataset)
+        request_meta = [self._request_audit_meta()]
         outputs = self.llm.generate([req], sampling_params=sampling_params)
-        self._audit_vllm_outputs(outputs, dataset=dataset)
+        self._audit_vllm_outputs(outputs, dataset=dataset, request_meta=request_meta)
         generated_text = self._extract_vllm_output_text(outputs[0])
         return self._post_process_response(generated_text)
 
     def _generate_batch_inner_vllm(self, messages, dataset=None):
         sampling_params = self._build_vllm_sampling_params()
-        reqs = [self._build_vllm_request(message, dataset=dataset) for message in messages]
+        reqs, request_meta = [], []
+        for message in messages:
+            reqs.append(self._build_vllm_request(message, dataset=dataset))
+            request_meta.append(self._request_audit_meta())
         outputs = self.llm.generate(reqs, sampling_params=sampling_params)
-        self._audit_vllm_outputs(outputs, dataset=dataset)
+        self._audit_vllm_outputs(outputs, dataset=dataset, request_meta=request_meta)
         return [self._post_process_response(self._extract_vllm_output_text(output)) for output in outputs]
 
     def _run_with_replay_cfg(self, message, dataset, *, replay_mode: str, repeat_times: int) -> str:
