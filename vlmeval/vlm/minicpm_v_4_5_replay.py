@@ -4,6 +4,7 @@ import os
 import random
 import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -17,19 +18,15 @@ from .qwen2_vl.replay_prompt_template import (
     strip_prompt_template_from_content_for_direct_answer,
 )
 from .replay_policy import (
-    REPLAY_IMAGE_TEXT_FILLER_TEXT,
     apply_replay,
     canonicalize_replay_mode,
     is_noop_replay_mode,
     maybe_debug_print_replay,
     read_replay_config_from_env,
 )
-from .replay_text_filler import (
-    SPACE_FILLER_LITERAL,
-    TextFillerAudit,
-    build_space_filler,
-    count_filler_tokens,
-    tokenize_length,
+from .replay_image_transform import (
+    apply_image_transform_to_content,
+    canonicalize_image_transform,
 )
 from ..smp import *
 
@@ -166,228 +163,6 @@ class MiniCPM_V_4_5(BaseModel):
             self.debug_io_file = os.path.join(self.debug_io_dir, f"{self.__class__.__name__}.jsonl")
         self._debug_io_counter = 0
         self._warned_vllm_beam_fallback = False
-        self._text_filler_audit = TextFillerAudit(self.__class__.__name__)
-        self._packaged_vllm_chat_template = None
-
-    def _minicpm_image_placeholder_pattern(self) -> str:
-        return "(<image>./</image>)"
-
-    def _packaged_chat_template_str(self) -> str:
-        if self._packaged_vllm_chat_template is None:
-            from vllm.transformers_utils.chat_templates.registry import CHAT_TEMPLATES_DIR
-
-            path = Path(CHAT_TEMPLATES_DIR) / "template_minicpmv45.jinja"
-            self._packaged_vllm_chat_template = Path(path).read_text(encoding="utf-8")
-        return self._packaged_vllm_chat_template
-
-    def _minicpm_visual_core_tokens(self, message):
-        """Core visual token count |V| for a message, using the same slicing
-        the vLLM engine applies.
-
-        vLLM resolves ``max_slice_nums`` from the checkpoint image processor
-        (MiniCPM-o 4_5: 9 in preprocessor_config.json even though the model
-        config's slice_config says 1), and every sub-image (thumbnail plus
-        slices) contributes ``image_feature_size`` resampler tokens.
-        """
-        image_processor = getattr(self.processor, "image_processor", None)
-        if image_processor is None:
-            raise RuntimeError("MiniCPM processor exposes no image_processor")
-        feature_size = int(getattr(image_processor, "image_feature_size", 0) or 0)
-        if feature_size <= 0:
-            raise RuntimeError("MiniCPM image processor lacks image_feature_size")
-        max_slice_nums = getattr(image_processor, "max_slice_nums", None)
-        details = []
-        total = 0
-        for item in message:
-            if not (isinstance(item, dict) and item.get("type") == "image"):
-                continue
-            with Image.open(str(item["value"])) as handle:
-                width, height = handle.size
-            grid = image_processor.get_sliced_grid((width, height), max_slice_nums)
-            slices = 0 if grid is None else int(grid[0]) * int(grid[1])
-            core = (slices + 1) * feature_size
-            total += core
-            details.append(
-                {
-                    "size": [width, height],
-                    "grid": None if grid is None else [int(grid[0]), int(grid[1])],
-                    "slices": slices,
-                    "core": core,
-                }
-            )
-        return total, details
-
-    def _render_vllm_chat_string(self, content_str, dataset=None):
-        """Mirror the chat-template branch ``_generate_batch_inner_vllm``
-        feeds to ``llm.chat`` so filler audits predict the engine prompt."""
-        _, chat_template_kwargs = self._build_vllm_sampling(dataset=dataset)
-        if chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False:
-            template = self._original_chat_template
-        else:
-            template = self._packaged_chat_template_str()
-        kwargs = dict(tokenize=False, add_generation_prompt=True, chat_template=template)
-        if chat_template_kwargs:
-            kwargs.update(chat_template_kwargs)
-        return self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": content_str}], **kwargs
-        )
-
-    def _expand_image_placeholder_text(self, size):
-        image_processor = getattr(self.processor, "image_processor", None)
-        return image_processor.get_slice_image_placeholder(size)
-
-    def _render_message_prompt_str(self, message, dataset=None):
-        """Chat-template string for ``message`` with the literal image
-        placeholder pattern (pre-replacement), mirroring llm.chat."""
-        texts = [
-            str(item["value"])
-            for item in message
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        image_items = [
-            item
-            for item in message
-            if isinstance(item, dict) and item.get("type") == "image"
-        ]
-        content = "\n".join(texts)
-        if image_items:
-            content = self._minicpm_image_placeholder_pattern() + "\n" + content
-        return self._render_vllm_chat_string(content, dataset=dataset)
-
-    def _predict_engine_prompt_len(self, message, dataset=None):
-        """Local replica of the engine's prompt length for ``message``.
-
-        Mirrors vLLM's MiniCPMV prompt-update path: the chat string P (with
-        the literal ``(<image>./</image>)`` pattern once per image) is
-        tokenized as a whole, then each pattern's token span is replaced by
-        the expanded placeholder's tokens. No bos is prepended (this
-        tokenizer has ``add_bos_token=False`` and vLLM adds nothing else).
-        A constant residual scaffold offset between this replica and the
-        engine is expected (e.g. from BPE merges at the pattern boundary)
-        and is verified constant per batch by the engine audit.
-        """
-        prompt_str = self._render_message_prompt_str(message, dataset=dataset)
-        image_items = [
-            item
-            for item in message
-            if isinstance(item, dict) and item.get("type") == "image"
-        ]
-        length = len(self.tokenizer.encode(prompt_str))
-        if image_items:
-            pattern_len = tokenize_length(
-                self.tokenizer, self._minicpm_image_placeholder_pattern()
-            )
-            for item in image_items:
-                with Image.open(str(item["value"])) as handle:
-                    width, height = handle.size
-                placeholder = self._expand_image_placeholder_text((width, height))
-                length += tokenize_length(self.tokenizer, placeholder) - pattern_len
-        return length
-
-    def _minicpm_unk_token_id(self) -> int:
-        image_processor = getattr(self.processor, "image_processor", None)
-        literal = getattr(image_processor, "unk_token", None) or getattr(
-            self.tokenizer, "unk_token", "<unk>"
-        )
-        token_id = int(self.tokenizer.convert_tokens_to_ids(str(literal)))
-        if token_id is None or token_id < 0:
-            raise RuntimeError(f"cannot resolve MiniCPM image feature token {literal!r}")
-        return token_id
-
-    def _count_pure_space_tokens(self, ids):
-        """Engine-side count of tokens whose decoded text is entirely space
-        characters (U+0020 only).
-
-        The filler block is a run of space characters, so its tokens decode to
-        pure-space strings; normal question text never produces them (spaces
-        merge into word tokens that decode with the word attached, and
-        newline/tab tokens are excluded by the U+0020-only check).
-        """
-        count = 0
-        for token_id in ids:
-            text = self.tokenizer.decode([token_id])
-            if text and len(text) == text.count(" "):
-                count += 1
-        return count
-
-    def _audit_text_filler_engine_outputs(self, messages, outputs, dataset=None):
-        if not any(
-            isinstance(item, dict) and item.get("text_filler_meta")
-            for message in messages
-            for item in message
-        ):
-            return
-        unk_id = self._minicpm_unk_token_id()
-        records = []
-        for message, output in zip(messages, outputs):
-            meta = next(
-                (
-                    item["text_filler_meta"]
-                    for item in message
-                    if isinstance(item, dict) and item.get("text_filler_meta")
-                ),
-                None,
-            )
-            if meta is None:
-                continue
-            ids = list(output.prompt_token_ids or [])
-            engine_len = len(ids)
-            unk_count = sum(1 for token_id in ids if token_id == unk_id)
-            baseline_prediction = int(meta["baseline_engine_len_predicted"])
-            filler_prediction = int(meta["filler_engine_len_predicted"])
-            records.append(
-                {
-                    **meta,
-                    "engine_prompt_len": engine_len,
-                    "engine_prompt_len_predicted": filler_prediction,
-                    "scaffold_offset": engine_len - filler_prediction,
-                    "engine_image_core_count": unk_count,
-                    "filler_tokens_engine_spaces": self._count_pure_space_tokens(ids)
-                    - int(meta.get("baseline_pure_space_tokens", 0)),
-                }
-            )
-        offsets = {int(r["scaffold_offset"]) for r in records}
-        if len(offsets) > 1:
-            self._dump_filler_mismatch_debug(records[0], messages, outputs, dataset)
-            raise RuntimeError(
-                f"[text-filler] ENGINE AUDIT MISMATCH ({self.__class__.__name__}, "
-                f"dataset={dataset}): scaffold offset not constant within batch: "
-                f"{sorted(offsets)}; records={records[:3]}"
-            )
-        offset = offsets.pop()
-        for record in records:
-            visual_core = int(record["visual_core_tokens"])
-            spaces = int(record["filler_tokens_engine_spaces"])
-            reasons = []
-            if abs(offset) > 8:
-                reasons.append(f"scaffold offset {offset} exceeds tolerance 8")
-            if record["engine_image_core_count"] != visual_core:
-                reasons.append(
-                    f"engine image core count {record['engine_image_core_count']} != {visual_core}"
-                )
-            # Pure-space tokens lose at most the two boundary merges of the
-            # filler run against the surrounding "\n" separators; anything
-            # beyond that is a real tokenization mismatch.
-            if not (-2 <= spaces - visual_core <= 0):
-                reasons.append(
-                    f"engine pure-space filler tokens {spaces} deviate from {visual_core} "
-                    f"by {spaces - visual_core} (tolerance [-2, 0])"
-                )
-            record["engine_audit_pass"] = not reasons
-            record["engine_audit_reason"] = "; ".join(reasons) or "ok"
-            if reasons:
-                self._dump_filler_mismatch_debug(record, messages, outputs, dataset)
-            self._text_filler_audit.log_engine(record)
-
-    def _dump_filler_mismatch_debug(self, record, messages, outputs, dataset=None):
-        debug_dir = os.environ.get("REPLAY_TEXT_FILLER_DEBUG_DIR", "/tmp").strip() or "/tmp"
-        try:
-            os.makedirs(debug_dir, exist_ok=True)
-            tag = f"mismatch_{self.__class__.__name__}_{dataset}".replace("/", "_")
-            with open(os.path.join(debug_dir, f"{tag}_record.json"), "w", encoding="utf-8") as fh:
-                json.dump(record, fh, ensure_ascii=False, default=str)
-        except Exception as dump_err:
-            print(f"[text-filler] mismatch debug dump failed: {dump_err}", flush=True)
 
     def _resolve_vllm_tp_size(self):
         gpu_count = max(1, torch.cuda.device_count())
@@ -684,11 +459,12 @@ class MiniCPM_V_4_5(BaseModel):
 
     def _message_to_content(self, message, dataset=None):
         content = []
+        images = []
         for item in message:
             if item["type"] == "text":
                 content.append(item["value"])
             elif item["type"] == "image":
-                image = Image.open(item["value"]).convert("RGB")
+                image = Image.open(self._strip_file_scheme(item["value"])).convert("RGB")
                 if not self.use_upsize(dataset):
                     content.append(image)
                 else:
@@ -701,15 +477,24 @@ class MiniCPM_V_4_5(BaseModel):
                         new_img_width = random.randint(img_width, max_img_width)
                         new_img_height = int(new_img_width / img_width * img_height)
                         content.append(image.resize((new_img_width, new_img_height)))
+                if content and isinstance(content[-1], Image.Image):
+                    images.append(content[-1])
+        self._maybe_dump_minicpm_payload(
+            phase="minicpm_hf_payload",
+            dataset=dataset,
+            message=message,
+            images=images,
+        )
         return content
 
     def _message_to_vllm_content(self, message, dataset=None):
         content = []
+        images = []
         for item in message:
             if item["type"] == "text":
                 content.append({"type": "text", "text": str(item["value"])})
             elif item["type"] == "image":
-                image = Image.open(item["value"]).convert("RGB")
+                image = Image.open(self._strip_file_scheme(item["value"])).convert("RGB")
                 if self.use_upsize(dataset):
                     img_width, img_height = image.width, image.height
                     if (img_width * img_height) < (1344 * 1344):
@@ -718,7 +503,14 @@ class MiniCPM_V_4_5(BaseModel):
                         new_img_width = random.randint(img_width, max_img_width)
                         new_img_height = int(new_img_width / img_width * img_height)
                         image = image.resize((new_img_width, new_img_height))
+                images.append(image)
                 content.append({"type": "image_pil", "image_pil": image})
+        self._maybe_dump_minicpm_payload(
+            phase="minicpm_vllm_payload",
+            dataset=dataset,
+            message=message,
+            images=images,
+        )
         return content
 
     def _build_default_generate_kwargs(self, dataset=None):
@@ -796,11 +588,6 @@ class MiniCPM_V_4_5(BaseModel):
         chat_template_kwargs = {}
         if enable_thinking is not None:
             chat_template_kwargs["enable_thinking"] = bool(enable_thinking)
-        print(
-            f"[MiniCPM_V_4_5] dataset={dataset} vLLM SamplingParams: {sampling_params} "
-            f"chat_template_kwargs={chat_template_kwargs or None}",
-            flush=True,
-        )
         return sampling_params, chat_template_kwargs or None
 
     def _normalize_official_output(self, text):
@@ -810,6 +597,40 @@ class MiniCPM_V_4_5(BaseModel):
         if getattr(output, "outputs", None):
             return output.outputs[0].text
         return ""
+
+    @staticmethod
+    def _strip_file_scheme(image_ref):
+        raw = str(image_ref or "").strip()
+        if raw.startswith("file://"):
+            return raw[len("file://") :]
+        return raw
+
+    def _maybe_dump_minicpm_payload(self, *, phase, dataset, message, images):
+        dump = getattr(self, "_write_replay_dump", None)
+        if not callable(dump):
+            return
+        active_ids = getattr(self, "_minicpm_trace_active_message_ids", set())
+        message_id = id(message)
+        if message_id not in active_ids:
+            return
+        transform_record = getattr(self, "_minicpm_transform_records_by_message_id", {}).get(
+            message_id,
+            getattr(self, "_last_image_transform_records", None),
+        )
+        dump(
+            {
+                "phase": phase,
+                "dataset": str(dataset) if dataset is not None else None,
+                "payload_image_count": len(images),
+                "payload_image_sizes": [list(image.size) for image in images],
+                "message_replayed": self._serialize_message_for_debug(message),
+                "transform_records": transform_record if isinstance(transform_record, list) else None,
+            },
+            detail="summary",
+            force=True,
+        )
+        active_ids.discard(message_id)
+        getattr(self, "_minicpm_transform_records_by_message_id", {}).pop(message_id, None)
 
     def _restore_vllm_full_output(self, text, chat_template_kwargs=None):
         raw_text = str(text)
@@ -847,7 +668,6 @@ class MiniCPM_V_4_5(BaseModel):
             chat_template_content_format="string",
             chat_template_kwargs=chat_template_kwargs,
         )
-        self._audit_text_filler_engine_outputs(messages, outputs, dataset=dataset)
         results = []
         for message, output in zip(messages, outputs):
             full_output = self._extract_vllm_output(output)
@@ -984,6 +804,136 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             f"[MiniCPM_V_4_5_Replay] template_on_last_replay_text={self.template_on_last_replay_text}",
             flush=True,
         )
+        self.image_transform_name = canonicalize_image_transform(os.environ.get("REPLAY_IMAGE_TRANSFORM", "baseline"))
+        self.image_transform_cache_dir = os.environ.get("REPLAY_IMAGE_TRANSFORM_CACHE_DIR", "").strip()
+        self.image_transform_effective_cache_dir = self.image_transform_cache_dir or os.path.join(
+            os.getcwd(),
+            ".replay_transform_cache",
+        )
+        # Comma-separated image positions (1-based, counted among image items)
+        # to apply the transform to. The single-position form "2" is the
+        # legacy paper path (blank the second image of image_text_image_text);
+        # "2,3" / "2,3,4" cover the multi-image-copy SLP tiers.
+        raw_positions = str(os.environ.get("REPLAY_IMAGE_TRANSFORM_TARGET_POSITION", "2") or "2")
+        positions = []
+        for part in raw_positions.split(","):
+            part = part.strip()
+            if part.isdigit():
+                positions.append(max(1, int(part)))
+        self.image_transform_target_positions = tuple(sorted(set(positions))) or (2,)
+        self._last_image_transform_records: list[dict[str, Any]] | None = None
+        self._minicpm_transform_records_by_message_id: dict[int, list[dict[str, Any]]] = {}
+        self._minicpm_trace_active_message_ids: set[int] = set()
+        trace_level = os.environ.get("REPLAY_TRACE_LEVEL", os.environ.get("REPLAY_STAGE_DEBUG", "off")).strip().lower()
+        if trace_level in {"1", "true", "yes", "on"}:
+            trace_level = "summary"
+        if trace_level not in {"off", "summary", "full"}:
+            trace_level = "off"
+        self._minicpm_trace_level = trace_level
+        self._minicpm_trace_max_samples = max(0, _env_int("REPLAY_TRACE_SAMPLES", 3))
+        self._minicpm_trace_seen_samples = 0
+        self._minicpm_trace_active = False
+        self._minicpm_dump_dir = os.environ.get("REPLAY_TRACE_DIR", os.environ.get("REPLAY_DUMP_DIR", "")).strip()
+        self._minicpm_dump_file = None
+        self._minicpm_dump_max_chars = _env_int("REPLAY_TRACE_MAX_CHARS", _env_int("REPLAY_DUMP_MAX_CHARS", 0))
+        if self._minicpm_dump_dir:
+            os.makedirs(self._minicpm_dump_dir, exist_ok=True)
+            pid = os.getpid()
+            self._minicpm_dump_file = os.path.join(
+                self._minicpm_dump_dir,
+                f"{self.__class__.__name__}.pid{pid}.jsonl",
+            )
+            print(f"[minicpm-replay-dump] enabled. Writing to {self._minicpm_dump_file}", flush=True)
+        print(
+            f"[MiniCPM_V_4_5_Replay] image_transform={self.image_transform_name} "
+            f"target_positions={self.image_transform_target_positions} "
+            f"cache_dir={self.image_transform_effective_cache_dir}",
+            flush=True,
+        )
+
+    def _begin_trace_sample(self):
+        if self._minicpm_trace_level in {"summary", "full"} and (
+            self._minicpm_trace_seen_samples < self._minicpm_trace_max_samples
+        ):
+            self._minicpm_trace_seen_samples += 1
+            self._minicpm_trace_active = True
+        else:
+            self._minicpm_trace_active = False
+        return self._minicpm_trace_active
+
+    def _trace_allows(self, detail="summary", *, force=False):
+        if not self._minicpm_dump_file:
+            return False
+        if not force and not self._minicpm_trace_active:
+            return False
+        if self._minicpm_trace_level == "full":
+            return True
+        return detail != "full"
+
+    def _clip_trace_text(self, value):
+        text = str(value)
+        if self._minicpm_dump_max_chars > 0 and len(text) > self._minicpm_dump_max_chars:
+            return text[: self._minicpm_dump_max_chars] + f"\n...[TRUNCATED {len(text) - self._minicpm_dump_max_chars} chars]"
+        return text
+
+    def _write_replay_dump(self, record, detail="summary", *, force=False):
+        if not self._trace_allows(detail, force=force):
+            return
+        serializable = json.loads(json.dumps(record, default=str, ensure_ascii=False))
+        serializable.setdefault("pid", os.getpid())
+        serializable.setdefault("cuda_visible_devices", os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+        serializable.setdefault("rank", os.environ.get("RANK", os.environ.get("LOCAL_RANK", "")))
+        for key in ("prompt", "raw_output", "full_output"):
+            if key in serializable:
+                serializable[key] = self._clip_trace_text(serializable[key])
+        try:
+            with open(self._minicpm_dump_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(serializable, ensure_ascii=False) + "\n")
+        except Exception as err:
+            print(f"[minicpm-replay-dump] write failed: {err}", flush=True)
+
+    def _extract_replay_meta(self, inputs):
+        for item in inputs:
+            if isinstance(item, dict) and isinstance(item.get("replay_meta"), dict):
+                return dict(item["replay_meta"])
+        return {}
+
+    def _apply_image_transform_pipeline(self, message, *, inputs, dataset=None, trace_active=False):
+        if self.image_transform_name == "baseline":
+            self._last_image_transform_records = [{"transform": "baseline", "applied": False}]
+            if trace_active:
+                self._minicpm_trace_active_message_ids.add(id(message))
+            return message
+        replay_meta = self._extract_replay_meta(inputs)
+        transformed = message
+        records: list[dict[str, Any]] = []
+        for position in self.image_transform_target_positions:
+            transformed, transform_record = apply_image_transform_to_content(
+                transformed,
+                transform_name=self.image_transform_name,
+                sample_meta=replay_meta,
+                cache_dir=self.image_transform_effective_cache_dir,
+                dataset_name=str(dataset) if dataset is not None else "unknown_dataset",
+                image_position=position,
+                model_family="minicpm45",
+            )
+            records.append(transform_record)
+        self._last_image_transform_records = records
+        if trace_active:
+            self._minicpm_transform_records_by_message_id[id(transformed)] = records
+            self._minicpm_trace_active_message_ids.add(id(transformed))
+            self._write_replay_dump(
+                {
+                    "phase": "image_transform",
+                    "dataset": str(dataset) if dataset is not None else None,
+                    "image_transform": self.image_transform_name,
+                    "target_positions": list(self.image_transform_target_positions),
+                    "replay_meta": replay_meta,
+                    "records": records,
+                },
+                detail="summary",
+            )
+        return transformed
 
     def _apply_prompt_template_to_message(self, message, dataset=None):
         template_text = self.prompt_template_cfg.get("template", "{problem}")
@@ -1035,13 +985,6 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
     def _apply_replay_pipeline(self, message, dataset=None):
         message = self._normalize_message_order(message)
         mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
-        if mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
-            return self._apply_text_filler_replay(message, dataset=dataset)
-        return self._apply_replay_pipeline_mode(message, dataset=dataset, mode=mode)
-
-    def _apply_replay_pipeline_mode(self, message, dataset=None, mode=None):
-        if mode is None:
-            mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
 
         if self.template_on_last_replay_text and not is_noop_replay_mode(mode):
             replay_source = message
@@ -1067,83 +1010,15 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
             image_copy_mode=self.replay_cfg.get("image_copy_mode", "reuse_path"),
         )
 
-    def _apply_text_filler_replay(self, message, dataset=None):
-        """⟨V,T,F,T⟩: the ⟨V,T,T⟩ pipeline with a token-matched spaces block
-        inserted between the two text halves.
-
-        The vLLM chat path joins text parts of the user content with "\\n"
-        (and prepends the image placeholder with the same separator), so the
-        filler lands as its own part between the two question copies; the
-        in-context token count of the filler is computed on that exact
-        joined chunk.
-        """
-        base = self._apply_replay_pipeline_mode(message, dataset=dataset, mode="image_text_text")
-        text_positions = [
-            idx
-            for idx, item in enumerate(base)
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        if not text_positions or len(text_positions) % 2 != 0:
-            raise RuntimeError(
-                f"MiniCPM filler mode expected an even number of text items after "
-                f"image_text_text expansion, got {len(text_positions)}"
-            )
-        half = len(text_positions) // 2
-        first_text = "\n".join(str(base[idx]["value"]) for idx in text_positions[:half])
-        second_text = "\n".join(str(base[idx]["value"]) for idx in text_positions[half:])
-        image_items = [
-            item
-            for item in base
-            if isinstance(item, dict) and item.get("type") == "image"
-        ]
-        if not image_items:
-            raise RuntimeError("MiniCPM filler mode requires at least one image item")
-        visual_core, image_details = self._minicpm_visual_core_tokens(base)
-        baseline_engine_prediction = self._predict_engine_prompt_len(base, dataset=dataset)
-        baseline_prompt_str = self._render_message_prompt_str(base, dataset=dataset)
-        baseline_pure_space = self._count_pure_space_tokens(
-            self.tokenizer(baseline_prompt_str, add_special_tokens=False).input_ids
-        )
-
-        def count_fn(filler_value):
-            chunk_with = "\n" + first_text + "\n" + filler_value + "\n" + second_text
-            chunk_without = "\n" + first_text + "\n" + second_text
-            return count_filler_tokens(self.tokenizer, chunk_with, chunk_without)
-
-        tag = f"{self.__class__.__name__} dataset={dataset}"
-        spec = build_space_filler(count_fn, visual_core, tag=tag)
-        filler_value = SPACE_FILLER_LITERAL * int(spec["chars"])
-        filler_position = text_positions[half]
-        filler_item = {
-            "type": "text",
-            "value": filler_value,
-        }
-        filler_message = []
-        for idx, item in enumerate(base):
-            if idx == filler_position:
-                filler_message.append(filler_item)
-            filler_message.append(item)
-        filler_engine_prediction = self._predict_engine_prompt_len(
-            filler_message, dataset=dataset
-        )
-        meta = {
-            "dataset": str(dataset) if dataset is not None else None,
-            "mode": REPLAY_IMAGE_TEXT_FILLER_TEXT,
-            "image_count": len(image_items),
-            "image_details": image_details,
-            "visual_core_tokens": visual_core,
-            "filler_chars": int(spec["chars"]),
-            "filler_tokens_local": int(spec["tokens"]),
-            "baseline_engine_len_predicted": baseline_engine_prediction,
-            "baseline_pure_space_tokens": baseline_pure_space,
-            "filler_engine_len_predicted": filler_engine_prediction,
-        }
-        filler_item["text_filler_meta"] = dict(meta)
-        self._text_filler_audit.log_construction({**meta, "phase_detail": "constructed"})
-        return filler_message
-
     def generate_inner(self, message, dataset=None):
+        trace_active = self._begin_trace_sample()
         replayed = self._apply_replay_pipeline(message, dataset=dataset)
+        replayed = self._apply_image_transform_pipeline(
+            replayed,
+            inputs=message,
+            dataset=dataset,
+            trace_active=trace_active,
+        )
         maybe_debug_print_replay(
             enabled=self.replay_cfg.get("debug", False),
             mode=canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text")),
@@ -1157,7 +1032,14 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
         replayed_messages = []
         replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
         for message in messages:
+            trace_active = self._begin_trace_sample()
             replayed = self._apply_replay_pipeline(message, dataset=dataset)
+            replayed = self._apply_image_transform_pipeline(
+                replayed,
+                inputs=message,
+                dataset=dataset,
+                trace_active=trace_active,
+            )
             maybe_debug_print_replay(
                 enabled=self.replay_cfg.get("debug", False),
                 mode=replay_mode,
