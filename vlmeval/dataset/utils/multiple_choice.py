@@ -473,7 +473,11 @@ def mcq_circular_eval(model, data, meta, nproc, result_file, dataset_name=None):
                 else:
                     result[k] = v
 
-    tmp_pth = f'/tmp/{timestr()}.xlsx'
+    # timestr() has second resolution; two concurrent circular evals on the
+    # same host (parallel EVAL packing in run_benchmark) collided on this
+    # name and one side read a half-written workbook. Pid suffix makes the
+    # name unique per process; the round-trip itself is load-bearing.
+    tmp_pth = f'/tmp/{timestr()}_{os.getpid()}.xlsx'
     dump(data_main, tmp_pth)
     data_main = load(tmp_pth)
     indices = data_main['index']
