@@ -33,8 +33,10 @@ from .replay_image_transform import (
 from .replay_text_filler import (
     SPACE_FILLER_LITERAL,
     TextFillerAudit,
-    build_space_filler,
+    build_text_filler,
     count_filler_tokens,
+    filler_literal_for,
+    read_text_filler_type,
     tokenize_length,
 )
 
@@ -614,11 +616,13 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             raise RuntimeError("Gemma3 filler mode requires at least one image item")
         per_image_core = self._gemma3_visual_core_tokens_per_image()
         visual_core = per_image_core * len(image_items)
+        filler_type = read_text_filler_type()
+        filler_literal = filler_literal_for(filler_type)
         baseline_prompt = self._message_to_vllm_payload(base)["prompt"]
         baseline_local_tokens = tokenize_length(self.processor.tokenizer, baseline_prompt)
-        baseline_pure_space = self._count_pure_space_tokens(
-            self.processor.tokenizer(baseline_prompt, add_special_tokens=False).input_ids
-        )
+        baseline_ids = self.processor.tokenizer(baseline_prompt, add_special_tokens=False).input_ids
+        baseline_pure_space = self._count_pure_space_tokens(baseline_ids)
+        baseline_pure_literal = self._count_pure_literal_tokens(baseline_ids, filler_literal)
         text_positions_set = set(text_positions)
         first_text_position = text_positions[0]
 
@@ -641,12 +645,14 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             return count_filler_tokens(self.processor.tokenizer, prompt, baseline_prompt)
 
         tag = f"Gemma3 dataset={dataset}"
-        spec = build_space_filler(count_fn, visual_core, tag=tag)
-        filler_value = SPACE_FILLER_LITERAL * int(spec["chars"])
+        spec = build_text_filler(count_fn, visual_core, literal=filler_literal, tag=tag)
+        filler_value = filler_literal * int(spec["chars"])
         filler_message = build_merged_message(filler_value)
         meta = {
             "dataset": str(dataset) if dataset is not None else None,
             "mode": REPLAY_IMAGE_TEXT_FILLER_TEXT,
+            "filler_type": filler_type,
+            "filler_literal": filler_literal,
             "image_count": len(image_items),
             "per_image_core": per_image_core,
             "visual_core_tokens": visual_core,
@@ -654,6 +660,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             "filler_tokens_local": int(spec["tokens"]),
             "baseline_local_tokens": baseline_local_tokens,
             "baseline_pure_space_tokens": baseline_pure_space,
+            "baseline_pure_literal_tokens": baseline_pure_literal,
             "chat_template": "gemma3-packaged",
         }
         for item in filler_message:
@@ -666,10 +673,15 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
     def _count_pure_space_tokens(self, ids):
         """Engine-side count of tokens whose decoded text is entirely space
         characters (U+0020 only); see the MiniCPM wrapper for rationale."""
+        return self._count_pure_literal_tokens(ids, " ")
+
+    def _count_pure_literal_tokens(self, ids, literal):
+        """Engine-side count of tokens whose decoded text consists solely of
+        ``literal`` (generalizes the pure-space audit to the dots filler)."""
         count = 0
         for token_id in ids:
             text = self.processor.tokenizer.decode([token_id])
-            if text and len(text) == text.count(" "):
+            if text and set(text) == {literal}:
                 count += 1
         return count
 
@@ -702,8 +714,12 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
                 + int(meta["image_count"]) * delta
                 + int(meta["visual_core_tokens"])
             )
+            filler_literal = str(meta.get("filler_literal", SPACE_FILLER_LITERAL))
             filler_engine_spaces = self._count_pure_space_tokens(ids) - int(
                 meta.get("baseline_pure_space_tokens", 0)
+            )
+            filler_engine_literal = self._count_pure_literal_tokens(ids, filler_literal) - int(
+                meta.get("baseline_pure_literal_tokens", meta.get("baseline_pure_space_tokens", 0))
             )
             record = {
                 **{k: v for k, v in meta.items() if k != "phase_detail"},
@@ -712,6 +728,7 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
                 "scaffold_offset": engine_len - predicted_len,
                 "engine_image_token_count": image_token_count,
                 "filler_tokens_engine_spaces": filler_engine_spaces,
+                "filler_tokens_engine_literal": filler_engine_literal,
             }
             reasons = []
             if engine_len != predicted_len:
@@ -724,9 +741,9 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
                     f"engine image token count {image_token_count} != visual core "
                     f"{meta['visual_core_tokens']}"
                 )
-            if not (-2 <= filler_engine_spaces - int(meta["visual_core_tokens"]) <= 0):
+            if not (-2 <= filler_engine_literal - int(meta["visual_core_tokens"]) <= 0):
                 reasons.append(
-                    f"engine pure-space filler tokens {filler_engine_spaces} deviate "
+                    f"engine pure-literal filler tokens {filler_engine_literal} deviate "
                     f"from {meta['visual_core_tokens']}"
                 )
             record["engine_audit_pass"] = not reasons
@@ -824,6 +841,12 @@ class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
             kwargs["top_k"] = self.sampling_top_k
         if self.sampling_repetition_penalty is not None:
             kwargs["repetition_penalty"] = self.sampling_repetition_penalty
+        # Optional per-request sampling determinism, shared knob with the
+        # MiniCPM wrapper (VLMEVAL_SAMPLING_SEED). Unset (default) leaves
+        # SamplingParams.seed at vLLM's default.
+        sampling_seed = _env_int_optional("VLMEVAL_SAMPLING_SEED")
+        if sampling_seed is not None:
+            kwargs["seed"] = sampling_seed
         logging.info("Gemma3 vLLM SamplingParams: %s", kwargs)
         print(f"Gemma3 vLLM SamplingParams: {kwargs}", flush=True)
         return SamplingParams(**kwargs)

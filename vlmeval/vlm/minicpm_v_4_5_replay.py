@@ -27,6 +27,7 @@ from .replay_policy import (
 from .replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
+    image_rgb_sha256,
 )
 from ..smp import *
 
@@ -43,6 +44,19 @@ def _env_int(name, default):
     if raw.isdigit():
         return int(raw)
     return default
+
+
+def _env_optional_int(name):
+    """Optional int env: None when unset/empty; invalid values warn and
+    return None (the knob is silently disabled rather than crashing a run
+    that never asked for determinism)."""
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return None
+    if not raw.lstrip("+-").isdigit():
+        print(f"[MiniCPM_V_4_5] ignoring invalid int env {name}={raw!r}", flush=True)
+        return None
+    return int(raw)
 
 
 def _dataset_type(name):
@@ -577,6 +591,10 @@ class MiniCPM_V_4_5(BaseModel):
             top_k = 0
         repetition_penalty = float(generate_kwargs.pop("repetition_penalty", 1.0))
         presence_penalty = float(generate_kwargs.pop("presence_penalty", 0.0))
+        # Optional per-request sampling determinism for multi-seed repeats of
+        # sampled long-CoT conditions (engine determinism probes C3/C4).
+        # Unset (default) leaves SamplingParams.seed at vLLM's default.
+        sampling_seed = _env_optional_int("VLMEVAL_SAMPLING_SEED")
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
             temperature=temperature,
@@ -584,6 +602,7 @@ class MiniCPM_V_4_5(BaseModel):
             top_k=top_k,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            **({"seed": sampling_seed} if sampling_seed is not None else {}),
         )
         chat_template_kwargs = {}
         if enable_thinking is not None:
@@ -623,6 +642,9 @@ class MiniCPM_V_4_5(BaseModel):
                 "dataset": str(dataset) if dataset is not None else None,
                 "payload_image_count": len(images),
                 "payload_image_sizes": [list(image.size) for image in images],
+                "payload_image_rgb_sha256": [
+                    image_rgb_sha256(image) for image in images
+                ],
                 "message_replayed": self._serialize_message_for_debug(message),
                 "transform_records": transform_record if isinstance(transform_record, list) else None,
             },

@@ -25,6 +25,7 @@ from ..replay_policy import (
 from ..replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
+    image_rgb_sha256,
 )
 from .replay_prompt_template import (
     apply_prompt_template_to_content,
@@ -1194,6 +1195,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 "replayed_image_refs": replayed_image_refs,
                 "replayed_image_count": len(replayed_image_refs),
                 "vision_extract_image_count": len(images) if images is not None else 0,
+                "vllm_payload_image_sizes": (
+                    [list(image.size) for image in images] if images is not None else []
+                ),
+                "vllm_payload_image_rgb_sha256": (
+                    [image_rgb_sha256(image) for image in images] if images is not None else []
+                ),
                 "vision_extract_video_count": len(videos) if videos is not None else 0,
                 "vision_extract_image_summary": self._summarize_mm(images),
                 "vision_extract_video_summary": self._summarize_mm(videos),

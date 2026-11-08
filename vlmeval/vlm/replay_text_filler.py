@@ -13,6 +13,11 @@ in the surrounding prompt context. BPE vocabularies merge runs of spaces
 Gemma-3-12B-it, up to 128 spaces per token for MiniCPM-o 4.5), so the
 character count generally exceeds |V|; the in-context token count is the
 quantity that must match.
+
+``REPLAY_TEXT_FILLER_TYPE`` selects the carrier literal: ``spaces``
+(default, the probe's ``space_text``) or ``dots`` (the probe's
+``dot_text``: a run of ``.`` characters, same |V|-exact in-context matching
+and the same audit pipeline).
 """
 
 from __future__ import annotations
@@ -24,7 +29,37 @@ from typing import Any, Callable
 
 
 SPACE_FILLER_LITERAL = " "
+DOTS_FILLER_LITERAL = "."
 SPACE_FILLER_MODE = "image_text_filler_text"
+TEXT_FILLER_TYPES = {
+    "spaces": SPACE_FILLER_LITERAL,
+    "dots": DOTS_FILLER_LITERAL,
+}
+
+
+def read_text_filler_type() -> str:
+    """Validated ``REPLAY_TEXT_FILLER_TYPE`` (default ``spaces``).
+
+    An unknown value is a hard error: a typo would silently run the wrong
+    carrier condition and corrupt the experiment.
+    """
+    raw = str(os.environ.get("REPLAY_TEXT_FILLER_TYPE", "spaces") or "spaces").strip().lower()
+    if raw not in TEXT_FILLER_TYPES:
+        raise RuntimeError(
+            f"[text-filler] unsupported REPLAY_TEXT_FILLER_TYPE={raw!r}; "
+            f"expected one of {sorted(TEXT_FILLER_TYPES)}"
+        )
+    return raw
+
+
+def filler_literal_for(filler_type: str) -> str:
+    try:
+        return TEXT_FILLER_TYPES[filler_type]
+    except KeyError:
+        raise RuntimeError(
+            f"[text-filler] unsupported filler type {filler_type!r}; "
+            f"expected one of {sorted(TEXT_FILLER_TYPES)}"
+        ) from None
 
 # Search bounds for the per-sample character count. The lower bound assumes
 # no merging (1 char = 1 token); observed merging is <= 128 chars/token on
@@ -52,29 +87,30 @@ def count_filler_tokens(
     )
 
 
-def build_space_filler(
+def build_text_filler(
     count_fn: Callable[[str], int],
     target_tokens: int,
     *,
+    literal: str = SPACE_FILLER_LITERAL,
     tag: str = "",
 ) -> dict[str, Any]:
-    """Find the smallest run of spaces whose in-context count is exactly
+    """Find the smallest run of ``literal`` whose in-context count is exactly
     ``target_tokens``.
 
     ``count_fn(filler_str)`` must return the in-context token count
     attributable to ``filler_str`` (see :func:`count_filler_tokens`). The
-    count is non-decreasing in the number of characters for a pure-space
-    filler; the search first expands exponentially, then binary-searches the
-    minimal character count whose count is >= target, and finally requires
-    exact equality. A miss is a hard error: the sample cannot be silently
-    run with an unmatched filler.
+    count is non-decreasing in the number of characters for a single-literal
+    filler run on the supported tokenizers; the search first expands
+    exponentially, then binary-searches the minimal character count whose
+    count is >= target, and finally requires exact equality. A miss is a
+    hard error: the sample cannot be silently run with an unmatched filler.
     """
     target_tokens = int(target_tokens)
     if target_tokens <= 0:
         raise RuntimeError(f"[text-filler] non-positive target token count: {target_tokens} ({tag})")
 
     def probe(n_chars: int) -> int:
-        return int(count_fn(SPACE_FILLER_LITERAL * n_chars))
+        return int(count_fn(literal * n_chars))
 
     lo = 1
     hi = max(2, target_tokens)
@@ -85,7 +121,7 @@ def build_space_filler(
             hi = min(hi * 2, ceiling)
         if probe(hi) < target_tokens:
             raise RuntimeError(
-                f"[text-filler] no space run within {ceiling} chars reaches "
+                f"[text-filler] no {literal!r} run within {ceiling} chars reaches "
                 f"{target_tokens} tokens ({tag})"
             )
     while lo < hi:
@@ -104,12 +140,22 @@ def build_space_filler(
             f"{count} tokens; nearby counts {near}"
         )
     return {
-        "literal": SPACE_FILLER_LITERAL,
+        "literal": literal,
         "chars": n_chars,
         "tokens": count,
         "target_tokens": target_tokens,
         "tag": tag,
     }
+
+
+def build_space_filler(
+    count_fn: Callable[[str], int],
+    target_tokens: int,
+    *,
+    tag: str = "",
+) -> dict[str, Any]:
+    """Backward-compatible spaces-only wrapper around :func:`build_text_filler`."""
+    return build_text_filler(count_fn, target_tokens, literal=SPACE_FILLER_LITERAL, tag=tag)
 
 
 class TextFillerAudit:
