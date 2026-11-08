@@ -6,10 +6,12 @@
 # Runtime blocks carry the dev-measured concurrency (GPUs 1-4/7, 2026-11-07
 # evening sweep; see rebuttal-runs journal). Decoding:
 #   - Gemma-4: greedy, DECIDED (GEMMA4_SAMPLING_PRESET=greedy, k=1).
-#   - Qwen non-thinking: G (greedy, temp 0 + vendor presence 1.5, k=1) vs
-#     S (vendor 0.7/0.8/20/1.5, k=3) PENDING the user decision. The switch is
-#     the single QWEN35_NONTHINK_SAMPLING line below (greedy -> remove for
-#     vendor). It currently holds greedy = main's recommendation.
+#   - Qwen non-thinking: G (greedy, temp 0 + vendor presence 1.5, k=1).
+#     DECIDED by the user 2026-11-08 under the pre-registered rule (truncation
+#     + extraction-failure comparison: G 0/256 vs S 1/256 per model, inside
+#     the 1-point band -> tie-break to G; both cap hits belonged to S).
+#     The switch remains the single QWEN35_NONTHINK_SAMPLING line below for
+#     provenance; changing it now requires a new decision, not a tweak.
 env_profiles:
   qwen_replay_vlmeval:
     python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
