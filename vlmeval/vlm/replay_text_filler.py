@@ -133,12 +133,41 @@ def build_text_filler(
     n_chars = lo
     count = probe(n_chars)
     if count != target_tokens:
-        near = {n: probe(n) for n in range(max(1, n_chars - 2), n_chars + 3)}
-        raise RuntimeError(
-            f"[text-filler] exact match unreachable ({tag}): target "
-            f"{target_tokens} tokens, best candidate {n_chars} chars -> "
-            f"{count} tokens; nearby counts {near}"
+        # Boundary non-monotonicity (first observed 2026-11-08, Qwen2.5-VL
+        # dots filler on OCRBench: nearby counts {8128: 127, 8129: 129,
+        # 8130: 128} for target 128): tokenization of the run can oscillate
+        # by +-1 around merge boundaries, so a binary search on a
+        # not-strictly-monotone count can step OVER an exact match that a
+        # neighbor attains. Scan an expanding window around the landing
+        # point before hard-failing; the hard-error guarantee (never run a
+        # silently unmatched filler) is preserved.
+        memo: dict[int, int] = {n_chars: count}
+        def mprobe(n: int) -> int:
+            if n not in memo:
+                memo[n] = probe(n)
+            return memo[n]
+        found = None
+        for radius in (2, 8, 32, 64):
+            for n in range(max(1, n_chars - radius), n_chars + radius + 1):
+                if mprobe(n) == target_tokens:
+                    found = n
+                    break
+            if found is not None:
+                break
+        if found is None:
+            near = {n: mprobe(n) for n in range(max(1, n_chars - 2), n_chars + 3)}
+            raise RuntimeError(
+                f"[text-filler] exact match unreachable ({tag}): target "
+                f"{target_tokens} tokens, best candidate {n_chars} chars -> "
+                f"{count} tokens; nearby counts {near}"
+            )
+        print(
+            f"[text-filler] boundary window recovered exact match "
+            f"({tag}): binary-search landing {n_chars} chars -> {count} "
+            f"tokens, using {found} chars -> {target_tokens} tokens",
+            flush=True,
         )
+        n_chars, count = found, target_tokens
     return {
         "literal": literal,
         "chars": n_chars,
