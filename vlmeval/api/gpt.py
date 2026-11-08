@@ -2,6 +2,7 @@ from ..smp import *
 import json
 import os
 import sys
+import threading
 import time
 import fcntl
 from .base import BaseAPI
@@ -141,6 +142,133 @@ def _estimate_cost_from_usage(model: str, usage: dict) -> dict:
         'uncached_prompt_tokens': uncached_tokens,
         'cached_prompt_tokens': cached_tokens,
     }
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    tmp = f'{path}.tmp.{os.getpid()}.{threading.get_ident()}'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+class _DynamicConcurrencyGate:
+    """Env-gated, cross-process adjustable concurrency limiter.
+
+    Enabled only when VLMEVAL_DYNAMIC_CONCURRENCY_FILE names a control file;
+    unset -> callers skip the gate entirely (historical behavior unchanged).
+
+    Semantics (user-specified, 2026-11-08):
+      - INCREASE takes effect immediately: waiting acquires see the new
+        target on their next control-file read and launch right away.
+      - DECREASE never cancels in-flight requests: new slots stop being
+        granted until global in_flight drains to <= target, then the run
+        continues at the lower rate. No work is lost and no request is
+        aborted.
+      - The gate applies per HTTP ATTEMPT (inside generate_inner), so retry
+        sleeps in BaseAPI.generate never hold a slot.
+
+    Cross-process correctness: the driving thread pools live in the dataset
+    layer (one pool per task subprocess), so both the control file and the
+    status file are shared experiment-wide and every acquire/release is a
+    locked read-modify-write of the status JSON. The pool CEILING is set by
+    matrix nproc (VLMEVAL_DYNAMIC_CONCURRENCY_CEILING, default 64, is the
+    documented value); this gate enforces the live TARGET. Writes are
+    write-temp-then-rename so readers never see torn values. Control-file
+    reads fail open to the last known target (atomic renames make torn
+    reads impossible in practice).
+    """
+
+    _instance = None
+    _instance_lock = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        control = os.environ.get('VLMEVAL_DYNAMIC_CONCURRENCY_FILE', '').strip()
+        if not control:
+            return None
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = _DynamicConcurrencyGate(control)
+            return cls._instance
+
+    def __init__(self, control_path: str):
+        self.control_path = control_path
+        self.status_path = (
+            os.environ.get('VLMEVAL_DYNAMIC_CONCURRENCY_STATUS', '').strip()
+            or control_path + '.status.json'
+        )
+        self.lock_path = self.status_path + '.lock'
+        self.poll_s = 0.1
+        initial = str(int(os.environ.get('VLMEVAL_DYNAMIC_CONCURRENCY_INITIAL', '16') or 16))
+        if not os.path.exists(self.control_path):
+            _atomic_write_text(self.control_path, initial)
+        self._last_target = self._read_target_raw(initial=int(initial))
+        if not os.path.exists(self.status_path):
+            self._write_status({'target': self._last_target, 'in_flight': 0, 'launched': 0,
+                                'completed': 0, 'failed': 0, 'last_update_ts': time.time()})
+
+    def _read_target_raw(self, initial: int) -> int:
+        try:
+            return max(1, int(open(self.control_path, encoding='utf-8').read().strip()))
+        except Exception:
+            return initial
+
+    def _read_status(self) -> dict:
+        try:
+            st = json.loads(open(self.status_path, encoding='utf-8').read())
+        except Exception:
+            st = {}
+        st.setdefault('in_flight', 0)
+        st.setdefault('launched', 0)
+        st.setdefault('completed', 0)
+        st.setdefault('failed', 0)
+        return st
+
+    def _write_status(self, st: dict) -> None:
+        st['last_update_ts'] = time.time()
+        _atomic_write_text(self.status_path, json.dumps(st))
+
+    def _locked(self):
+        # Local handle: flock mutual exclusion requires a distinct open file
+        # description per holder; instance-level state would let one thread
+        # close another thread's handle and break exclusion.
+        fh = open(self.lock_path, 'a+', encoding='utf-8')
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        return fh
+
+    def _unlock(self, fh) -> None:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+    def acquire(self) -> None:
+        while True:
+            fh = self._locked()
+            try:
+                target = self._read_target_raw(initial=self._last_target)
+                self._last_target = target
+                st = self._read_status()
+                if int(st['in_flight']) < target:
+                    st['in_flight'] = int(st['in_flight']) + 1
+                    st['launched'] = int(st['launched']) + 1
+                    st['target'] = target
+                    self._write_status(st)
+                    return
+            finally:
+                self._unlock(fh)
+            time.sleep(self.poll_s)
+
+    def release(self, ok: bool) -> None:
+        fh = self._locked()
+        try:
+            st = self._read_status()
+            st['in_flight'] = max(0, int(st['in_flight']) - 1)
+            st['completed' if ok else 'failed'] = int(st['completed' if ok else 'failed']) + 1
+            st['target'] = self._last_target
+            self._write_status(st)
+        finally:
+            self._unlock(fh)
 
 
 def log_openai_compatible_usage_event(
@@ -419,13 +547,26 @@ class OpenAIWrapper(BaseAPI):
         if isinstance(api_base, str):
             api_base = normalize_openai_compatible_api_base(api_base)
         throttle_openai_compatible_request()
+        # Per-HTTP-attempt adjustable concurrency gate (env-gated; None when
+        # VLMEVAL_DYNAMIC_CONCURRENCY_FILE is unset -> historical behavior).
+        # Acquired after the throttle sleep and released after the response
+        # is received and logged, so retry sleeps never hold a slot.
+        _concurrency_gate = _DynamicConcurrencyGate.get()
+        if _concurrency_gate is not None:
+            _concurrency_gate.acquire()
         request_started = time.time()
-        response = requests.post(
-            api_base,
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=self.timeout * 1.1,
-        )
+        _attempt_ok = False
+        try:
+            response = requests.post(
+                api_base,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=self.timeout * 1.1,
+            )
+            _attempt_ok = 200 <= int(response.status_code) < 300
+        finally:
+            if _concurrency_gate is not None:
+                _concurrency_gate.release(_attempt_ok)  # exception -> failed
         latency_s = time.time() - request_started
         ret_code = response.status_code
         ret_code = 0 if (200 <= int(ret_code) < 300) else ret_code
