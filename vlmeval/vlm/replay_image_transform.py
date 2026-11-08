@@ -543,6 +543,11 @@ def _v2_token_budget_grid(
     )
     v1_tokens = grid_h * grid_w
     v2_tokens = (v2_h // stride) * (v2_w // stride)
+    # Near the processor floor its upward rounding can overshoot V1; there
+    # is no smaller grid to offer, so V2 falls back to V1's grid.
+    capped_at_v1 = v2_tokens > v1_tokens
+    if capped_at_v1:
+        v2_h, v2_w, v2_tokens = v1_h, v1_w, v1_tokens
     return {
         "target_fraction": float(fraction),
         "llm_token_stride": stride,
@@ -556,6 +561,7 @@ def _v2_token_budget_grid(
         "v2_llm_tokens": int(v2_tokens),
         "achieved_fraction": float(v2_tokens) / float(v1_tokens),
         "processor_bounds_applied": bool((v2_h, v2_w) != (target_h * stride, target_w * stride)),
+        "capped_at_v1": bool(capped_at_v1),
         "processor_min_pixels": processor_min,
         "processor_max_pixels": processor_max,
     }
