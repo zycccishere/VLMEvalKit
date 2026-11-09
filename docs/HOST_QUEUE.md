@@ -11,7 +11,16 @@ waits two seconds before the next scan. Its
 exclusive-card criterion is the same local `memory.used <= 1024 MiB` criterion
 as the existing launch scripts. Pending entries share the whole host; declared
 `gpus_per_job` determines whether a task fits. Within each explicit priority,
-the existing `BenchmarkRunner._select_gpu_pool_task` handles mixed TP packing.
+the shortest estimated remaining inference time goes first, both on initial
+dispatch and subsequent refill. The existing native selector breaks ties.
+Unknown estimates follow known estimates. Background judging is excluded from
+the GPU duration; it never delays refill after inference releases its cards.
+
+`tools/queue.sh estimates --file /absolute/runtime-estimates.json` connects the
+existing viewer export. Estimates are refreshed at each dispatch scan, and
+must match the cell ID, model entry, GPU width and registered model config path.
+Their source and chosen duration are recorded on each attempt. This is a
+forecast, not a task timeout or a promise of completion order.
 Each cell's TP allocation stays within one node. Tasks that fit can pass a wider task waiting for enough cards. This maximizes
 available use, but is not a reservation/fairness or global optimality guarantee.
 
@@ -161,3 +170,48 @@ worker control through a simulated transport, node-loss claim preservation,
 and admission sealing. Real SSH between platform nodes, shared-volume locks,
 and GPU execution remain deployment acceptance checks; no platform job was
 launched as part of this implementation.
+
+## Cancellation and resume
+
+New queue attempts enable `--atomic-checkpoints` for both native inference and
+the detached evaluator. The unchanged execution checkout's `run.py` runs through
+a small import hook that wraps only `vlmeval.smp.file.dump` at its normal import
+time. It preserves the original serializer, cache paths and native resume
+selection. Checkpoints are written beside the destination, fsynced, atomically
+replaced and directory-fsynced. A serialization error preserves the previous
+checkpoint and fails visibly, rather than publishing a changed fallback format.
+Native phase manifests record `checkpoint_io=atomic-fsync-replace-v1`; model
+source, prompts, decoding and judge configuration are unchanged. Queue state
+and native phase records use the same durable commit principle.
+
+Only committed progress can be retained. An unfinished inference batch or an
+API response not yet committed can run again after cancellation. This is not
+live migration of vLLM/RNG state or an exactly-once API-billing guarantee.
+Already completed prediction rows and judge-cache entries retain their bytes.
+
+`pause` stops new claims while active inference and judging continue; `unpause`
+reenables claims. To cancel a whole platform allocation, use the existing
+`ctl-exp stop`. Keep the shared queue directory and registered result roots.
+For a new submission to continue it, set:
+
+```bash
+QUEUE_RESUME_ROOT=<previous persistent queue root>
+QUEUE_PREVIOUS_TASK=<previous platform task>
+QUEUE_PREVIOUS_STATUS=<saved terminal ctl-exp status JSON>
+```
+
+The new entrypoint requires a terminal reason and matching previous task,
+RUN_ID and CTL_EXP_RUN_TS in that control-plane receipt. It refuses a live
+controller, active inference/eval locks, or unreadable published pickle caches.
+It records the old node/attempt identities, rebinds to the new nodes, preserves
+all artifacts, and requeues interrupted work. Complete and deliberately removed
+items stay complete/removed; ordinary failed tasks still require explicit retry.
+Local stopped instances can use `queue.sh resume` then `queue.sh serve` after
+their prior processes are confirmed gone. Merely losing SSH connectivity does
+not authorize resume onto a different node.
+
+Kill-during-write tests cover both prediction and judge caches. Resume tests
+cover preserved checkpoint bytes, corrupt-checkpoint rejection, previous-task
+identity, and running-vs-terminal platform receipts. Real platform cancellation
+remains a deployment test; the existing completed 30-cell batch was not killed
+or rewritten to test this feature.

@@ -286,6 +286,7 @@ class BenchmarkRunner:
     def __init__(self, repo_root: Path, args: argparse.Namespace) -> None:
         self.repo_root_path = repo_root
         self.args = args
+        self.atomic_checkpoints = getattr(args, "atomic_checkpoints", False)
         self.gpu_ready_timeout = getattr(args, "gpu_ready_timeout", 0)
         if self.gpu_ready_timeout < 0:
             raise ValueError("gpu-ready-timeout must be nonnegative")
@@ -1204,7 +1205,14 @@ except Exception:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
                 fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -1227,6 +1235,7 @@ except Exception:
     def _task_payload(self, task: Task, model: ModelSpec, expected: int) -> dict[str, Any]:
         return {
             "schema_version": 1,
+            "checkpoint_io": "atomic-fsync-replace-v1" if self.atomic_checkpoints else "native",
             "matrix": self.matrix_name,
             "run_id": self.experiment_cfg.get("run_id"),
             "binding": self.experiment_cfg.get("bindings", {}).get(task.tag),
@@ -1314,6 +1323,9 @@ except Exception:
 
     def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path,
                        on_start: Any = None) -> int:
+        if self.atomic_checkpoints and len(cmd) > 1 and cmd[1] == "run.py":
+            cmd = [cmd[0], str(self.repo_root_path / "scripts/atomic_checkpoints.py"),
+                   str(Path(self.repo_root) / "run.py"), *cmd[2:]]
         ensure_dir(log_path.parent)
         with log_path.open("w", encoding="utf-8") as log_fh:
             proc = subprocess.Popen(
@@ -1586,6 +1598,8 @@ except Exception:
                    "--eval-task-tag", task.tag, "--eval-lock-fd", str(lock.fileno())]
             if self.task_manifest_path:
                 cmd += ["--task-manifest", str(self.task_manifest_path.resolve())]
+            if self.atomic_checkpoints:
+                cmd.append("--atomic-checkpoints")
             supervisor_log = directory / "worker.log"
             self.write_phase_status(task, model, expected, "evaluation", "queued", log=str(supervisor_log),
                                     worker_lock=str(directory / ".worker.lock"))
@@ -1713,6 +1727,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodes", type=int, default=detect_num_nodes())
     parser.add_argument("--node-rank", type=int, default=detect_node_rank())
     parser.add_argument("--gpu-ids", type=str, default="")
+    parser.add_argument("--atomic-checkpoints", action="store_true",
+                        help="Atomically commit native prediction and judge checkpoint writes.")
     parser.add_argument("--gpu-ready-timeout", type=int, default=0,
                         help="Opt-in: wait up to N seconds before inference for assigned GPUs to use <=1024 MiB; 0 disables.")
     parser.add_argument("--models", type=str, default="")

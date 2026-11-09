@@ -127,6 +127,56 @@ class QueueTests(unittest.TestCase):
         state=dict(jobs=[jobs[0]],events=[]);q.reconcile(state,{})
         self.assertEqual(state['jobs'][0]['state'],'needs_review')
 
+    def test_shortest_estimated_runtime_with_capacity_priority_and_unknowns(self):
+        jobs=[dict(id=i, state='queued', priority=0, estimated_seconds=seconds,
+                   spec=dict(model_key=str(i),gpus=gpus,weight=1))
+              for i,seconds,gpus in [(1,600,4),(2,60,1),(3,None,1),(4,10,8)]]
+        self.assertEqual(q.choose(jobs,4)['id'],2)
+        self.assertEqual(q.choose(jobs,8)['id'],4)
+        jobs[1]['state']='running'
+        self.assertEqual(q.choose(jobs,4)['id'],1)
+        jobs[2]['priority']=10
+        self.assertEqual(q.choose(jobs,4)['id'],3)
+
+    def test_estimates_reuse_remaining_time_and_reject_wrong_model_configuration(self):
+        spec=self.register('left','A');q.enqueue(self.store,[spec])
+        p=self.root/'runtime-estimates.json'
+        estimate=dict(id=spec['cell_id'],entry='m',gpus=1,runtime_source=str(Path(spec['registration'])/'models.yaml'),
+                      remaining_s=20,full_s=600,kind='estimated')
+        p.write_text(json.dumps({'cells':[estimate]}))
+        with self.store.edit() as state:
+            state['config']['estimate_file']=str(p);q.update_estimates(state)
+            self.assertEqual(state['jobs'][0]['estimated_seconds'],20)
+            estimate['runtime_source']='/different/models.yaml';p.write_text(json.dumps({'cells':[estimate]}));q.update_estimates(state)
+            self.assertIsNone(state['jobs'][0]['estimated_seconds'])
+
+    def test_resume_preserves_inference_and_judge_checkpoints(self):
+        import pickle
+        spec=self.register('left','A');q.enqueue(self.store,[spec]);root=Path(spec['path']);root.mkdir(parents=True)
+        checkpoints=[root/'prediction-partial.pkl',root/'judge-partial.pkl']
+        for p in checkpoints:p.write_bytes(pickle.dumps({0:'committed'}))
+        before=[p.read_bytes() for p in checkpoints]
+        with self.store.edit() as state:
+            state['jobs'][0].update(state='scoring',attempt=2)
+            state['paused']=True
+        q.resume_instance(self.store)
+        s=self.store.snapshot();self.assertEqual(s['jobs'][0]['state'],'queued');self.assertEqual(s['jobs'][0]['attempt'],2)
+        self.assertEqual([p.read_bytes() for p in checkpoints],before)
+        checkpoints[0].write_bytes(b'truncated')
+        with self.assertRaises(ValueError):q.resume_instance(self.store)
+
+    def test_platform_resume_requires_previous_terminal_identity(self):
+        spec=self.register('left','A');q.enqueue(self.store,[spec])
+        with self.store.edit() as state:state['config']['instance_id']='run/old'
+        nodes=self.root/'nodes.json';nodes.write_text(json.dumps({'new-main':{'gpu_ids':['0','1'],'ssh':[]}}))
+        receipt=self.root/'platform.json';value={'meta':{'name':'task-old'},'status':{'reason':'Running'},
+                'spec':{'podCommon':{'environments':[{'key':'RUN_ID','value':'run'},{'key':'CTL_EXP_RUN_TS','value':'old'}]}}}
+        receipt.write_text(json.dumps(value))
+        with self.assertRaises(ValueError):q.resume_instance(self.store,nodes,'run/new',receipt,'task-old')
+        value['status']['reason']='Stopped';receipt.write_text(json.dumps(value))
+        q.resume_instance(self.store,nodes,'run/new',receipt,'task-old')
+        s=self.store.snapshot();self.assertEqual(s['config']['instance_id'],'run/new');self.assertEqual(len(s['resume_history']),1)
+
     def test_concurrent_admission_and_legacy_pending_owner(self):
         spec=self.register('left','A')
         cmd=[sys.executable,str(Path(q.__file__).resolve()),'--root',str(self.store.root),

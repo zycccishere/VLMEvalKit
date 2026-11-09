@@ -7,7 +7,9 @@ import csv
 import fcntl
 import hashlib
 import json
+import math
 import os
+import pickle
 from pathlib import Path
 import shlex
 import socket
@@ -18,10 +20,12 @@ from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
 from prepare_bound_run import load_runner
+from atomic_checkpoints import atomic_writer
 
 native = load_runner()
 CONTROL_SHA = hashlib.sha256(b''.join(p.read_bytes() for p in
-    (Path(__file__), Path(__file__).with_name('prepare_bound_run.py'), Path(native.__file__)))).hexdigest()
+    (Path(__file__), Path(__file__).with_name('prepare_bound_run.py'),
+     Path(__file__).with_name('atomic_checkpoints.py'), Path(native.__file__)))).hexdigest()
 TERMINAL = {'complete', 'failed', 'cancelled', 'needs_review'}
 
 
@@ -78,9 +82,7 @@ class Store:
             fcntl.flock(f, fcntl.LOCK_EX)
             state = read(self.root/'state.json') or {'next_id': 1, 'jobs': [], 'events': []}
             yield state
-            temp = self.root/'state.next.json'
-            temp.write_text(json.dumps(state, ensure_ascii=False, indent=2)+'\n')
-            os.replace(temp, self.root/'state.json')
+            atomic_writer(lambda value, path: Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n'))(state, self.root/'state.json')
 
     def snapshot(self):
         return read(self.root/'state.json')
@@ -293,12 +295,38 @@ def query_gpus(gpu_ids):
     return [gpu for gpu in gpu_ids if 0 <= values[gpu] <= 1024]
 
 
+def update_estimates(state):
+    """Reuse the viewer's source-backed remaining inference-time estimates."""
+    filename = state['config'].get('estimate_file')
+    try:
+        payload = read(Path(filename)) if filename else {}
+        estimates = {r['id']: r for r in payload.get('cells', [])}
+    except (OSError, ValueError, KeyError, TypeError):
+        estimates = {}
+    for job in state['jobs']:
+        if job['state'] != 'queued':
+            continue
+        e = estimates.get(job['spec']['cell_id'], {})
+        seconds = e.get('remaining_s', e.get('full_s'))
+        source_matches = (e.get('entry') == job['spec']['row']['model']
+                          and e.get('gpus') == job['spec']['gpus']
+                          and e.get('runtime_source')
+                          and Path(e['runtime_source']).resolve() == (Path(job['spec']['registration'])/'models.yaml').resolve())
+        valid = source_matches and isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0
+        job['estimated_seconds'] = float(seconds) if valid else None
+        job['estimate_source'] = dict(file=filename, updated_at=payload.get('updated_at'),
+                                      kind=e.get('kind'), basis=e.get('progress_basis')) if valid else None
+
+
 def choose(jobs, free_count):
     candidates = [j for j in jobs if j['state'] == 'queued' and j['spec']['gpus'] <= free_count]
     if not candidates:
         return None
     priority = max(j['priority'] for j in candidates)
     candidates = [j for j in candidates if j['priority'] == priority]
+    duration = lambda j: j.get('estimated_seconds') if j.get('estimated_seconds') is not None else math.inf
+    shortest = min(map(duration, candidates))
+    candidates = [j for j in candidates if duration(j) == shortest]
     models = {j['spec']['model_key']: SimpleNamespace(gpus_per_job=j['spec']['gpus']) for j in jobs}
     order = list(models)
     tasks = [SimpleNamespace(model_key=j['spec']['model_key'], weight=j['spec']['weight'], index=j['id']) for j in candidates]
@@ -346,6 +374,8 @@ def tick(store, children):
     owners = {cell: name for name, value in observations.items() for cell in value.get('owners', {})}
     with store.edit() as state:
         reconcile(state, owners, observations)
+        update_estimates(state)
+        state['scheduling_policy'] = 'shortest_remaining_inference_first'
         state['nodes'] = observations
         state['gpu_error'] = '; '.join(f"{n}: {p['error']}" for n, p in observations.items() if p.get('error')) or None
         state['heartbeat'] = time.time()
@@ -353,11 +383,12 @@ def tick(store, children):
         for name, observation in sorted(observations.items(), key=lambda item: -len(item[1].get('free', []))):
             reserved = {g for j in state['jobs'] if j.get('node', 'local') == name and j['state'] in ('launching', 'running', 'needs_review') for g in j.get('gpu_ids', [])}
             free = [g for g in observation.get('free', []) if g not in reserved]
-            while (job := choose(state['jobs'], len(free))) is not None:
+            while not state.get('paused') and (job := choose(state['jobs'], len(free))) is not None:
                 assigned = free[:job['spec']['gpus']]
                 free = free[len(assigned):]
                 job['attempt'] += 1
-                transition(state, job, 'launching', gpu_ids=assigned, identity=None, node=name)
+                transition(state, job, 'launching', gpu_ids=assigned, identity=None, node=name,
+                           estimated_seconds=job.get('estimated_seconds'), estimate_source=job.get('estimate_source'))
             state['free_gpus'].extend(f'{name}:{g}' for g in free)
     # Claim is durable before Popen. A crash here becomes needs_review, not retry.
     for job in store.snapshot()['jobs']:
@@ -409,7 +440,7 @@ def worker(store, job_id, attempt):
                     writer.writeheader(); writer.writerow(spec['row'])
                 cmd = ['bash', config['launcher'], spec['run_id'], '--task-manifest', str(manifest),
                        '--gpu-ids', ','.join(job['gpu_ids']), '--nodes', '1', '--node-rank', '0',
-                       '--gpu-ready-timeout', '600']
+                       '--gpu-ready-timeout', '600', '--atomic-checkpoints']
                 with (directory/'native.log').open('a') as log:
                     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                             pass_fds=(lock.fileno(),))
@@ -423,6 +454,70 @@ def worker(store, job_id, attempt):
         latest = next(j for j in state['jobs'] if j['id'] == job_id)
         if latest['attempt'] == attempt:
             transition(state, latest, status, reason=reason, gpu_ids=[])
+
+
+def resume_instance(store, nodes_file=None, instance_id=None, previous_status=None, previous_task=None):
+    """Reattach durable work only after the old controller and workers are gone."""
+    with (store.root/'daemon.lock').open('a+') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        saved = store.snapshot()
+        old_config = saved['config']
+        proof = None
+        if nodes_file:
+            proof = read(previous_status) if previous_status else {}
+            reason = str(proof.get('status', {}).get('reason', '')).lower()
+            terminal = {'completed','failed','stopped','killed','cancelled','canceled','succeeded','terminated','error','evicted','oomkilled'}
+            env = {v['key']: v['value'] for v in proof.get('spec', {}).get('podCommon', {}).get('environments', [])}
+            if (not previous_task or proof.get('meta', {}).get('name') != previous_task or reason not in terminal
+                    or old_config.get('instance_id') != env.get('RUN_ID', '')+'/'+env.get('CTL_EXP_RUN_TS', '')
+                    or not instance_id):
+                raise ValueError('require matching terminal job-pack get JSON for the previous submission')
+        else:
+            observations = collect_nodes(store)
+            own_cells = {j['spec']['cell_id'] for j in saved['jobs']}
+            if any(p.get('error') or own_cells.intersection(p.get('owners', {})) or any(p.get('workers', {}).values()) for p in observations.values()):
+                raise ValueError('previous node/workers remain live or unknown; cannot resume')
+        for job in saved['jobs']:
+            root = Path(job['spec']['path'])
+            if locked(root/'.host-queue.lock') or locked(root/'eval/.worker.lock'):
+                raise ValueError('a native inference or evaluator still owns a cell')
+            validate(job['spec'])
+            if artifact_state(job['spec']) != 'complete':
+                for checkpoint in root.rglob('*.pkl'):
+                    if checkpoint.name.startswith('.'):
+                        continue
+                    try:
+                        with checkpoint.open('rb') as f:
+                            pickle.load(f)
+                    except Exception as exc:
+                        raise ValueError(f'checkpoint unreadable; preserve and repair instead of discarding: {checkpoint}') from exc
+        terminal = store.root/'terminal.json'
+        if terminal.exists():
+            terminal.rename(store.root/f'terminal-before-resume-{time.time_ns()}.json')
+        with store.edit() as state:
+            state.setdefault('resume_history', []).append(dict(config=state['config'].copy(),
+                daemon=state.get('daemon'), at=time.time(), previous_task=previous_task, terminal_proof=proof))
+            if nodes_file:
+                proposed = read(nodes_file)
+                if not proposed or sum(not n.get('ssh') for n in proposed.values()) != 1:
+                    raise ValueError('replacement topology requires exactly one main node')
+                if any(not n.get('gpu_ids') or len(set(n['gpu_ids'])) != len(n['gpu_ids']) or not all(g.isdigit() for g in n['gpu_ids']) or not isinstance(n.get('ssh', []), list) for n in proposed.values()):
+                    raise ValueError('invalid replacement topology')
+                state['config'].update(nodes=proposed, instance_id=instance_id)
+            state.pop('node_identities', None)
+            state.pop('daemon', None)
+            state.pop('heartbeat', None)
+            state.pop('nodes', None)
+            state['paused'] = False
+            state['closed_for_admission'] = False
+            for job in state['jobs']:
+                if artifact_state(job['spec']) == 'complete':
+                    transition(state, job, 'complete', identity=None, gpu_ids=[])
+                elif job['state'] != 'cancelled' and (job['state'] != 'failed'
+                        or job.get('reason', '').startswith('owner exited without complete score')
+                        or any(f'rc={rc};' in job.get('reason', '') for rc in (-9, -15, 137, 143))):
+                    transition(state, job, 'queued', identity=None, gpu_ids=[], node=main_node(state['config']),
+                               reason='explicit resume of stopped instance; preserve native prediction/judge caches')
 
 
 def main():
@@ -441,6 +536,11 @@ def main():
     listing = sub.add_parser('list'); listing.add_argument('--json', action='store_true')
     sub.add_parser('serve')
     sub.add_parser('close')
+    sub.add_parser('pause'); sub.add_parser('unpause')
+    resuming = sub.add_parser('resume')
+    resuming.add_argument('--nodes-file', type=Path); resuming.add_argument('--instance-id')
+    resuming.add_argument('--previous-status', type=Path); resuming.add_argument('--previous-task')
+    estimating = sub.add_parser('estimates'); estimating.add_argument('--file', type=Path, required=True)
     probing = sub.add_parser('probe'); probing.add_argument('--node', required=True)
     for name in ('remove', 'retry', 'priority', 'worker'):
         p = sub.add_parser(name); p.add_argument('--id', type=int, required=True)
@@ -481,6 +581,17 @@ def main():
         print(json.dumps(probe(store, a.node)))
     elif a.command == 'close':
         with store.edit() as state: state['closed_for_admission'] = True
+    elif a.command in ('pause','unpause'):
+        with store.edit() as state: state['paused'] = a.command == 'pause'
+    elif a.command == 'resume':
+        resume_instance(store, a.nodes_file, a.instance_id, a.previous_status, a.previous_task)
+    elif a.command == 'estimates':
+        payload = read(a.file)
+        if not isinstance(payload.get('cells'), list):
+            raise ValueError('expected the viewer runtime-estimates.json export')
+        with store.edit() as state:
+            state['config']['estimate_file'] = str(a.file.resolve())
+            update_estimates(state)
     elif a.command == 'add':
         specs = registered_specs(store.snapshot()['config'], a.run_id, a.cell, a.all)
         print(json.dumps(enqueue(store, specs, a.priority, a.observe)))
