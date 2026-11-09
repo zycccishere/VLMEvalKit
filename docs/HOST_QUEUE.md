@@ -63,8 +63,17 @@ a deliberate fresh experiment needs a separately registered result identity.
 
 ## Process and artifact ownership
 
-The JSON ledger is protected by `flock` and atomic rename. One daemon owns the
-host queue. Claims reserve GPU IDs before children load models. Admission and
+The JSON ledger has exactly one writer: the main controller's kernel. `flock`
+and atomic rename only hold within one kernel, so on the multi-node shared
+volume workers never edit `state.json` — they report through write-once
+`started.json` / `outcome.json` files in their own attempt directory, and the
+main tick applies them (`apply_attempt_records`). Transient unreadable
+markers simply wait for the next tick; a missing or empty ledger on an
+initialized root aborts the edit instead of silently recreating one (a
+recreated empty ledger once destroyed `config` and crashed the main with
+`KeyError: 'config'`). Development-machine commands route over SSH via
+`--via` so every write lands on the main's kernel. Claims reserve GPU IDs
+before children load models. Admission and
 launch recheck the frozen configuration hashes. Repeated admission is
 idempotent by cell ID; altered configuration under the same ID is rejected.
 Each execution child holds a per-cell lock inherited by the native controller.

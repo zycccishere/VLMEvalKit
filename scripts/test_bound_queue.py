@@ -180,6 +180,48 @@ class QueueTests(unittest.TestCase):
         q.resume_instance(self.store,nodes,'run/new',receipt,'task-old')
         s=self.store.snapshot();self.assertEqual(s['config']['instance_id'],'run/new');self.assertEqual(len(s['resume_history']),1)
 
+    def test_worker_reports_via_files_and_never_touches_ledger(self):
+        spec=self.register('left','A');q.enqueue(self.store,[spec])
+        with self.store.edit() as state:state['jobs'][0].update(state='launching',attempt=1,gpu_ids=['0'],node='local')
+        (self.store.root/'attempts/1-1').mkdir(parents=True)
+        before=(self.store.root/'state.json').read_bytes()
+        q.worker(self.store,1,1)
+        self.assertEqual((self.store.root/'state.json').read_bytes(),before)  # single-writer: ledger untouched
+        directory=self.store.root/'attempts/1-1'
+        self.assertTrue((directory/'started.json').exists() and (directory/'outcome.json').exists())
+        with self.store.edit() as state:q.apply_attempt_records(state,self.store.root)
+        job=self.store.snapshot()['jobs'][0]
+        self.assertIn(job['state'],('running','scoring','complete'))
+
+    def test_edit_refuses_to_recreate_ledger_on_initialized_root(self):
+        # Regression: a worker whose volume view lacked state.json once recreated
+        # an empty ledger, destroying config and crashing the main controller.
+        (self.store.root/'shared-token').write_text('bootstrap-token')
+        (self.store.root/'state.json').unlink()
+        with self.assertRaises(ValueError):self.store.edit().__enter__()
+        (self.store.root/'state.json').write_text('')
+        with self.assertRaises(ValueError):self.store.edit().__enter__()
+
+    def test_apply_attempt_records_guards_stale_and_bogus_outcomes(self):
+        spec=self.register('left','A');q.enqueue(self.store,[spec])
+        directory=self.store.root/'attempts/1-2';directory.mkdir(parents=True)
+        q.atomic_json(directory/'outcome.json',dict(status='complete',reason='stale attempt',attempt=1))
+        with self.store.edit() as state:
+            state['jobs'][0].update(state='running',gpu_ids=['0'],node='local',identity=q.identity(os.getpid()))
+            q.apply_attempt_records(state,self.store.root)
+            self.assertEqual(state['jobs'][0]['state'],'running')  # attempt mismatch ignored
+        q.atomic_json(directory/'outcome.json',dict(status='skipped',reason='gate failed',attempt=2))
+        with self.store.edit() as state:state['jobs'][0].update(state='running',attempt=2)
+        self.until(lambda:self.store.snapshot()['jobs'][0]['state']=='needs_review')
+        reason=self.store.snapshot()['jobs'][0].get('reason','')
+        self.assertIn('gate failed',reason)
+        directory2=self.store.root/'attempts/1-3';directory2.mkdir(parents=True)
+        q.atomic_json(directory2/'outcome.json',dict(status='weird-status',attempt=3))
+        with self.store.edit() as state:
+            state['jobs'][0].update(state='launching',attempt=3,gpu_ids=['0'],node='local')
+            q.apply_attempt_records(state,self.store.root)
+            self.assertEqual(state['jobs'][0]['state'],'needs_review')
+
     def test_concurrent_admission_and_legacy_pending_owner(self):
         spec=self.register('left','A')
         cmd=[sys.executable,str(Path(q.__file__).resolve()),'--root',str(self.store.root),

@@ -71,6 +71,11 @@ def locked(path):
             return True
 
 
+def atomic_json(path, payload):
+    atomic_writer(lambda value, target: Path(target).write_text(
+        json.dumps(value, ensure_ascii=False, indent=2)+'\n'))(payload, str(path))
+
+
 class Store:
     def __init__(self, root):
         self.root = Path(root)
@@ -80,9 +85,20 @@ class Store:
     def edit(self):
         with (self.root/'state.lock').open('a+') as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            state = read(self.root/'state.json') or {'next_id': 1, 'jobs': [], 'events': []}
+            path = self.root/'state.json'
+            if path.exists():
+                # A worker once saw a volume view without this file and silently
+                # recreated an empty ledger, destroying config and jobs. An
+                # initialized root must never fall back to a fresh ledger.
+                state = read(path)
+                if not state:
+                    raise ValueError('queue ledger exists but is empty/unreadable; refusing to reset it')
+            elif (self.root/'shared-token').exists():
+                raise ValueError('initialized queue root lost its ledger; refusing to recreate it')
+            else:
+                state = {'next_id': 1, 'jobs': [], 'events': []}
             yield state
-            atomic_writer(lambda value, path: Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n'))(state, self.root/'state.json')
+            atomic_json(path, state)
 
     def snapshot(self):
         return read(self.root/'state.json')
@@ -378,6 +394,43 @@ def reconcile(state, owners, observations=None):
             transition(state, job, actual, gpu_ids=[])
 
 
+REPORTED = TERMINAL | {'scoring', 'observing'}
+
+
+def apply_attempt_records(state, root):
+    """Single-writer intake: apply worker started/outcome files to the ledger.
+
+    Workers never edit state.json (cross-host flock is not exclusive and file
+    visibility can lag on the shared volume). They record write-once markers in
+    their own attempt directory; only this controller, on its own kernel,
+    turns them into transitions. A transiently unreadable marker simply waits
+    for the next tick.
+    """
+    for job in state['jobs']:
+        if job['state'] not in ('launching', 'running'):
+            continue
+        directory = Path(root)/'attempts'/f"{job['id']}-{job['attempt']}"
+        try:
+            started = read(directory/'started.json') if job['state'] == 'launching' else None
+            outcome = read(directory/'outcome.json')
+        except (OSError, ValueError):
+            continue  # transient cross-host view; retry next tick
+        if started and started.get('attempt') == job['attempt']:
+            transition(state, job, 'running', identity=started.get('identity'))
+        if job['state'] in ('launching', 'running') and outcome:
+            if outcome.get('attempt') != job['attempt']:
+                continue
+            status = outcome.get('status')
+            if status == 'skipped':
+                transition(state, job, 'needs_review', gpu_ids=[],
+                           reason=f"worker skipped attempt: {outcome.get('reason')}")
+            elif status in REPORTED:
+                transition(state, job, status, reason=outcome.get('reason'), gpu_ids=[])
+            else:
+                transition(state, job, 'needs_review', gpu_ids=[],
+                           reason=f'unrecognized worker outcome status: {status!r}')
+
+
 def tick(store, children):
     for pid, proc in list(children.items()):
         if proc.poll() is not None:
@@ -386,6 +439,7 @@ def tick(store, children):
     owners = {cell: name for name, value in observations.items() for cell in value.get('owners', {})}
     with store.edit() as state:
         reconcile(state, owners, observations)
+        apply_attempt_records(state, store.root)
         update_estimates(state)
         state['scheduling_policy'] = 'shortest_remaining_inference_first'
         state['nodes'] = observations
@@ -422,18 +476,38 @@ def tick(store, children):
 
 
 def worker(store, job_id, attempt):
-    with store.edit() as state:
-        job = next(j for j in state['jobs'] if j['id'] == job_id)
-        if job['state'] != 'launching' or job['attempt'] != attempt:
-            return
-        transition(state, job, 'running', identity=identity(os.getpid()))
-        config = state['config']
+    """Execute one attempt without ever writing the shared ledger.
+
+    The queue root sits on a volume shared across nodes, where flock is not
+    exclusive between kernels and file visibility can lag. Only the main
+    controller's kernel may write state.json; this worker reports through
+    write-once files in its exclusively owned attempt directory, and the
+    main tick applies them (apply_attempt_records).
+    """
+    directory = store.root/'attempts'/f'{job_id}-{attempt}'
+    state = {}
+    for _ in range(10):
+        try:
+            state = store.snapshot() or {}
+            break
+        except (OSError, ValueError):
+            time.sleep(1)  # transient cross-host view; the ledger is never written here
+    config = state.get('config') or {}
+    job = next((j for j in state.get('jobs', []) if j['id'] == job_id), None)
+    def outcome(status, reason):
+        atomic_json(directory/'outcome.json', dict(status=status, reason=reason,
+                     attempt=attempt, identity=identity(os.getpid()), at=time.time()))
+    if not job or job['state'] != 'launching' or job['attempt'] != attempt:
+        outcome('skipped', 'job no longer launching or attempt superseded')
+        return
+    atomic_json(directory/'started.json', dict(attempt=attempt,
+                identity=identity(os.getpid()), at=time.time()))
     spec = job['spec']
     root = Path(spec['path'])
     root.mkdir(parents=True, exist_ok=True)
     status, reason = 'failed', ''
     try:
-        if store.snapshot().get('control_source_sha', CONTROL_SHA) != CONTROL_SHA:
+        if state.get('control_source_sha', CONTROL_SHA) != CONTROL_SHA:
             raise ValueError('controller source changed; do not mix execution-control versions')
         validate(spec)
         # Includes legacy controller pending lists, so a new queue cannot steal
@@ -445,7 +519,6 @@ def worker(store, job_id, attempt):
         else:
             with (root/'.host-queue.lock').open('a+') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                directory = store.root/'attempts'/f'{job_id}-{attempt}'
                 manifest = directory/'task.csv'
                 with manifest.open('w') as f:
                     writer = csv.DictWriter(f, fieldnames=list(spec['row']))
@@ -462,10 +535,7 @@ def worker(store, job_id, attempt):
                 reason = f'native launcher rc={rc}; artifact={actual}'
     except Exception as exc:
         reason = f'{type(exc).__name__}: {exc}'
-    with store.edit() as state:
-        latest = next(j for j in state['jobs'] if j['id'] == job_id)
-        if latest['attempt'] == attempt:
-            transition(state, latest, status, reason=reason, gpu_ids=[])
+    outcome(status, reason)
 
 
 def resume_instance(store, nodes_file=None, instance_id=None, previous_status=None, previous_task=None):
