@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import csv
 import json
 import math
@@ -13,6 +14,8 @@ import time
 import subprocess
 import sys
 import threading
+import socket
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -293,6 +296,7 @@ class BenchmarkRunner:
         self.node_gpu_ids = split_names(args.gpu_ids or str(matrix.get("node_gpu_ids", "0,1,2,3,4,5,6,7")))
         self.resume_infer = args.resume_infer if args.resume_infer is not None else truthy(matrix.get("resume_infer_default", False))
         self.evaluation_cfg = matrix.get("evaluation", {})
+        self.experiment_cfg = matrix.get("experiment", {})
         self.replay_cfg = matrix.get("replay", {})
         self.answer_format_cfg = matrix.get("answer_format", {})
         self.trace_cfg = matrix.get("trace", {})
@@ -322,6 +326,17 @@ class BenchmarkRunner:
         self.task_manifest_rows: list[dict[str, str]] = []
         self._load_profiles(models_cfg)
         self._load_matrix(matrix, models_cfg)
+        if self.experiment_cfg:
+            bindings = self.experiment_cfg.get("bindings", {})
+            if not self.experiment_cfg.get("run_id"):
+                raise ValueError("experiment.run_id is required")
+            if any(not bindings.get(t.tag, {}).get("cell_id") for t in self.tasks):
+                raise ValueError("Every selected task requires an experiment binding")
+            if self.experiment_cfg.get('execution_sha'):
+                sha = subprocess.check_output(['git', '-C', self.repo_root, 'rev-parse', 'HEAD'], text=True).strip()
+                dirty = subprocess.check_output(['git', '-C', self.repo_root, 'status', '--porcelain'], text=True).strip()
+                if sha != self.experiment_cfg['execution_sha'] or dirty:
+                    raise ValueError('Bound execution checkout changed after registration')
 
     def _resolve_results_root(self, raw: str) -> Path:
         path = Path(raw)
@@ -527,7 +542,7 @@ class BenchmarkRunner:
                 for failure in self.failures:
                     print(f"[NODE][FAILURE] {failure}", flush=True)
                 return 1
-            print(f"[NODE][DONE] node_rank={self.args.node_rank}", flush=True)
+            print(f"[NODE][{'INFERENCE_DONE' if self.evaluation_cfg.get('launch_mode') == 'bg' else 'DONE'}] node_rank={self.args.node_rank}", flush=True)
             return 0
 
         grouped: dict[str, list[Task]] = defaultdict(list)
@@ -569,7 +584,7 @@ class BenchmarkRunner:
             for failure in self.failures:
                 print(f"[NODE][FAILURE] {failure}", flush=True)
             return 1
-        print(f"[NODE][DONE] node_rank={self.args.node_rank}", flush=True)
+        print(f"[NODE][{'INFERENCE_DONE' if self.evaluation_cfg.get('launch_mode') == 'bg' else 'DONE'}] node_rank={self.args.node_rank}", flush=True)
         return 0
 
     def run_gpu_pool(self, assigned: list[Task]) -> None:
@@ -1181,12 +1196,37 @@ except Exception:
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         ensure_dir(path.parent)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".status-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def write_phase_status(self, task: Task, model: ModelSpec, expected: int,
+                           phase: str, status: str, **details: Any) -> None:
+        if not self.experiment_cfg:
+            return
+        payload = self._task_payload(task, model, expected)
+        if details.get("pid"):
+            try:
+                details['pid_start_ticks'] = Path(f"/proc/{details['pid']}/stat").read_text().rsplit(')', 1)[1].split()[19]
+            except FileNotFoundError:
+                pass  # the command may have already completed
+        payload.update(phase=phase, status=status, host=socket.gethostname(),
+                       supervisor_pid=os.getpid(), **details)
+        directory = self.prediction_dir(task) if phase == "inference" else self.eval_output_dir(task)
+        self._write_json(directory / "status.json", payload)
 
     def _task_payload(self, task: Task, model: ModelSpec, expected: int) -> dict[str, Any]:
         return {
             "schema_version": 1,
             "matrix": self.matrix_name,
+            "run_id": self.experiment_cfg.get("run_id"),
+            "binding": self.experiment_cfg.get("bindings", {}).get(task.tag),
             "task": {
                 "tag": task.tag,
                 "index": task.index,
@@ -1269,18 +1309,22 @@ except Exception:
             return False
         return self.acc_complete(task, model)
 
-    def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path) -> int:
+    def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path,
+                       on_start: Any = None) -> int:
         ensure_dir(log_path.parent)
         with log_path.open("w", encoding="utf-8") as log_fh:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=self.repo_root,
                 env=env,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 text=True,
+                pass_fds=((self._eval_lock_fd,) if hasattr(self, "_eval_lock_fd") else ()),
             )
-        return proc.returncode
+            if on_start:
+                on_start(proc.pid)
+            return proc.wait()
 
     def _query_nvidia_smi(self, gpu_ids: list[str]) -> str:
         gpu_arg = ",".join(gpu_ids)
@@ -1407,7 +1451,9 @@ except Exception:
             f"gpus={env['CUDA_VISIBLE_DEVICES']} batch={batch_size}",
             flush=True,
         )
-        rc = self.run_subprocess(cmd, env, log_path)
+        rc = self.run_subprocess(cmd, env, log_path, on_start=lambda pid:
+            self.write_phase_status(task, model, expected_count, "inference", "running",
+                                    pid=pid, log=str(log_path)))
         if rc == 0:
             pred_file = self.infer_file_path(task, model)
             if self.prediction_file_valid(pred_file, expected_count):
@@ -1415,6 +1461,9 @@ except Exception:
             print(f"[DONE][INFER] {task.tag} log={log_path}", flush=True)
         else:
             print(f"[FAIL][INFER] {task.tag} rc={rc} log={log_path}", flush=True)
+        complete = rc == 0 and self.infer_complete(task, model, expected_count)
+        self.write_phase_status(task, model, expected_count, "inference",
+                                "complete" if complete else "failed", returncode=rc, log=str(log_path))
         return rc
 
     def run_eval(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
@@ -1424,6 +1473,19 @@ except Exception:
             print(f"[FAIL][EVAL] {task.tag}: missing fixed prediction file", flush=True)
             return 1
         ensure_dir(self.eval_output_dir(task))
+        env = dict(env)
+        # Each eval subprocess gets its own existing API concurrency gate.
+        # No shared experiment gate may silently turn a per-cell ceiling into
+        # a fleet-wide ceiling. No generation parameter is changed here.
+        if self.experiment_cfg:
+            nproc = int(self.evaluation_cfg.get("nproc", 512))
+            env.pop("LOCAL_LLM", None)
+            env.pop("VLMEVAL_OPENAI_TEMPERATURE", None)
+            env.update(CUDA_VISIBLE_DEVICES="",
+                       VLMEVAL_DYNAMIC_CONCURRENCY_FILE=str(self.eval_output_dir(task) / "concurrency.target"),
+                       VLMEVAL_DYNAMIC_CONCURRENCY_STATUS=str(self.eval_output_dir(task) / "concurrency.status.json"),
+                       VLMEVAL_DYNAMIC_CONCURRENCY_INITIAL=str(nproc),
+                       VLMEVAL_DYNAMIC_CONCURRENCY_CEILING=str(nproc))
         cmd = [
             self.env_profiles[model.env_profile].python,
             "run.py",
@@ -1447,14 +1509,86 @@ except Exception:
             str(self.evaluation_cfg.get("judge", "gpt-4o-mini")),
         ]
         print(f"[START][EVAL] {task.tag}", flush=True)
-        rc = self.run_subprocess(cmd, env, log_path)
+        rc = self.run_subprocess(cmd, env, log_path, on_start=lambda pid:
+            self.write_phase_status(task, model, expected_count, "evaluation", "running",
+                                    pid=pid, log=str(log_path), judge=self.evaluation_cfg.get("judge"),
+                                    nproc=int(self.evaluation_cfg.get("nproc", 8))))
         if rc == 0:
             self.write_eval_manifest(task, model, expected_count, pred_file, rc)
             print(f"[DONE][EVAL] {task.tag} log={log_path}", flush=True)
         else:
             self.write_eval_manifest(task, model, expected_count, pred_file, rc)
             print(f"[FAIL][EVAL] {task.tag} rc={rc} log={log_path}", flush=True)
-        return rc
+        complete = rc == 0 and self.eval_complete(task, model, expected_count)
+        self.write_phase_status(task, model, expected_count, "evaluation",
+                                "complete" if complete else "failed", returncode=rc, log=str(log_path))
+        return rc if rc else (0 if complete else 1)
+
+    def launch_background_eval(self, task: Task, model: ModelSpec, expected: int) -> None:
+        """Detach only the CPU/API evaluation; the existing GPU pool continues."""
+        directory = self.eval_output_dir(task)
+        ensure_dir(directory)
+        lock = (directory / ".worker.lock").open("a+")
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"[SKIP][EVAL] {task.tag}: background worker already owns this cell", flush=True)
+                return
+            if self.eval_complete(task, model, expected):
+                return
+            # Reuse the same runner, config resolution, eval command and final
+            # manifest checks. The inherited lock lasts until the worker exits.
+            cmd = [sys.executable, str(Path(__file__).resolve()),
+                   "--matrix-config", str(self.args.matrix_config.resolve()),
+                   "--model-config", str(self.args.model_config.resolve()),
+                   "--models", task.model_key, "--policies", task.policy_key,
+                   "--modes", task.mode, "--transforms", task.transform, "--datasets", task.dataset,
+                   "--eval-task-tag", task.tag, "--eval-lock-fd", str(lock.fileno())]
+            if self.task_manifest_path:
+                cmd += ["--task-manifest", str(self.task_manifest_path.resolve())]
+            supervisor_log = directory / "worker.log"
+            self.write_phase_status(task, model, expected, "evaluation", "queued", log=str(supervisor_log),
+                                    worker_lock=str(directory / ".worker.lock"))
+            with supervisor_log.open("a") as log:
+                proc = subprocess.Popen(cmd, cwd=self.repo_root, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True, pass_fds=(lock.fileno(),))
+            threading.Thread(target=proc.wait, daemon=True).start()
+            print(f"[BACKGROUND][EVAL] {task.tag} log={supervisor_log}", flush=True)
+        finally:
+            lock.close()
+
+    def run_background_eval(self, tag: str, lock_fd: int) -> int:
+        task = next(t for t in self.tasks if t.tag == tag)
+        model = self.models[task.model_key]
+        expected = -1
+        try:
+            os.fstat(lock_fd)  # launch_background_eval passed a live lock
+            self._eval_lock_fd = lock_fd
+            env = self.build_env(model, task, [])
+            expected = self.get_expected_count(model, env, task.dataset)
+            if not self.infer_complete(task, model, expected):
+                raise RuntimeError("background eval requires complete predictions")
+            if self.eval_complete(task, model, expected):
+                return 0
+            gate_path = self.eval_output_dir(task) / 'concurrency.status.json'
+            if gate_path.exists():
+                previous = self._read_json(gate_path)
+                # The inherited exclusive lock proves the previous scorer is
+                # gone. A killed HTTP worker cannot release its old slots.
+                previous['abandoned_on_resume'] = previous.get('in_flight', 0)
+                previous['in_flight'] = 0
+                self._write_json(gate_path, previous)
+            # Never re-enter inference or clean predictions in this worker.
+            self.run_answer_format(task, model, env)
+            return self.run_eval(task, model, env, expected)
+        except Exception as exc:
+            self.write_phase_status(task, model, expected, "evaluation", "failed",
+                                    error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            os.close(lock_fd)
 
     def run_single_task(self, model: ModelSpec, task: Task, gpu_ids: list[str]) -> None:
         env = self.build_env(model, task, gpu_ids)
@@ -1499,6 +1633,10 @@ except Exception:
 
         if self.eval_complete(task, model, expected_count):
             print(f"[SKIP][EVAL] {task.tag}: complete", flush=True)
+            return
+        launch_mode = str(self.evaluation_cfg.get("launch_mode", "fg")).lower()
+        if launch_mode == "bg":
+            self.launch_background_eval(task, model, expected_count)
             return
         if self.eval_artifacts(task, model):
             print(f"[CLEAN][EVAL] {task.tag}: remove stale eval artifacts", flush=True)
@@ -1556,6 +1694,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-infer", action="store_true", dest="resume_infer")
     parser.add_argument("--no-resume-infer", action="store_false", dest="resume_infer")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--eval-task-tag", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--eval-lock-fd", type=int, default=-1, help=argparse.SUPPRESS)
     parser.set_defaults(resume_infer=None)
     return parser.parse_args()
 
@@ -1563,6 +1703,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     runner = BenchmarkRunner(default_repo_root(), args)
+    if args.eval_task_tag:
+        return runner.run_background_eval(args.eval_task_tag, args.eval_lock_fd)
     return runner.run()
 
 
