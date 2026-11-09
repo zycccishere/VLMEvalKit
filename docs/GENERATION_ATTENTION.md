@@ -99,3 +99,23 @@ TP > 1 的真实模型验收也尚未完成。这些检查验证实现，不提�
 有贡献。它不能单独证明 V2 保留了哪类语义内容，或排除改变注意力归一化的
 一般影响。`all_visible` 只排查实现扰动，不能称为等删边 Sham。
 全量配对准确率与置信区间完成前，不填写 reviewer 的实验证据回应。
+
+## 2026-11-09 原生 greedy 与远端全量运行
+
+用户明确跳过中间模型验收，直接在 `172.27.0.13:22` 使用四组 TP2 全量并发。
+入口改为调用 `Qwen2VLChatReplay._build_vllm_sampling_params`，其实际 vLLM
+默认是 temperature 0、repetition penalty 1、max_tokens 2048。初版 smoke 使用的
+.01/1.05 来自其他推理入口的构造参数；历史文件不修改，历史技术 parity 仍是
+同配置内部对照，不声称与 B1 解码一致。全量三臂均使用修正后的相同配置。
+
+`--logprobs 0 --conditions slp,no_write,vtt` 关闭正式生成的逐token log-prob收集，
+保留预测、token数、finish reason和逐worker mask审计。技术全放行模式仍要求
+logprobs开启。随机种子按原始行偏移分配，不随分片边界重置。
+
+`scripts/run_generation_attention_batch.py --config <config.json>` 是固定四组的
+子进程驱动，每组加载一次原生LLM并依次跑三臂；不是新的通用调度器。它核对
+执行主机、干净提交和八卡余量，记录每组PID、命令、日志与退出码，不自动重跑。
+全部分片成功后，`score_generation_attention` 核对配置/源码/数据hash与每臂
+447个原始index的唯一完整性，转换为标准预测表，再调用原生 `LogicVista.evaluate`。
+判分复用 `run_bound.sh` 的凭据加载及清除 `LOCAL_LLM`/温度覆盖规则，实际模型为
+gpt-4o-mini-2024-07-18，nproc 512。评分失败与推理失败分别记录，保留已完成产物。

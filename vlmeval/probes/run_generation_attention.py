@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -18,6 +19,34 @@ from vlmeval.probes.readout_v2 import write_json, sha256_file
 from vlmeval.probes.standard_entry_parity import build_standard_prompt, repo_git_snapshot
 from vlmeval.vlm.qwen2_vl.prompt import Qwen2VLPromptMixin
 from vlmeval.vlm.replay_policy import apply_replay
+
+
+def native_greedy_params(args):
+    """Reuse the actual vLLM entry, not the HF/LMDeploy constructor defaults."""
+    from vlmeval.vlm.qwen2_vl.model import Qwen2VLChatReplay
+    base = Qwen2VLChatReplay._build_vllm_sampling_params(
+        SimpleNamespace(max_new_tokens=args.max_tokens))
+    expected = dict(temperature=0.0, top_p=1.0, repetition_penalty=1.0,
+                    presence_penalty=0.0, frequency_penalty=0.0, min_p=0.0)
+    for key, value in expected.items():
+        if getattr(base, key) != value:
+            raise ValueError(f'Native greedy contract overridden: {key}={getattr(base, key)}')
+    if base.max_tokens != args.max_tokens or base.stop_token_ids or base.stop:
+        raise ValueError('Unexpected native output-budget/stop override')
+    params = []
+    for i in range(args.limit):
+        sample = base.clone()
+        sample.seed = args.seed + args.offset + i
+        sample.logprobs = args.logprobs or None
+        params.append(sample)
+    fields = [*expected, 'top_k', 'max_tokens', 'stop', 'stop_token_ids',
+              'ignore_eos', 'skip_special_tokens', 'spaces_between_special_tokens']
+    effective = {key: getattr(base, key) for key in fields}
+    if hasattr(base, 'watermarking'):
+        effective['watermarking'] = base.watermarking
+    effective.update(logprobs=args.logprobs or None,
+                     sample_seeds=[p.seed for p in params], source='Qwen2VLChatReplay._build_vllm_sampling_params')
+    return params, effective
 
 
 def prepare(args):
@@ -70,7 +99,9 @@ def run(args):
         raise ValueError('Conditions must be unique members of slp,all_visible,no_write,vtt')
     if min(args.limit, args.tp, args.batch_size, args.max_tokens) <= 0 or args.offset < 0:
         raise ValueError('Counts must be positive and offset nonnegative')
-    from vllm import LLM, SamplingParams
+    if 'all_visible' in conditions and args.logprobs < 1:
+        raise ValueError('Technical parity requires first-token logprobs')
+    from vllm import LLM
     from vlmeval.probes.generation_attention import image_bounds
     out = Path(args.output)
     out.mkdir(parents=True,exist_ok=True)
@@ -79,17 +110,21 @@ def run(args):
     rows, token_ids = prepare(args)
     if len(rows) != args.limit:
         raise ValueError(f'Requested {args.limit} samples, found {len(rows)}; check offset/limit')
+    params, effective_sampling = native_greedy_params(args)
     source_root = Path(__file__).resolve().parents[2]
     import vllm.v1.attention.backends.flex_attention as flex_backend
     manifest = dict(args=vars(args),kind='normal_generation_attention',dataset='LogicVista',
         dataset_sha256=sha256_file(Path(os.environ['LMUData'])/'LogicVista.tsv'),
         versions={p:importlib.metadata.version(p) for p in ['torch','transformers','vllm']},
-        repo=repo_git_snapshot(Path(__file__).resolve().parents[2]),
+        repo=repo_git_snapshot(Path(__file__).resolve().parents[2]),sampling=effective_sampling,
         native_qwen_config_sha256=sha256_file(Path(__file__).resolve().parents[1]/'config_qwen_minimal.py'),
         source_sha256={name:sha256_file(source_root/name) for name in [
             'vlmeval/probes/generation_attention.py', 'vlmeval/probes/run_generation_attention.py',
             'vlmeval/probes/standard_entry_parity.py', 'vlmeval/probes/readout_v2.py',
-            'vlmeval/vlm/replay_policy.py', 'vlmeval/config_qwen_minimal.py']},
+            'vlmeval/probes/score_generation_attention.py',
+            'vlmeval/vlm/replay_policy.py', 'vlmeval/vlm/qwen2_vl/model.py',
+            'vlmeval/config_qwen_minimal.py', 'vlmeval/dataset/image_vqa.py',
+            'vlmeval/dataset/utils/logicvista.py']},
         flex_backend_sha256=sha256_file(Path(flex_backend.__file__)),
         model_metadata_sha256={p.name:sha256_file(p) for p in Path(args.model).glob('*.json')},
         weight_files=[dict(name=p.name,size=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns)
@@ -120,9 +155,6 @@ def run(args):
         mask = 'native' if condition in ['slp','vtt'] else condition
         llm.collective_rpc('set_generation_intervention',args=(mask,))
         requests = [r['prompts']['vtt' if condition=='vtt' else 'slp'] for r in rows]
-        params = [SamplingParams(temperature=args.temperature,top_p=1.0,top_k=-1,
-            repetition_penalty=1.05,max_tokens=args.max_tokens,seed=args.seed+i,
-            logprobs=5) for i in range(len(rows))]
         t0 = time.monotonic()
         result = llm.generate(requests,params,use_tqdm=True)
         elapsed = time.monotonic()-t0
@@ -186,7 +218,8 @@ def main():
     p.add_argument('--max-batched-tokens',type=int)
     p.add_argument('--max-tokens',type=int,default=2048)
     p.add_argument('--seed',type=int,default=20261109)
-    p.add_argument('--temperature',type=float,default=.01)
+    p.add_argument('--temperature',type=float,default=0.0,choices=[0.0])
+    p.add_argument('--logprobs',type=int,default=5,choices=range(0,21))
     p.add_argument('--gpu-memory-utilization',type=float,default=.85)
     p.add_argument('--conditions',default='slp,all_visible,no_write,vtt')
     p.add_argument('--prepare-only',action='store_true')
