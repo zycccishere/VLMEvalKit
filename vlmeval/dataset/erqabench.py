@@ -121,3 +121,96 @@ class ERQABench(ImageVQADataset):
             order=self._task_category(),
             dataset_name=getattr(self, 'dataset_name', 'ERQA')
         )
+
+
+class ERQASingleImage(ERQABench):
+    """Single-image subset of ERQA (EASI leaderboard TSV).
+
+    ERQA contains 287 single-image rows and 113 multi-image rows (2-16 images;
+    all 37 Multi-view Reasoning rows are multi-image). This subset keeps only
+    the single-image rows for image-prompt replay studies, following the same
+    mechanism as MMMUSingleImageDataset (image_mcq.py): the canonical ERQA.tsv
+    is reused and filtered in post_build, so no extra TSV file is stored.
+    """
+
+    DATASET_URL = {
+        'ERQA_SINGLE': ERQABench.DATASET_URL['ERQA'],
+        'ERQA_SINGLE_IMAGE': ERQABench.DATASET_URL['ERQA'],
+    }
+
+    DATASET_MD5 = {
+        'ERQA_SINGLE': ERQABench.DATASET_MD5['ERQA'],
+        'ERQA_SINGLE_IMAGE': ERQABench.DATASET_MD5['ERQA'],
+    }
+
+    SOURCE_DATASET = 'ERQA'
+
+    def load_data(self, dataset):
+        # Reuse the canonical ERQA TSV while exposing a filtered replay-safe alias.
+        original_name = self.dataset_name
+        self.dataset_name = self.SOURCE_DATASET
+        try:
+            return self.prepare_tsv(self.DATASET_URL[dataset], self.DATASET_MD5.get(dataset))
+        finally:
+            self.dataset_name = original_name
+
+    @staticmethod
+    def _is_present(value):
+        if isinstance(value, list):
+            return len(value) > 0
+        return not pd.isna(value)
+
+    @staticmethod
+    def _single_image_row(row):
+        image_count = 0
+        if 'image_path' in row and ERQASingleImage._is_present(row['image_path']):
+            image_count = max(image_count, len(toliststr(row['image_path'])))
+        if 'image' in row and ERQASingleImage._is_present(row['image']):
+            image_count = max(image_count, len(toliststr(row['image'])))
+        return image_count == 1
+
+    def post_build(self, dataset):
+        keep = self.data.apply(self._single_image_row, axis=1)
+        self.data = self.data[keep].copy().reset_index(drop=True)
+
+
+class ERQAMultiImageAt8(ERQASingleImage):
+    """Multi-image ERQA rows (2-16 images), each repeated 8 times ("@8").
+
+    The complement of ERQA_SINGLE: the 113 rows with at least two images, kept
+    in their native ERQABench interleaving (visual_indices) and expanded into
+    8 replicate rows each, so one native run yields all 904 generations and the
+    native ERQABench score is the mean accuracy over every replicate (not
+    pass@8). ``index = source_index * 10 + repeat_index``; ``source_index``,
+    ``repeat_index`` and ``sample_id`` (``ERQA-<source>-rNN``) keep the
+    per-question pairing explicit. Replicates share the source row's image
+    files via ``image_path``, so their visual input is byte-identical.
+    """
+
+    DATASET_URL = {'ERQA_MULTI_IMAGE': ERQABench.DATASET_URL['ERQA']}
+    DATASET_MD5 = {'ERQA_MULTI_IMAGE': ERQABench.DATASET_MD5['ERQA']}
+    REPEATS = 8
+
+    @staticmethod
+    def _image_count(row):
+        image_count = 0
+        for col in ('image_path', 'image'):
+            if col in row and ERQASingleImage._is_present(row[col]):
+                image_count = max(image_count, len(toliststr(row[col])))
+        return image_count
+
+    def post_build(self, dataset):
+        multi = self.data[self.data.apply(self._image_count, axis=1) >= 2]
+        rows = []
+        for _, row in multi.iterrows():
+            source = int(row['index'])
+            images = toliststr(row['image'])
+            for repeat in range(self.REPEATS):
+                copy = row.copy()
+                copy['index'] = source * 10 + repeat
+                copy['source_index'] = source
+                copy['repeat_index'] = repeat
+                copy['sample_id'] = f'ERQA-{source}-r{repeat:02d}'
+                copy['image_path'] = [f'{source}_{i}.jpg' for i in range(len(images))]
+                rows.append(copy)
+        self.data = pd.DataFrame(rows).reset_index(drop=True)
