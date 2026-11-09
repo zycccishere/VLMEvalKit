@@ -119,3 +119,11 @@ logprobs开启。随机种子按原始行偏移分配，不随分片边界重置
 447个原始index的唯一完整性，转换为标准预测表，再调用原生 `LogicVista.evaluate`。
 判分复用 `run_bound.sh` 的凭据加载及清除 `LOCAL_LLM`/温度覆盖规则，实际模型为
 gpt-4o-mini-2024-07-18，nproc 512。评分失败与推理失败分别记录，保留已完成产物。
+
+首轮四组并发中，shard0完整通过112题三臂；其余三组在原生预热阶段、安装干预
+之前，同时在同一Inductor生成文件触发Triton `inspect.getsourcelines` 的OSError
+包装错误。共享缓存的并发可见性是工作假设，未声称已独立复现文件系统根因。
+恢复配置为每个分片分别设置Inductor/Triton/vLLM缓存路径，使用原生环境变量，
+不修改依赖库或attention代码。driver仅补跑失败分片；`reused_shards`经逐文件SHA256
+和completion契约检查后用符号链接引用旧完成分片，合并器继续检查全447题覆盖。
+显存准入只检查实际补跑使用的GPU，不要求空闲但不会使用的卡也保持空闲。
