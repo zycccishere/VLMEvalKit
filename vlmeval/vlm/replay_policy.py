@@ -12,10 +12,10 @@ REPLAY_IMAGE_TEXT_TEXT = "image_text_text"
 REPLAY_IMAGE_TEXT_IMAGE_TEXT = "image_text_image_text"
 REPLAY_IMAGE_TEXT_IMAGE = "image_text_image"
 REPLAY_IMAGE_IMAGE_TEXT = "image_image_text"
-# ⟨V,V,T,T⟩ equal-token order control: the same item multiset as SLP
-# ⟨V,T,V,T⟩ (one image copy + one text copy), reordered so both images
-# precede both texts. Token counts match SLP by construction; only the
-# input order differs.
+# ⟨V,V,T,T⟩ item-order control: the same item multiset as SLP
+# ⟨V,T,V,T⟩ (one image copy + one text copy), with images before texts.
+# Equal item counts do not guarantee equal engine token counts: verify the
+# model/version-specific chat parser and multimodal processor separately.
 REPLAY_IMAGE_IMAGE_TEXT_TEXT = "image_image_text_text"
 # Multi-image-copy SLP tiers: <V,T,V,...,V,T> with 2 / 3 image copies between
 # the two text copies. Combined with the `blank` image transform on image

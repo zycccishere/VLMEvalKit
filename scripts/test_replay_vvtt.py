@@ -1,4 +1,4 @@
-"""VVTT ⟨V,V,T,T⟩ equal-token order control: construction and no silent fallback."""
+"""VVTT ⟨V,V,T,T⟩ item-order control: construction and no silent fallback."""
 import importlib.util
 import sys
 import unittest
@@ -42,8 +42,8 @@ class VVTTModeTests(unittest.TestCase):
         out = apply_replay(content(), REPLAY_IMAGE_IMAGE_TEXT_TEXT)
         self.assertEqual([i["type"] for i in out],
                          ["image", "image", "text", "text"])
-        # Same multiset as SLP ⟨V,T,V,T⟩ (equal tokens by construction),
-        # only the order differs.
+        # Same item multiset as SLP ⟨V,T,V,T⟩; engine token equality
+        # requires the separate native payload audit.
         slp = apply_replay(content(), "image_text_image_text")
         self.assertEqual(count_modalities(out), count_modalities(slp))
         self.assertEqual(out[0]["path"], out[1]["path"])
