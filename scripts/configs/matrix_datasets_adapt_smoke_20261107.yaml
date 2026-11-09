@@ -1,0 +1,54 @@
+# Smoke for newly adapted single-image datasets (BabyVision, ERQA_SINGLE,
+# RealWorldQA, CharXiv_reasoning_val) on Qwen2.5-VL-3B-Instruct-Replay, GPU 7 only.
+# Model fallback: Gemma4-E4B-it-Replay is unreachable on main (full registry only;
+# see the note in models_prompt_replay_smoke.yaml and the config commit message).
+# ~12 samples per dataset via dataset_index_allowlists; both replay modes.
+name: datasets_adapt_smoke_20261107
+repo_root: "{repo_root}"
+results_root: /data/local/yicheng/temporary/scratch/prompt-replay/datasets-adapt/runs/smoke2_datasets_adapt_20261107
+node_gpu_ids: "7"
+datasets:
+  - BabyVision
+  - ERQA_SINGLE
+  - RealWorldQA
+  - CharXiv_reasoning_val
+dataset_index_allowlists:
+  BabyVision: "{repo_root}/configs/index_allowlists/datasets_adapt_smoke_babyvision_20261107.txt"
+  ERQA_SINGLE: "{repo_root}/configs/index_allowlists/datasets_adapt_smoke_erqa_single_20261107.txt"
+  RealWorldQA: "{repo_root}/configs/index_allowlists/datasets_adapt_smoke_realworldqa_20261107.txt"
+  CharXiv_reasoning_val: "{repo_root}/configs/index_allowlists/datasets_adapt_smoke_charxiv_reasoning_val_20261107.txt"
+policies:
+  default:
+    replay_prompt_template_name: identity
+replay_modes:
+  - image_text
+  - image_text_image_text
+models:
+  - qwen25vl_3b
+replay:
+  replay_times: 1
+  template_on_last_replay_text: 1
+  image_copy_mode: reuse_path
+  limit_mm_per_prompt: 2
+  safe_fallback: 0
+  safe_truncate_chars: 6000
+  stage_debug: 1
+  stage_debug_samples: 4
+  prompt_audit: 1
+  prompt_audit_print: 1
+answer_format:
+  enable: 1
+  require_boxed: 0
+  response_col: prediction
+  fallback_col: detailed_prediction
+  max_fails: 50
+evaluation:
+  launch_mode: fg
+  nproc: 8
+  judge: gpt-4o-mini
+  openai_api_key: ""
+  openai_api_base: https://api.openai.com/v1
+worker_monitor:
+  enable: true
+  interval_seconds: 600
+resume_infer_default: false

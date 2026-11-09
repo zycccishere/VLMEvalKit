@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import warnings
 
@@ -22,10 +23,66 @@ from .qwen2_vl.replay_prompt_template import (
     read_prompt_template_config_from_env,
     strip_prompt_template_from_content_for_direct_answer,
 )
+from .replay_image_transform import (
+    V2_TOKEN_BUDGET_PROFILES,
+    V2_TOKEN_FRACTION_TRANSFORMS,
+    apply_image_transform_to_content,
+    canonicalize_image_transform,
+)
 from ..smp import get_gpu_memory, listinstr
 
 VLLM_MAX_IMAGE_INPUT_NUM = 24
 QWEN35_GENERAL_DATASETS = {"AI2D_TEST", "OCRBench", "SEEDBench2_Plus"}
+
+# Explicit thinking control for the Qwen3.5/Qwen3.8 chat template. The template
+# keeps thinking on when `enable_thinking` is undefined, pre-fills an empty
+# `<think>\n\n</think>\n\n` block when it is False, and pre-fills the opening
+# `<think>\n` in the prompt when it is True (see chat_template.jinja of
+# Qwen3.8-27B / Qwen3.5-35B-A3B).
+QWEN35_THINKING_MODES = {'', 'auto', 'on', 'off'}
+
+# Official reasoning-effort levels of the Qwen3.8/Qwen3.5 chat template
+# (Qwen3.8-27B README: "official support for reasoning_effort ... xhigh
+# (default), medium, low"; the template itself hard-errors on other values).
+# Empty string means "leave the template default" (xhigh), so existing entries
+# behave unchanged. Only read when thinking is on; ignored otherwise.
+QWEN35_REASONING_EFFORTS = {'', 'low', 'medium', 'xhigh'}
+
+# Non-thinking decoding presets for the explicit thinking='off' profile
+# (rebuttal run, 2026-11-07; final choice pending user decision):
+# - 'vendor' (historical default): model-card non-thinking sampling
+#   temperature=0.7 / top_p=0.8 / top_k=20 / presence_penalty=1.5;
+# - 'greedy': temperature=0.0 while KEEPING the vendor presence_penalty=1.5
+#   (Qwen3.8 README:505 recommends presence_penalty=1.5 to reduce endless
+#   repetition; vLLM 0.31 applies penalties to the logits before the greedy
+#   argmax, vllm/v1/sample/sampler.py:404 -> :296-301, so the penalty stays
+#   meaningful at temperature=0). top_p/top_k keep the vendor values: they are
+#   argmax-invariant, so they cannot change the greedy token.
+QWEN35_NONTHINK_SAMPLING_PRESETS = {'vendor', 'greedy'}
+
+_THINK_BLOCK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
+
+
+def strip_qwen_thinking(text: str) -> str:
+    """Drop Qwen thinking content so only the final answer remains.
+
+    With `enable_thinking=True` the chat template pre-fills `<think>\\n` in the
+    prompt, so the raw generation is `reasoning...\\n</think>\\n\\nanswer` and the
+    answer is everything after the last `</think>`. A generation that hit the
+    token cap inside thinking has no `</think>` at all and yields no answer.
+    The complete-block form is also handled defensively (e.g. omni variants
+    that emit the opening tag themselves).
+    """
+    if not isinstance(text, str):
+        return text
+    if '</think>' in text:
+        return text.rsplit('</think>', 1)[1].strip()
+    if '<think>' in text:
+        stripped = _THINK_BLOCK_RE.sub('', text)
+        if '<think>' in stripped:
+            stripped = stripped.split('<think>')[0]
+        return stripped.strip()
+    return text
 
 
 def qwen35_is_general_dataset(dataset: str | None) -> bool:
@@ -36,13 +93,74 @@ def resolve_qwen35_generation_profile(
     dataset: str | None,
     *,
     force_no_thinking: bool = False,
+    thinking_mode: str | None = None,
     max_new_tokens: int = 32768,
     thinking_temperature: float = 1.0,
     thinking_top_p: float = 0.95,
     thinking_top_k: int = 20,
     repetition_penalty: float = 1.0,
     presence_penalty: float = 1.5,
-) -> dict[str, int | float | bool]:
+    thinking_presence_penalty: float = 0.0,
+    nonthink_sampling: str = 'vendor',
+    reasoning_effort: str | None = None,
+) -> dict[str, int | float | bool | None]:
+    # Explicit per-entry thinking control (Qwen3.8 / Qwen3.5-MoE replay
+    # entries). `thinking='on'` keeps thinking enabled for every dataset and
+    # policy with the model-card thinking sampling parameters supplied by the
+    # registry entry; `thinking='off'` uses the model-card non-thinking
+    # parameters (identical for Qwen3.8-27B and Qwen3.5-35B-A3B). Empty or
+    # 'auto' keeps the historical dataset/policy-dependent behavior.
+    #
+    # presence_penalty keeps its historical 1.5 default for the legacy
+    # branches below. The thinking branch uses its own
+    # thinking_presence_penalty, whose 0.0 default follows the Qwen3.8-27B
+    # model card's thinking-mode recommendation (presence_penalty=0.0;
+    # 1.5 is the card's non-thinking value). Qwen3.5-35B-A3B's card
+    # recommends 1.5 for thinking as well, so its registry entry passes
+    # 1.5 explicitly; both think entries therefore run with their own
+    # card values.
+    #
+    # nonthink_sampling selects the decoding preset for the explicit
+    # thinking='off' branch only ('vendor' historical default, 'greedy' for
+    # the rebuttal G option); the legacy branches below keep their historical
+    # values regardless of this switch.
+    mode = str(thinking_mode or '').strip().lower()
+    effort = str(reasoning_effort or '').strip().lower()
+    if effort not in QWEN35_REASONING_EFFORTS:
+        raise ValueError(
+            f'Invalid reasoning_effort={reasoning_effort!r}; '
+            f'expected one of {sorted(QWEN35_REASONING_EFFORTS)} '
+            f'(empty = template default xhigh)'
+        )
+    nonthink_preset = str(nonthink_sampling or '').strip().lower() or 'vendor'
+    if nonthink_preset not in QWEN35_NONTHINK_SAMPLING_PRESETS:
+        raise ValueError(
+            f'Invalid nonthink_sampling={nonthink_sampling!r}; '
+            f'expected one of {sorted(QWEN35_NONTHINK_SAMPLING_PRESETS)}'
+        )
+    if mode == 'on':
+        return {
+            'enable_thinking': True,
+            'reasoning_effort': effort or None,
+            'temperature': thinking_temperature,
+            'top_p': thinking_top_p,
+            'top_k': thinking_top_k,
+            'min_p': 0.0,
+            'repetition_penalty': repetition_penalty,
+            'presence_penalty': thinking_presence_penalty,
+            'max_new_tokens': max_new_tokens,
+        }
+    if mode == 'off':
+        return {
+            'enable_thinking': False,
+            'temperature': 0.0 if nonthink_preset == 'greedy' else 0.7,
+            'top_p': 0.8,
+            'top_k': 20,
+            'min_p': 0.0,
+            'repetition_penalty': 1.0,
+            'presence_penalty': 1.5,
+            'max_new_tokens': max_new_tokens,
+        }
     if force_no_thinking:
         return {
             'enable_thinking': False,
@@ -223,6 +341,8 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         temperature: float = 1.0,
         repetition_penalty: float = 1.0,
         presence_penalty: float = 1.5,
+        thinking: str | None = None,
+        nonthink_sampling: str | None = None,
         use_custom_prompt: bool = False,
         system_prompt: str | None = None,
         post_process: bool = False,
@@ -240,6 +360,49 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         self.repetition_penalty = repetition_penalty
         self.presence_penalty = presence_penalty
         self.temperature = temperature
+        self.thinking = str(thinking or '').strip().lower()
+        if self.thinking not in QWEN35_THINKING_MODES:
+            raise ValueError(
+                f'Invalid thinking={thinking!r}; expected one of {sorted(QWEN35_THINKING_MODES)}'
+            )
+        if self.thinking in {'on', 'off'}:
+            print(f'[Qwen35VLChatReplay] explicit thinking mode: {self.thinking}', flush=True)
+        # Non-thinking decoding preset (G=greedy vs S=vendor sampling, see
+        # QWEN35_NONTHINK_SAMPLING_PRESETS above). Constructor arg wins over
+        # the QWEN35_NONTHINK_SAMPLING env var; unset means the historical
+        # 'vendor' default, so every existing entry behaves unchanged.
+        self.nonthink_sampling = (
+            str(nonthink_sampling).strip().lower()
+            if nonthink_sampling is not None
+            else os.environ.get('QWEN35_NONTHINK_SAMPLING', '').strip().lower()
+        ) or 'vendor'
+        if self.nonthink_sampling not in QWEN35_NONTHINK_SAMPLING_PRESETS:
+            raise ValueError(
+                f'Invalid nonthink_sampling={self.nonthink_sampling!r}; '
+                f'expected one of {sorted(QWEN35_NONTHINK_SAMPLING_PRESETS)}'
+            )
+        if self.thinking == 'off':
+            print(
+                f'[Qwen35VLChatReplay] non-thinking sampling preset: {self.nonthink_sampling}',
+                flush=True,
+            )
+        # Official reasoning_effort knob (Qwen3.8-27B / Qwen3.5-35B-A3B chat
+        # template; README: xhigh default / medium / low). Env-driven so model
+        # entries select the tier via task_env without multiplying registry
+        # partials; validated here so a typo hard-fails instead of silently
+        # running the template default. Only forwarded when thinking is on.
+        self.reasoning_effort = os.environ.get('QWEN35_REASONING_EFFORT', '').strip().lower()
+        if self.reasoning_effort not in QWEN35_REASONING_EFFORTS:
+            raise ValueError(
+                f'Invalid QWEN35_REASONING_EFFORT={self.reasoning_effort!r}; '
+                f'expected one of {sorted(QWEN35_REASONING_EFFORTS)} '
+                f'(empty = template default xhigh)'
+            )
+        if self.thinking == 'on' and self.reasoning_effort:
+            print(
+                f'[Qwen35VLChatReplay] reasoning_effort: {self.reasoning_effort}',
+                flush=True,
+            )
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
@@ -287,6 +450,14 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
                 os.environ.get('QWEN35_VLLM_MAX_NUM_SEQS', '').strip()
                 or os.environ.get('VLLM_MAX_NUM_SEQS', '').strip()
             )
+            env_gpu_util = (
+                os.environ.get('QWEN35_VLLM_GPU_UTIL', '').strip()
+                or os.environ.get('VLLM_GPU_UTIL', '').strip()
+            )
+            env_max_num_batched_tokens = (
+                os.environ.get('QWEN35_VLLM_MAX_NUM_BATCHED_TOKENS', '').strip()
+                or os.environ.get('VLLM_MAX_NUM_BATCHED_TOKENS', '').strip()
+            )
             tp_size = resolve_vllm_tp_size(
                 self.model_path,
                 gpu_count,
@@ -296,6 +467,20 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             if max_model_len is None:
                 max_model_len = int(env_max_model_len) if env_max_model_len.isdigit() else 32768
             max_num_seqs = int(env_max_num_seqs) if env_max_num_seqs.isdigit() else 2
+            gpu_utils = kwargs.get('gpu_utils', 0.9)
+            if env_gpu_util:
+                try:
+                    gpu_utils = float(env_gpu_util)
+                except ValueError:
+                    logging.warning(f'Ignoring invalid QWEN35_VLLM_GPU_UTIL={env_gpu_util!r}')
+            llm_kwargs = {}
+            if env_max_num_batched_tokens:
+                if env_max_num_batched_tokens.isdigit():
+                    llm_kwargs['max_num_batched_tokens'] = int(env_max_num_batched_tokens)
+                else:
+                    logging.warning(
+                        f'Ignoring invalid QWEN35_VLLM_MAX_NUM_BATCHED_TOKENS={env_max_num_batched_tokens!r}'
+                    )
             env_enforce_eager = (
                 os.environ.get('QWEN35_VLLM_ENFORCE_EAGER', '').strip().lower()
                 or os.environ.get('VLLM_ENFORCE_EAGER', '').strip().lower()
@@ -314,10 +499,11 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
                     limit_mm_per_prompt=limit_mm,
                     tensor_parallel_size=tp_size,
                     enable_expert_parallel=enable_expert_parallel,
-                    gpu_memory_utilization=kwargs.get('gpu_utils', 0.9),
+                    gpu_memory_utilization=gpu_utils,
                     trust_remote_code=True,
                     enforce_eager=enforce_eager,
                     seed=0,
+                    **llm_kwargs,
                 )
             except Exception as err:
                 print(f'[Qwen35VLChatReplay] vLLM init failed, fallback to transformers: {type(err).__name__}: {err}', flush=True)
@@ -359,6 +545,26 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             '1', 'true', 'yes', 'on'
         }
         self.safe_fallback_truncate_chars = max(512, int(os.environ.get('REPLAY_SAFE_TRUNCATE_CHARS', '6000')))
+        self.image_transform_name = canonicalize_image_transform(os.environ.get('REPLAY_IMAGE_TRANSFORM', 'baseline'))
+        self.image_transform_cache_dir = os.environ.get('REPLAY_IMAGE_TRANSFORM_CACHE_DIR', '').strip()
+        self.image_transform_target_position = max(1, int(os.environ.get('REPLAY_IMAGE_TRANSFORM_TARGET_POSITION', '2')))
+        self._last_replay_meta = {}
+        self._last_image_transform_record = None
+        if self.image_transform_name in V2_TOKEN_FRACTION_TRANSFORMS:
+            image_processor = self.processor.image_processor
+            observed = {
+                'llm_token_stride': int(image_processor.patch_size) * int(image_processor.merge_size),
+                'processor_min_pixels': int(image_processor.size['shortest_edge']),
+                'processor_max_pixels': int(image_processor.size['longest_edge']),
+            }
+            expected = {key: V2_TOKEN_BUDGET_PROFILES['qwen3_vl'][key] for key in observed}
+            if observed != expected:
+                raise ValueError(f'{self.image_transform_name}: checkpoint processor {observed} != qwen3_vl profile {expected}')
+        print(
+            f'[Qwen35VLChatReplay] image_transform={self.image_transform_name} '
+            f'target_position={self.image_transform_target_position}',
+            flush=True,
+        )
         print(f'[Qwen35VLChatReplay] replay_cfg={self.replay_cfg}', flush=True)
         print(f'[Qwen35VLChatReplay] prompt_template_cfg={self.prompt_template_cfg}', flush=True)
         print(f'[Qwen35VLChatReplay] template_on_last_replay_text={self.template_on_last_replay_text}', flush=True)
@@ -370,12 +576,16 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         return resolve_qwen35_generation_profile(
             dataset,
             force_no_thinking=self._prefer_direct_answer_mode(),
+            thinking_mode=self.thinking,
             max_new_tokens=self.max_new_tokens,
             thinking_temperature=self.temperature,
             thinking_top_p=self.top_p,
             thinking_top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
             presence_penalty=self.presence_penalty,
+            thinking_presence_penalty=self.presence_penalty,
+            nonthink_sampling=self.nonthink_sampling,
+            reasoning_effort=self.reasoning_effort,
         )
 
     def _build_transformers_generate_kwargs(self, dataset: str | None = None):
@@ -392,6 +602,15 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
     def _apply_chat_template(self, messages, dataset: str | None = None, **kwargs):
         profile = self._resolve_generation_profile(dataset)
         if profile['enable_thinking']:
+            effort = profile.get('reasoning_effort')
+            if effort:
+                # The Qwen3.8/Qwen3.5 chat template accepts reasoning_effort
+                # natively (verified against chat_template.jinja); if a
+                # processor rejected it, the TypeError fallback in
+                # apply_chat_template_think would silently drop it, so the
+                # banner print above + prompt audit are the run-side evidence
+                # that the tier actually took effect.
+                kwargs.setdefault('reasoning_effort', effort)
             return apply_chat_template_think(self.processor, messages, **kwargs)
         return apply_chat_template_nothink(self.processor, messages, **kwargs)
 
@@ -515,6 +734,49 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
         templated = self._apply_prompt_template_to_content(content, dataset=dataset)
         return self._apply_replay_to_content(templated)
 
+    def _apply_image_transform_pipeline(
+        self,
+        content: list[dict[str, str]],
+        *,
+        inputs: list[dict[str, str]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        replay_meta = next(
+            (dict(s['replay_meta']) for s in inputs if isinstance(s, dict) and isinstance(s.get('replay_meta'), dict)),
+            {},
+        )
+        self._last_replay_meta = replay_meta
+        self._last_image_transform_record = None
+        if self.image_transform_name == 'baseline':
+            return content
+        transformed, transform_record = apply_image_transform_to_content(
+            content,
+            transform_name=self.image_transform_name,
+            sample_meta=replay_meta,
+            cache_dir=self.image_transform_cache_dir or os.path.join(os.getcwd(), '.replay_transform_cache'),
+            dataset_name=str(dataset) if dataset is not None else 'unknown_dataset',
+            image_position=self.image_transform_target_position,
+            model_family='qwen3_vl',
+        )
+        self._last_image_transform_record = transform_record
+        self._stage_debug('image_transform', {'image_transform': self.image_transform_name, 'record': transform_record})
+        self._write_replay_dump({
+            'phase': 'image_transform',
+            'dataset': str(dataset) if dataset is not None else None,
+            'image_transform': self.image_transform_name,
+            'replay_meta': replay_meta,
+            'record': transform_record,
+        })
+        return transformed
+
+    def _request_audit_meta(self) -> dict:
+        meta = {'sample_index': self._last_replay_meta.get('sample_index')}
+        budget = (self._last_image_transform_record or {}).get('v2_token_budget')
+        if budget:
+            meta['v1_llm_tokens'] = budget['v1_llm_tokens']
+            meta['v2_llm_tokens'] = budget['v2_llm_tokens']
+        return meta
+
     def _prepare_content(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
         content = []
         for s in inputs:
@@ -566,9 +828,32 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             else:
                 raise ValueError(f'Invalid message type: {s["type"]}, {s}')
             content.append(item)
-        return self._apply_template_replay_pipeline(content, dataset=dataset)
+        replayed = self._apply_template_replay_pipeline(content, dataset=dataset)
+        return self._apply_image_transform_pipeline(replayed, inputs=inputs, dataset=dataset)
 
     def _post_process_response(self, response: str) -> str:
+        # Entries with explicit thinking control strip model-emitted thinking
+        # content before scoring. This is not limited to thinking='on': with
+        # thinking='off' the chat template pre-fills an empty think block, but
+        # Qwen3.8/Qwen3.5 occasionally open a new implicit thinking block
+        # anyway (observed on LogicVista); `</think>` then unambiguously
+        # separates reasoning from the final answer. Legacy entries (thinking
+        # unset) keep the historical behavior unchanged.
+        if self.thinking in {'on', 'off'} and isinstance(response, str):
+            raw_response = response
+            response = strip_qwen_thinking(response)
+            audit_info = {
+                'thinking_mode': self.thinking,
+                'raw_chars': len(raw_response),
+                'answer_chars': len(response),
+                'raw_has_think_close': '</think>' in raw_response,
+                'raw_has_think_open': '<think>' in raw_response,
+                'raw_preview': self._clip_text(raw_response),
+                'answer_preview': self._clip_text(response),
+            }
+            self._stage_debug('response_thinking_stripped', audit_info)
+            if self._prompt_audit_enabled:
+                self._write_replay_dump({'phase': 'response_thinking_stripped', **audit_info})
         if self.post_process:
             resp = response.split('\boxed{')[-1]
             lt = len(resp)
@@ -730,17 +1015,54 @@ class Qwen35VLChatReplay(Qwen3VLPromptMixin, BaseModel):
             return output.outputs[0].text
         return ''
 
+    def _audit_vllm_outputs(self, outputs, dataset: str | None = None, request_meta: list[dict] | None = None) -> None:
+        """Record per-request finish reasons and token counts for the replay
+        prompt audit (REPLAY_PROMPT_AUDIT + REPLAY_DUMP_DIR), so length-cap
+        truncations inside thinking are visible without reading raw dumps.
+        prompt_tokens is the engine-side prompt length; with request_meta it
+        is keyed by sample_index so per-sample visual-token budgets can be
+        checked across replay conditions."""
+        if not self._prompt_audit_enabled:
+            return
+        try:
+            stats = []
+            for idx, output in enumerate(outputs):
+                prompt_ids = getattr(output, 'prompt_token_ids', None)
+                meta = request_meta[idx] if request_meta and idx < len(request_meta) else {}
+                for comp in getattr(output, 'outputs', []) or []:
+                    token_ids = getattr(comp, 'token_ids', None)
+                    stats.append({
+                        **meta,
+                        'finish_reason': getattr(comp, 'finish_reason', None),
+                        'stop_reason': str(getattr(comp, 'stop_reason', None)),
+                        'generated_tokens': len(token_ids) if token_ids is not None else None,
+                        'prompt_tokens': len(prompt_ids) if prompt_ids is not None else None,
+                    })
+            self._write_replay_dump({
+                'phase': 'vllm_generation_stats',
+                'dataset': str(dataset) if dataset is not None else None,
+                'requests': stats,
+            })
+        except Exception as err:
+            logging.warning(f'vllm generation audit failed: {type(err).__name__}: {err}')
+
     def _generate_inner_vllm_once(self, message, dataset=None):
         sampling_params = self._build_vllm_sampling_params(dataset)
         req = self._build_vllm_request(message, dataset=dataset)
+        request_meta = [self._request_audit_meta()]
         outputs = self.llm.generate([req], sampling_params=sampling_params)
+        self._audit_vllm_outputs(outputs, dataset=dataset, request_meta=request_meta)
         generated_text = self._extract_vllm_output_text(outputs[0])
         return self._post_process_response(generated_text)
 
     def _generate_batch_inner_vllm(self, messages, dataset=None):
         sampling_params = self._build_vllm_sampling_params()
-        reqs = [self._build_vllm_request(message, dataset=dataset) for message in messages]
+        reqs, request_meta = [], []
+        for message in messages:
+            reqs.append(self._build_vllm_request(message, dataset=dataset))
+            request_meta.append(self._request_audit_meta())
         outputs = self.llm.generate(reqs, sampling_params=sampling_params)
+        self._audit_vllm_outputs(outputs, dataset=dataset, request_meta=request_meta)
         return [self._post_process_response(self._extract_vllm_output_text(output)) for output in outputs]
 
     def _run_with_replay_cfg(self, message, dataset, *, replay_mode: str, repeat_times: int) -> str:

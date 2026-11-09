@@ -51,6 +51,18 @@ V2_TOKEN_FRACTION_TRANSFORMS = {
     "v2_tokens_half": 0.5,
     "v2_tokens_quarter": 0.25,
 }
+# Engine-side processor bounds for checkpoint families whose V2 budget differs
+# from the Qwen2.5-VL profile below (preprocessor_config.json; Qwen3.8-27B:
+# size.shortest_edge / size.longest_edge, patch 16 x merge 2). Matched exactly
+# on the wrapper's model_family; every other family keeps its resolved profile.
+V2_TOKEN_BUDGET_PROFILES = {
+    "qwen3_vl": {
+        "model_family": "qwen3_vl",
+        "llm_token_stride": 32,
+        "processor_min_pixels": 65536,
+        "processor_max_pixels": 16777216,
+    },
+}
 IMAGE_TRANSFORM_ALIASES = {
     f"shift_{direction}_vit_token": f"shift_{direction}_one_vit_token"
     for direction in SHIFT_DIRECTIONS
@@ -725,12 +737,13 @@ def apply_image_transform_to_content(
 
     record["original_image_size"] = list(source_image.size)
     if transform in V2_TOKEN_FRACTION_TRANSFORMS:
-        if "processor_min_pixels" not in profile:
-            raise ValueError(f"{transform} is only defined for Qwen-family profiles, got {profile['model_family']}")
+        v2_profile = V2_TOKEN_BUDGET_PROFILES.get(str(model_family or ""), profile)
+        if "processor_min_pixels" not in v2_profile:
+            raise ValueError(f"{transform} is only defined for Qwen-family profiles, got {v2_profile['model_family']}")
         budget = _v2_token_budget_grid(
             source_image.size,
             fraction=V2_TOKEN_FRACTION_TRANSFORMS[transform],
-            profile=profile,
+            profile=v2_profile,
             min_pixels=image_item.get("min_pixels"),
             max_pixels=image_item.get("max_pixels"),
         )

@@ -64,6 +64,23 @@ env_profiles:
       VLMEVAL_VLM_MINIMAL_IMPORT: '1'
       VLMEVAL_LAZY_INIT: '1'
       GEMMA3_USE_VLLM: '1'
+  prompt_replay_vlmeval:
+    python: /data/local/yicheng/venvs/prompt-replay-vlmeval/bin/python
+    pythonpath:
+    - '{repo_root}'
+    base_env:
+      LMUData: '{lmu_data}'
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HOME: /data/local/yicheng/temporary/scratch/prompt-replay/hf-cache
+      OMP_NUM_THREADS: '1'
+      FORCE_LOCAL: 'True'
+      OLD_VERSION: 'False'
+      PYTHONNOUSERSITE: '1'
+      VLMEVAL_USE_GEMMA4_MINIMAL_CONFIG: '1'
+      VLMEVAL_API_MINIMAL_IMPORT: '1'
+      VLMEVAL_VLM_MINIMAL_IMPORT: '1'
+      VLMEVAL_LAZY_INIT: '1'
+      GEMMA4_USE_VLLM: '1'
 models:
   qwen25vl_3b:
     display_name: Qwen2.5-VL-3B
@@ -266,6 +283,26 @@ models:
     task_env:
       MODEL_PATH_GEMMA3_27B: '{model_root}/gemma-3-27b-it'
       GEMMA3_MAX_NEW_TOKENS: '4096'
+  gemma4_e4b:
+    display_name: Gemma4-E4B-it
+    registry_name: Gemma4-E4B-it-Replay
+    env_profile: prompt_replay_vlmeval
+    model_path: /cloud/oss_checkpoints/google/gemma-4-E4B-it
+    runtime:
+      gpus_per_job: 1
+      infer_batch_size: 256
+      max_num_seqs: 256
+      tp_size: 1
+      max_model_len: 8192
+      estimated_dataset_cost: 1.2
+    task_env:
+      MODEL_PATH_GEMMA4_E4B: /cloud/oss_checkpoints/google/gemma-4-E4B-it
+      GEMMA4_MAX_NEW_TOKENS: '4096'
+      GEMMA4_ENABLE_THINKING: '0'
+      GEMMA4_VLLM_GPU_MEMORY_UTILIZATION: '0.9'
+      # User decision 2026-11-07: rebuttal runs decode Gemma-4 non-thinking
+      # greedily (paper protocol; k=1). Wrapper default remains 'official'.
+      GEMMA4_SAMPLING_PRESET: 'greedy'
   gpt_4o_mini:
     display_name: gpt-4o-mini
     registry_name: gpt-4o-mini
