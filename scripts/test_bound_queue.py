@@ -222,6 +222,22 @@ class QueueTests(unittest.TestCase):
             q.apply_attempt_records(state,self.store.root)
             self.assertEqual(state['jobs'][0]['state'],'needs_review')
 
+    def test_transient_owner_sighting_requeues_never_dispatched_cell(self):
+        # Regression (platform 20261109T140450Z): a seconds-long plan/verify
+        # child carrying the registration-wide manifest made external_owners
+        # claim queued cells; when it vanished, reconcile failed them. A
+        # never-dispatched (attempt==0) observing cell must return to queued.
+        spec=self.register('left','A');q.enqueue(self.store,[spec])
+        def snap(job):return {'local':{'error':None,'versions':{str(job['id']):[job['attempt'],job['updated_at']]},
+                                   'workers':{},'artifacts':{str(job['id']):'idle'}}}
+        with self.store.edit() as state:
+            job=state['jobs'][0]
+            q.reconcile(state,{spec['cell_id']:'local'},snap(job))
+            self.assertEqual(job['state'],'observing')
+            q.reconcile(state,{},snap(job))  # owner vanished, artifact idle
+            self.assertEqual(job['state'],'queued')
+            self.assertEqual(job['attempt'],0)
+
     def test_concurrent_admission_and_legacy_pending_owner(self):
         spec=self.register('left','A')
         cmd=[sys.executable,str(Path(q.__file__).resolve()),'--root',str(self.store.root),

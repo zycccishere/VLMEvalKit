@@ -388,6 +388,14 @@ def reconcile(state, owners, observations=None):
             if observations is not None:
                 job['node'] = owners[job['spec']['cell_id']]
         if actual == 'idle':
+            if job['attempt'] == 0 and status == 'observing':
+                # A never-dispatched cell only "lost" a transient external
+                # owner sighting (e.g. a seconds-long plan/verify child of
+                # another cell's launcher carrying the registration-wide
+                # manifest). Nothing of ours ran; return it to the queue.
+                transition(state, job, 'queued', gpu_ids=[], node=main_node(state['config']),
+                           reason='transient external owner sighting cleared; never dispatched')
+                continue
             if status != 'queued':
                 transition(state, job, 'failed', gpu_ids=[], reason='owner exited without complete score; explicit retry required')
         elif actual != status:

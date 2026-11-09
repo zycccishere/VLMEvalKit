@@ -12,6 +12,11 @@ REPLAY_IMAGE_TEXT_TEXT = "image_text_text"
 REPLAY_IMAGE_TEXT_IMAGE_TEXT = "image_text_image_text"
 REPLAY_IMAGE_TEXT_IMAGE = "image_text_image"
 REPLAY_IMAGE_IMAGE_TEXT = "image_image_text"
+# ⟨V,V,T,T⟩ equal-token order control: the same item multiset as SLP
+# ⟨V,T,V,T⟩ (one image copy + one text copy), reordered so both images
+# precede both texts. Token counts match SLP by construction; only the
+# input order differs.
+REPLAY_IMAGE_IMAGE_TEXT_TEXT = "image_image_text_text"
 # Multi-image-copy SLP tiers: <V,T,V,...,V,T> with 2 / 3 image copies between
 # the two text copies. Combined with the `blank` image transform on image
 # positions 2..N+1 these yield <V,T,box,box,T> / <V,T,box,box,box,T>.
@@ -39,6 +44,7 @@ CANONICAL_REPLAY_MODES = {
     REPLAY_IMAGE_TEXT_IMAGE_IMAGE_TEXT,
     REPLAY_IMAGE_TEXT_IMAGE_IMAGE_IMAGE_TEXT,
     REPLAY_IMAGE_TEXT_FILLER_TEXT,
+    REPLAY_IMAGE_IMAGE_TEXT_TEXT,
 }
 SUPPORTED_REPLAY_MODES = CANONICAL_REPLAY_MODES | {REPLAY_NONE}
 
@@ -171,6 +177,12 @@ def _reorder_to_image_image_text_once(content: list[dict[str, Any]], image_copy_
     return vision_items + [_copy_item(x, image_copy_mode) for x in vision_items] + text_items + other_items
 
 
+def _reorder_to_image_image_text_text_once(content: list[dict[str, Any]], image_copy_mode: str) -> list[dict[str, Any]]:
+    text_items, vision_items, other_items = _split_modal_items(content, image_copy_mode)
+    return (vision_items + [_copy_item(x, image_copy_mode) for x in vision_items]
+            + text_items + [_copy_item(x, image_copy_mode) for x in text_items] + other_items)
+
+
 def apply_replay(content: list[dict[str, Any]], mode: str, repeat_times: int = 1, image_copy_mode: str = "reuse_path") -> list[dict[str, Any]]:
     mode = canonicalize_replay_mode(mode)
     if mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
@@ -194,6 +206,8 @@ def apply_replay(content: list[dict[str, Any]], mode: str, repeat_times: int = 1
             out = _reorder_to_text_image_once(out, image_copy_mode=image_copy_mode)
         elif mode == REPLAY_IMAGE_IMAGE_TEXT:
             out = _reorder_to_image_image_text_once(out, image_copy_mode=image_copy_mode)
+        elif mode == REPLAY_IMAGE_IMAGE_TEXT_TEXT:
+            out = _reorder_to_image_image_text_text_once(out, image_copy_mode=image_copy_mode)
         elif mode in REPLAY_MODE_IMAGE_COPY_COUNTS:
             out = _repeat_prompt_with_image_copies_once(
                 out,
