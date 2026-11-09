@@ -115,6 +115,7 @@ def read_replay_config_from_env() -> dict[str, Any]:
         "repeat_times": repeat_times,
         "debug": debug,
         "image_copy_mode": image_copy_mode,
+        "sequence_separator": os.environ.get("REPLAY_SEQUENCE_SEPARATOR", ""),
     }
 
 
@@ -145,9 +146,20 @@ def _repeat_prompt_once(content: list[dict[str, Any]], image_copy_mode: str) -> 
     return content + text_items
 
 
-def _repeat_full_sequence_once(content: list[dict[str, Any]], image_copy_mode: str) -> list[dict[str, Any]]:
+def _separator_item(content: list[dict[str, Any]], separator: str) -> dict[str, Any]:
+    """A text item carrying ``separator`` with the same text key as ``content``
+    (VLMEval messages use ``value``; wrapper-prepared content uses ``text``)."""
+    keys = {k for item in content if item.get("type") == "text" for k in ("value", "text") if k in item}
+    if len(keys) != 1:
+        raise ValueError(f"cannot infer the text key for the replay separator from text keys {sorted(keys)}")
+    return {"type": "text", keys.pop(): separator}
+
+
+def _repeat_full_sequence_once(content: list[dict[str, Any]], image_copy_mode: str, separator: str = "") -> list[dict[str, Any]]:
     copied = [_copy_item(x, image_copy_mode) for x in content]
-    return content + copied
+    if not separator:
+        return content + copied
+    return content + [_separator_item(content, separator)] + copied
 
 
 def _repeat_image_once(content: list[dict[str, Any]], image_copy_mode: str) -> list[dict[str, Any]]:
@@ -183,8 +195,20 @@ def _reorder_to_image_image_text_text_once(content: list[dict[str, Any]], image_
             + text_items + [_copy_item(x, image_copy_mode) for x in text_items] + other_items)
 
 
-def apply_replay(content: list[dict[str, Any]], mode: str, repeat_times: int = 1, image_copy_mode: str = "reuse_path") -> list[dict[str, Any]]:
+def apply_replay(
+    content: list[dict[str, Any]],
+    mode: str,
+    repeat_times: int = 1,
+    image_copy_mode: str = "reuse_path",
+    sequence_separator: str | None = None,
+) -> list[dict[str, Any]]:
+    """``sequence_separator`` (default: env ``REPLAY_SEQUENCE_SEPARATOR``) is an
+    exact text part inserted between the original sequence and its full copy;
+    it is only defined for full-sequence replay and is a hard error elsewhere,
+    so a configured separator can never be silently dropped."""
     mode = canonicalize_replay_mode(mode)
+    if sequence_separator is None:
+        sequence_separator = os.environ.get("REPLAY_SEQUENCE_SEPARATOR", "")
     if mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
         raise RuntimeError(
             "image_text_filler_text requires model-aware filler construction "
@@ -193,13 +217,15 @@ def apply_replay(content: list[dict[str, Any]], mode: str, repeat_times: int = 1
         )
     if is_noop_replay_mode(mode) or repeat_times <= 0:
         return content
+    if sequence_separator and mode != REPLAY_FULL_SEQUENCE:
+        raise ValueError(f"sequence separator is only defined for {REPLAY_FULL_SEQUENCE}, not {mode}")
 
     out = list(content)
     for _ in range(repeat_times):
         if mode == REPLAY_PROMPT:
             out = _repeat_prompt_once(out, image_copy_mode=image_copy_mode)
         elif mode == REPLAY_FULL_SEQUENCE:
-            out = _repeat_full_sequence_once(out, image_copy_mode=image_copy_mode)
+            out = _repeat_full_sequence_once(out, image_copy_mode=image_copy_mode, separator=sequence_separator)
         elif mode == REPLAY_IMAGE:
             out = _repeat_image_once(out, image_copy_mode=image_copy_mode)
         elif mode == REPLAY_TEXT_IMAGE:

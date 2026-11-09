@@ -6,7 +6,7 @@ chat_template_content_format="string")``. With vLLM's default
 to the front of the joined text, so <V,T,V,T> reaches the engine as <V,V,T,T>.
 These tests run vLLM's own parser (``parse_chat_messages``) against the
 checkpoint's ModelConfig, i.e. the code path ``llm.chat`` takes, and check
-that the wrapper enables interleaving.
+that the wrapper enables interleaving and that its prompt replica mirrors it.
 
 CPU only. Needs vllm plus the checkpoint (``MODEL_PATH_MINICPMO45`` or
 ``MODEL_PATH``); those tests are skipped otherwise. Run e.g.:
@@ -16,6 +16,7 @@ CPU only. Needs vllm plus the checkpoint (``MODEL_PATH_MINICPMO45`` or
 """
 import ast
 import os
+import sys
 import unittest
 from pathlib import Path
 
@@ -115,6 +116,18 @@ class EngineParserTests(unittest.TestCase):
         for shape in _IMAGE_FIRST:
             with self.subTest(shape=shape):
                 self.assertEqual(self.render(shape, True), self.render(shape, False))
+
+    def test_prompt_replica_mirrors_parser(self):
+        sys.path.insert(0, str(_REPO))
+        from vlmeval.vlm.minicpm_v_4_5_replay import MiniCPM_V_4_5
+
+        replica = object.__new__(MiniCPM_V_4_5)
+        # Isolate the content join; the chat template step is shared by both.
+        replica._render_vllm_chat_string = lambda content, dataset=None: content
+        for shape in _SHAPES:
+            with self.subTest(shape=shape):
+                _, items = _messages(shape, self.image)
+                self.assertEqual(replica._render_message_prompt_str(items), self.render(shape, True))
 
 
 if __name__ == "__main__":

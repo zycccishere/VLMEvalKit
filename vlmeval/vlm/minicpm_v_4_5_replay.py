@@ -267,21 +267,18 @@ class MiniCPM_V_4_5(BaseModel):
 
     def _render_message_prompt_str(self, message, dataset=None):
         """Chat-template string for ``message`` with the literal image
-        placeholder pattern (pre-replacement), mirroring llm.chat."""
-        texts = [
-            str(item["value"])
-            for item in message
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        image_items = [
-            item
-            for item in message
-            if isinstance(item, dict) and item.get("type") == "image"
-        ]
-        content = "\n".join(texts)
-        if image_items:
-            content = self._minicpm_image_placeholder_pattern() + "\n" + content
-        return self._render_vllm_chat_string(content, dataset=dataset)
+        placeholder pattern (pre-replacement), mirroring llm.chat with
+        ``interleave_mm_strings=True``: one pattern per image at its content
+        position, all parts joined by "\\n"."""
+        parts = []
+        for item in message:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                parts.append(str(item["value"]))
+            elif item.get("type") == "image":
+                parts.append(self._minicpm_image_placeholder_pattern())
+        return self._render_vllm_chat_string("\n".join(parts), dataset=dataset)
 
     def _predict_engine_prompt_len(self, message, dataset=None):
         """Local replica of the engine's prompt length for ``message``.
@@ -1315,8 +1312,8 @@ class MiniCPM_V_4_5_Replay(MiniCPM_V_4_5):
         """⟨V,T,F,T⟩: the ⟨V,T,T⟩ pipeline with a token-matched filler block
         inserted between the two text halves.
 
-        The vLLM chat path joins text parts of the user content with "\\n"
-        (and prepends the image placeholder with the same separator), so the
+        The vLLM chat path joins the user content parts in order with "\\n"
+        (the image placeholder, first here, uses the same separator), so the
         filler lands as its own part between the two question copies; the
         in-context token count of the filler is computed on that exact
         joined chunk. The carrier literal is selected by
