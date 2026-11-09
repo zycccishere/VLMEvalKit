@@ -27,6 +27,13 @@ CONTROL_SHA = hashlib.sha256(b''.join(p.read_bytes() for p in
     (Path(__file__), Path(__file__).with_name('prepare_bound_run.py'),
      Path(__file__).with_name('atomic_checkpoints.py'), Path(native.__file__)))).hexdigest()
 TERMINAL = {'complete', 'failed', 'cancelled', 'needs_review'}
+# Dispatch settles only after the queue has been quiet for this long: serial
+# admissions (each `add` loads the native runner for ~10s) otherwise let the
+# first-registered cells grab every idle GPU before the rest are admitted,
+# and SJF then sees only a truncated candidate set (observed on instance
+# 20261109T142545Z: the 14:27:53 wave took the shortest of 27 admitted cells
+# while 36 more cells arrived seconds later).
+DISPATCH_SETTLE_SECONDS = 15
 
 
 def nodes(config):
@@ -454,10 +461,14 @@ def tick(store, children):
         state['gpu_error'] = '; '.join(f"{n}: {p['error']}" for n, p in observations.items() if p.get('error')) or None
         state['heartbeat'] = time.time()
         state['free_gpus'] = []
+        admission_quiet = not any(j['state'] == 'queued' and
+                                  time.time() - j.get('updated_at', 0) < DISPATCH_SETTLE_SECONDS
+                                  for j in state['jobs'])
+        state['dispatch_holding_for_admission'] = not admission_quiet or None
         for name, observation in sorted(observations.items(), key=lambda item: -len(item[1].get('free', []))):
             reserved = {g for j in state['jobs'] if j.get('node', 'local') == name and j['state'] in ('launching', 'running', 'needs_review') for g in j.get('gpu_ids', [])}
             free = [g for g in observation.get('free', []) if g not in reserved]
-            while not state.get('paused') and (job := choose(state['jobs'], len(free))) is not None:
+            while admission_quiet and not state.get('paused') and (job := choose(state['jobs'], len(free))) is not None:
                 assigned = free[:job['spec']['gpus']]
                 free = free[len(assigned):]
                 job['attempt'] += 1

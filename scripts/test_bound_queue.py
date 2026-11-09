@@ -100,6 +100,8 @@ class QueueTests(unittest.TestCase):
     def test_busy_cards_priority_and_no_duplicate_after_scheduler_restart(self):
         a=self.register('left','A');b=self.register('right','B');q.enqueue(self.store,[a,b])
         q.change(self.store,2,'priority',10)
+        with self.store.edit() as state:
+            for j in state['jobs']: j['updated_at']=time.time()-q.DISPATCH_SETTLE_SECONDS-1  # admission quiet
         with patch.object(q,'query_gpus',return_value=[]):q.tick(self.store,self.children)
         self.assertTrue(all(j['state']=='queued' for j in self.store.snapshot()['jobs']))
         with patch.object(q,'query_gpus',return_value=['1']):q.tick(self.store,self.children)
@@ -238,6 +240,25 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(job['state'],'queued')
             self.assertEqual(job['attempt'],0)
 
+    def test_dispatch_settles_until_admission_is_quiet(self):
+        # Regression (instance 20261109T142545Z): the first wave dispatched the
+        # shortest of only-just-admitted cells while later `add` commands were
+        # still loading the native runner; the whole cluster filled from a
+        # truncated candidate set. Dispatch must wait for a quiet period.
+        a=self.register('left','A');b=self.register('right','B')
+        q.enqueue(self.store,[a])
+        q.tick(self.store,self.children)
+        self.assertEqual(self.store.snapshot()['jobs'][0]['state'],'queued')  # inside settle window
+        self.assertTrue(self.store.snapshot().get('dispatch_holding_for_admission'))
+        with self.store.edit() as state: state['jobs'][0]['updated_at']=time.time()-q.DISPATCH_SETTLE_SECONDS-1
+        q.enqueue(self.store,[b])  # a fresh admission restarts the quiet period
+        q.tick(self.store,self.children)
+        self.assertEqual(self.store.snapshot()['jobs'][0]['state'],'queued')
+        with self.store.edit() as state:
+            for j in state['jobs']: j['updated_at']=time.time()-q.DISPATCH_SETTLE_SECONDS-1
+        q.tick(self.store,self.children)
+        self.assertEqual(self.store.snapshot()['jobs'][0]['state'],'launching')
+
     def test_concurrent_admission_and_legacy_pending_owner(self):
         spec=self.register('left','A')
         cmd=[sys.executable,str(Path(q.__file__).resolve()),'--root',str(self.store.root),
@@ -265,6 +286,7 @@ class QueueTests(unittest.TestCase):
                 'worker':{'gpu_ids':['1'],'ssh':[str(ssh),'fixture-worker']}}
             state['config']['instance_id']='fixture/submission1'
         q.enqueue(self.store,[spec])
+        with self.store.edit() as state: state['jobs'][0]['updated_at']=time.time()-q.DISPATCH_SETTLE_SECONDS-1
         original=q.query_gpus
         with patch.object(q,'query_gpus',side_effect=lambda ids:[] if ids==['0'] else original(ids)):
             q.tick(self.store,self.children)
