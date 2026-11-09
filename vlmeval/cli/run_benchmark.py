@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
+import importlib.util
 import csv
 import json
 import math
@@ -27,6 +29,18 @@ try:
 except ImportError as exc:
     raise SystemExit("PyYAML is required to run vlmeval.cli.run_benchmark") from exc
 
+
+
+@functools.lru_cache(maxsize=1)
+def _replay_policy():
+    """The stdlib-only replay policy, loaded by file path: this runner is also
+    imported by path (prepare_bound_run, queue tests) without ``vlmeval`` on
+    sys.path, and importing the ``vlmeval.vlm`` package would pull wrappers."""
+    path = Path(__file__).resolve().parents[1] / "vlm" / "replay_policy.py"
+    spec = importlib.util.spec_from_file_location("bound_runner_replay_policy", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -856,7 +870,13 @@ class BenchmarkRunner:
         env["REPLAY_MODE"] = task.mode
         env["REPLAY_IMAGE_TRANSFORM"] = task.transform
         env["REPLAY_IMAGE_TRANSFORM_CACHE_DIR"] = str(self.task_root(task) / "_transform_cache" / task.dataset)
-        env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = "2"
+        image_copy_count = _replay_policy().replay_mode_image_copy_count(task.mode)
+        if image_copy_count > 1:
+            env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = ",".join(
+                str(position) for position in range(2, 2 + image_copy_count)
+            )
+        else:
+            env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = "2"
         env["REPLAY_PROMPT_TEMPLATE_NAME"] = policy.replay_prompt_template_name
         env["REPLAY_TIMES"] = str(self.replay_cfg.get("replay_times", 1))
         env["REPLAY_DEBUG"] = "0"
