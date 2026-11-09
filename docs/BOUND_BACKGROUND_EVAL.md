@@ -66,6 +66,15 @@ still determine prediction/score completion. A zero exit without score files
 is failed, not complete. The launcher's `INFERENCE_DONE` message does not mean
 all detached scorers have completed.
 
+For exclusive-card recovery on the current development host, pass
+`--gpu-ready-timeout 600` to the same native launcher. Before each inference
+child it waits for all assigned cards to use at most 1024 MiB (the existing
+topic launch scripts' free-card criterion). Busy or unreadable cards time out
+with failed status and no model launch. The guard is off by default, changes
+no model memory/decoding settings, and does not reserve cards against other
+launchers. It mitigates the observed startup-memory failures; it does not
+establish which process held the card or prove a vLLM cleanup defect.
+
 Each bound eval receives its own existing dynamic-concurrency gate and a
 512-worker ceiling. Multiple cells can therefore exceed 512 fleet-wide.
 Historical overrides of `LOCAL_LLM` or omitted temperature are cleared in

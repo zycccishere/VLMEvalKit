@@ -286,6 +286,9 @@ class BenchmarkRunner:
     def __init__(self, repo_root: Path, args: argparse.Namespace) -> None:
         self.repo_root_path = repo_root
         self.args = args
+        self.gpu_ready_timeout = getattr(args, "gpu_ready_timeout", 0)
+        if self.gpu_ready_timeout < 0:
+            raise ValueError("gpu-ready-timeout must be nonnegative")
         matrix = load_yaml(args.matrix_config)
         models_cfg = load_yaml(args.model_config)
         default_repo_root = str(repo_root)
@@ -1418,10 +1421,46 @@ except Exception:
         if rc != 0:
             print(f"[FAIL][FORMAT] {task.tag}: rc={rc} log={log_path}", flush=True)
 
+    def wait_for_gpu_ready(self, gpu_ids: str) -> bool:
+        """Opt-in exclusive-card guard; placement remains owned by gpu_pool."""
+        if not self.gpu_ready_timeout:
+            return True
+        deadline = time.monotonic() + self.gpu_ready_timeout
+        while True:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "-i", gpu_ids, "--query-gpu=memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, check=True,
+                    timeout=max(.1, min(10, deadline - time.monotonic())),
+                )
+                used = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+                if len(used) != len(gpu_ids.split(",")):
+                    raise ValueError("GPU query returned an unexpected device count")
+                if all(value <= 1024 for value in used):
+                    print(f"[GPU][READY] gpus={gpu_ids} used_mib={used}", flush=True)
+                    return True
+                detail = f"used_mib={used} limit_mib=1024"
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                detail = f"query_error={type(exc).__name__}: {exc}"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(f"[GPU][TIMEOUT] gpus={gpu_ids} {detail}", flush=True)
+                return False
+            print(f"[GPU][WAIT] gpus={gpu_ids} {detail}", flush=True)
+            time.sleep(min(2, remaining))
+
     def run_infer(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
         log_path = self.log_root(task) / "infer" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         ensure_dir(self.model_output_root(task, model))
         ensure_dir(self.prediction_dir(task))
+        if self.gpu_ready_timeout:
+            self.write_phase_status(task, model, expected_count, "inference", "waiting_gpu",
+                                    gpu_ids=env["CUDA_VISIBLE_DEVICES"])
+            if not self.wait_for_gpu_ready(env["CUDA_VISIBLE_DEVICES"]):
+                self.write_phase_status(task, model, expected_count, "inference", "failed",
+                                        returncode=75, reason="gpu_readiness_timeout")
+                return 75
         batch_size = self.infer_batch_size_for_task(model, task)
         cmd = [
             self.env_profiles[model.env_profile].python,
@@ -1674,6 +1713,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodes", type=int, default=detect_num_nodes())
     parser.add_argument("--node-rank", type=int, default=detect_node_rank())
     parser.add_argument("--gpu-ids", type=str, default="")
+    parser.add_argument("--gpu-ready-timeout", type=int, default=0,
+                        help="Opt-in: wait up to N seconds before inference for assigned GPUs to use <=1024 MiB; 0 disables.")
     parser.add_argument("--models", type=str, default="")
     parser.add_argument("--policies", type=str, default="")
     parser.add_argument("--modes", type=str, default="")

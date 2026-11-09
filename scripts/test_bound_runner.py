@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import yaml
@@ -94,6 +95,31 @@ class Tests(unittest.TestCase):
         for t in r.tasks:
             self.assertFalse(r.eval_complete(t,r.models['m'],1))
             self.assertTrue(r.infer_complete(t,r.models['m'],1))
+
+    def test_gpu_guard_waits_for_all_assigned_cards(self):
+        r=self.runner(['A']);r.gpu_ready_timeout=10
+        responses=[native.subprocess.CompletedProcess([],0,'20000\n100\n'),
+                   native.subprocess.CompletedProcess([],0,'100\n100\n')]
+        with patch.object(native.subprocess,'run',side_effect=responses) as query, \
+             patch.object(native.time,'sleep') as sleep:
+            self.assertTrue(r.wait_for_gpu_ready('6,7'))
+            self.assertEqual(query.call_count,2);sleep.assert_called_once()
+            self.assertEqual(query.call_args.args[0][2],'6,7')
+
+    def test_gpu_guard_timeout_never_launches_inference(self):
+        r=self.runner(['A']);r.gpu_ready_timeout=1
+        with patch.object(native.subprocess,'run',return_value=native.subprocess.CompletedProcess([],0,'70000\n')), \
+             patch.object(native.time,'monotonic',side_effect=[0,0,2]), \
+             patch.object(r,'run_subprocess') as launch:
+            self.assertEqual(r.run_infer(r.tasks[0],r.models['m'],{'CUDA_VISIBLE_DEVICES':'7'},1),75)
+            launch.assert_not_called()
+        status=r._read_json(r.prediction_dir(r.tasks[0])/'status.json')
+        self.assertEqual(status['reason'],'gpu_readiness_timeout')
+
+    def test_gpu_guard_disabled_does_not_query(self):
+        r=self.runner(['A'])
+        with patch.object(native.subprocess,'run') as query:
+            self.assertTrue(r.wait_for_gpu_ready('7'));query.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()
