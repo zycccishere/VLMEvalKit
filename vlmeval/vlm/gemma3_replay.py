@@ -91,15 +91,15 @@ def _load_gemma3_transformers_model(model_path: str):
     from transformers import Gemma3ForConditionalGeneration
 
     base_kwargs = {
-        "device_map": "auto",
         "torch_dtype": torch.bfloat16,
     }
     try:
-        return Gemma3ForConditionalGeneration.from_pretrained(
+        model, loading_info = Gemma3ForConditionalGeneration.from_pretrained(
             model_path,
             attn_implementation="flash_attention_2",
+            output_loading_info=True,
             **base_kwargs,
-        ).eval()
+        )
     except Exception as err:
         logging.warning(
             "Gemma3 flash_attention_2 load failed for %s: %s: %s; falling back to default attention",
@@ -107,7 +107,19 @@ def _load_gemma3_transformers_model(model_path: str):
             type(err).__name__,
             err,
         )
-        return Gemma3ForConditionalGeneration.from_pretrained(model_path, **base_kwargs).eval()
+        model, loading_info = Gemma3ForConditionalGeneration.from_pretrained(
+            model_path,
+            output_loading_info=True,
+            **base_kwargs,
+        )
+    loading_errors = {
+        key: list(loading_info.get(key, []))
+        for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+    }
+    if any(loading_errors.values()):
+        raise RuntimeError(f"Gemma3 checkpoint did not load exactly: {loading_errors}")
+    model._replay_checkpoint_loading_info = loading_errors
+    return model.to("cuda").eval()
 
 
 class Gemma3Replay(Qwen3VLPromptMixin, BaseModel):
