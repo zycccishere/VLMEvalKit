@@ -65,7 +65,7 @@ def main():
             assert model_name == 'Qwen3.8-27B'
             allowed = protocol['effort_entries'][condition.split(' · ')[0]]
         assert row['model'] in allowed, ('model entry does not match table cell',cell,row['model'])
-        mode = {'VT':'image_text','VTT':'image_text_text','SLP':'image_text_image_text',
+        mode = {'VT':'image_text','VTT':'image_text_text','SLP':'image_text_image_text','VVTT':'image_image_text_text',
                 '1 blank':'image_text_image_text','2 blank':'image_text_image_image_text',
                 '3 blank':'image_text_image_image_image_text','dots':'image_text_filler_text',
                 'spaces':'image_text_filler_text','noise':'image_text_image_text',
