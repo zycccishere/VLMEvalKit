@@ -104,6 +104,17 @@ def validate(spec):
             raise ValueError(f'prepared configuration changed: {name}')
 
 
+def validate_checkpoints(spec):
+    for checkpoint in Path(spec['path']).rglob('*.pkl'):
+        if checkpoint.name.startswith('.'):
+            continue
+        try:
+            with checkpoint.open('rb') as f:
+                pickle.load(f)
+        except Exception as exc:
+            raise ValueError(f'checkpoint unreadable; preserve and repair instead of discarding: {checkpoint}') from exc
+
+
 def registered_specs(config, run_id, cells, all_cells=False):
     directory = Path(config['registry'])/run_id
     if directory.parent != Path(config['registry']) or not directory.is_dir():
@@ -283,6 +294,7 @@ def change(store, job_id, command, priority=0):
             if active or job['spec']['cell_id'] in owners or observation.get('artifacts', {}).get(str(job_id)) != 'idle':
                 raise ValueError('existing process, lock, or complete result still owns this cell')
             validate(job['spec'])
+            validate_checkpoints(job['spec'])
             transition(state, job, 'queued', identity=None, gpu_ids=[], reason='explicit retry; reuse native predictions')
 
 
@@ -483,20 +495,15 @@ def resume_instance(store, nodes_file=None, instance_id=None, previous_status=No
                 raise ValueError('a native inference or evaluator still owns a cell')
             validate(job['spec'])
             if artifact_state(job['spec']) != 'complete':
-                for checkpoint in root.rglob('*.pkl'):
-                    if checkpoint.name.startswith('.'):
-                        continue
-                    try:
-                        with checkpoint.open('rb') as f:
-                            pickle.load(f)
-                    except Exception as exc:
-                        raise ValueError(f'checkpoint unreadable; preserve and repair instead of discarding: {checkpoint}') from exc
+                validate_checkpoints(job['spec'])
         terminal = store.root/'terminal.json'
         if terminal.exists():
             terminal.rename(store.root/f'terminal-before-resume-{time.time_ns()}.json')
         with store.edit() as state:
             state.setdefault('resume_history', []).append(dict(config=state['config'].copy(),
-                daemon=state.get('daemon'), at=time.time(), previous_task=previous_task, terminal_proof=proof))
+                daemon=state.get('daemon'), at=time.time(), previous_task=previous_task,
+                terminal_proof=dict(path=str(previous_status), sha256=hashlib.sha256(previous_status.read_bytes()).hexdigest(),
+                                    reason=proof['status']['reason']) if proof else None))
             if nodes_file:
                 proposed = read(nodes_file)
                 if not proposed or sum(not n.get('ssh') for n in proposed.values()) != 1:

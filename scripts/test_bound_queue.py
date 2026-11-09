@@ -93,6 +93,9 @@ class QueueTests(unittest.TestCase):
         (self.repo/'release').touch()
         self.until(lambda:all(j['state']=='complete' for j in self.store.snapshot()['jobs'][:2]))
         for ds in ['A','B']:self.assertEqual(len((self.repo/(ds+'.starts')).read_text().splitlines()),1)
+        for job in self.store.snapshot()['jobs'][:2]:
+            for phase in ['predictions','eval']:
+                self.assertEqual(q.read(Path(job['spec']['path'])/phase/'manifest.json')['checkpoint_io'],'atomic-fsync-replace-v1')
 
     def test_busy_cards_priority_and_no_duplicate_after_scheduler_restart(self):
         a=self.register('left','A');b=self.register('right','B');q.enqueue(self.store,[a,b])
