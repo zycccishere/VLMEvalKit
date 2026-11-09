@@ -9,12 +9,14 @@ import json
 import time
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import StoppingCriteria
 
 from ..base import BaseModel
 from .prompt import Qwen2VLPromptMixin
 from ..replay_policy import (
+    REPLAY_IMAGE_TEXT_FILLER_TEXT,
     apply_replay,
     canonicalize_replay_mode,
     is_noop_replay_mode,
@@ -24,6 +26,16 @@ from ..replay_policy import (
 from ..replay_image_transform import (
     apply_image_transform_to_content,
     canonicalize_image_transform,
+    image_rgb_sha256,
+)
+from ..replay_text_filler import (
+    SPACE_FILLER_LITERAL,
+    TextFillerAudit,
+    build_text_filler,
+    count_filler_tokens,
+    filler_literal_for,
+    read_text_filler_type,
+    tokenize_length,
 )
 from .replay_prompt_template import (
     apply_prompt_template_to_content,
@@ -544,6 +556,221 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             "tail": token_ids[-128:],
         }
 
+    @staticmethod
+    def _trace_env_truthy(name: str, default: str = "0") -> bool:
+        return str(os.environ.get(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _trace_safe_token(text: Any) -> str:
+        out = []
+        for ch in str(text):
+            if ch.isalnum() or ch in {"-", "_", "."}:
+                out.append(ch)
+            else:
+                out.append("_")
+        return "".join(out).strip("_") or "sample"
+
+    @staticmethod
+    def _processor_image_slices(processor_inputs: Any) -> list[dict[str, Any]]:
+        grid = processor_inputs.get("image_grid_thw") if hasattr(processor_inputs, "get") else None
+        pixel_values = processor_inputs.get("pixel_values") if hasattr(processor_inputs, "get") else None
+        if grid is None or pixel_values is None:
+            return []
+        try:
+            grid_list = grid.detach().cpu().tolist() if hasattr(grid, "detach") else grid.tolist()
+        except Exception:
+            return []
+        out = []
+        start = 0
+        for idx, row in enumerate(grid_list):
+            if len(row) != 3:
+                continue
+            t, h, w = [int(x) for x in row]
+            count = int(t * h * w)
+            out.append(
+                {
+                    "image_position": idx + 1,
+                    "image_grid_thw": [t, h, w],
+                    "pixel_values_start": start,
+                    "pixel_values_end": start + count,
+                    "pixel_values_count": count,
+                }
+            )
+            start += count
+        return out
+
+    @staticmethod
+    def _load_rgb_image_from_ref(image_ref: str):
+        from PIL import Image
+
+        raw = str(image_ref or "").strip()
+        if raw.startswith("file://"):
+            raw = raw[len("file://") :]
+        with Image.open(raw) as image:
+            return image.convert("RGB")
+
+    @staticmethod
+    def _shift_pil_wrap(image, *, dx: int, dy: int):
+        from PIL import Image
+
+        source = np.asarray(image.convert("RGB"))
+        shifted = np.roll(source, shift=dy, axis=0)
+        shifted = np.roll(shifted, shift=dx, axis=1)
+        return Image.fromarray(shifted.astype(np.uint8), mode="RGB")
+
+    def _expected_vit_patch_images(self, transform_record: dict[str, Any]) -> tuple[Any, Any] | None:
+        from PIL import Image
+
+        shift = transform_record.get("shift")
+        if not isinstance(shift, dict):
+            return None
+        if not shift.get("processed_space") and shift.get("pixel_shift_kind") != "processed_vit_patch":
+            return None
+        if shift.get("pad_mode") != "wrap":
+            return None
+        original_ref = str(transform_record.get("original_image_ref", "")).strip()
+        if not original_ref:
+            return None
+        processed_size = transform_record.get("processed_image_size_before_shift") or transform_record.get("transformed_image_size")
+        if not isinstance(processed_size, list) or len(processed_size) != 2:
+            return None
+        original = self._load_rgb_image_from_ref(original_ref)
+        resized = original.resize(
+            (int(processed_size[0]), int(processed_size[1])),
+            resample=Image.Resampling.BICUBIC,
+        )
+        shifted = self._shift_pil_wrap(
+            resized,
+            dx=int(shift.get("dx", 0) or 0),
+            dy=int(shift.get("dy", 0) or 0),
+        )
+        return resized, shifted
+
+    def _target_pixel_values(
+        self,
+        processor_inputs: Any,
+        image_position: int,
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        pixel_values = processor_inputs.get("pixel_values") if hasattr(processor_inputs, "get") else None
+        slices = self._processor_image_slices(processor_inputs)
+        target = next((item for item in slices if item["image_position"] == image_position), None)
+        if pixel_values is None or target is None:
+            return None, target
+        return pixel_values[target["pixel_values_start"] : target["pixel_values_end"]], target
+
+    def _record_processor_image_transform_validation(
+        self,
+        *,
+        text,
+        images,
+        videos,
+        processor_inputs,
+        dataset: str | None,
+        transform_record: dict[str, Any] | None,
+    ) -> None:
+        if not transform_record or not self._trace_env_truthy("REPLAY_PROCESSOR_TRACE_VALIDATE"):
+            return
+        image_position = int(transform_record.get("target_image_position", 2) or 2)
+        target_index = image_position - 1
+        target_actual, target_slice = self._target_pixel_values(processor_inputs, image_position)
+        payload: dict[str, Any] = {
+            "phase": "processor_image_transform_validation",
+            "dataset": str(dataset) if dataset is not None else None,
+            "image_transform": transform_record.get("transform"),
+            "sample_index": transform_record.get("sample_index"),
+            "target_image_position": image_position,
+            "target_pixel_values_slice": target_slice,
+            "transform_record": transform_record,
+        }
+        if images is None or target_index < 0 or target_index >= len(images):
+            payload["ok"] = False
+            payload["error"] = "target image position is outside extracted image list"
+            self._write_replay_dump(payload, detail="summary")
+            return
+        expected_pair = self._expected_vit_patch_images(transform_record)
+        if expected_pair is None:
+            self._write_replay_dump({**payload, "ok": True, "comparison": "not_applicable"}, detail="summary")
+            return
+        reference_image, expected_shifted_image = expected_pair
+        try:
+            expected_images = list(images)
+            expected_images[target_index] = expected_shifted_image
+            expected_inputs = self.processor(
+                text=text,
+                images=expected_images,
+                videos=videos,
+                padding=True,
+                return_tensors="pt",
+            )
+            expected_target, expected_slice = self._target_pixel_values(expected_inputs, image_position)
+            reference_images = list(images)
+            reference_images[target_index] = reference_image
+            reference_inputs = self.processor(
+                text=text,
+                images=reference_images,
+                videos=videos,
+                padding=True,
+                return_tensors="pt",
+            )
+            reference_target, reference_slice = self._target_pixel_values(reference_inputs, image_position)
+        except Exception as err:
+            payload["ok"] = False
+            payload["error_type"] = type(err).__name__
+            payload["error"] = self._clip_text(str(err))
+            self._write_replay_dump(payload, detail="summary")
+            return
+
+        if target_actual is None or expected_target is None:
+            payload["ok"] = False
+            payload["error"] = "missing target pixel_values slice"
+            self._write_replay_dump(payload, detail="summary")
+            return
+        actual_cpu = target_actual.detach().cpu()
+        expected_cpu = expected_target.detach().cpu()
+        reference_cpu = reference_target.detach().cpu() if reference_target is not None else None
+        same_shape = tuple(actual_cpu.shape) == tuple(expected_cpu.shape)
+        if same_shape:
+            diff = (actual_cpu.float() - expected_cpu.float()).abs()
+            max_abs_diff = float(diff.max().item()) if diff.numel() else 0.0
+            mean_abs_diff = float(diff.mean().item()) if diff.numel() else 0.0
+        else:
+            max_abs_diff = None
+            mean_abs_diff = None
+        npz_path = ""
+        if self._trace_env_truthy("REPLAY_PROCESSOR_TRACE_SAVE_NPZ"):
+            out_dir = os.environ.get("REPLAY_PROCESSOR_TRACE_NPZ_DIR", self._replay_dump_dir or "").strip()
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                name = "_".join(
+                    [
+                        "processor_patch",
+                        self._trace_safe_token(dataset or "dataset"),
+                        self._trace_safe_token(transform_record.get("sample_index", "sample")),
+                        self._trace_safe_token(transform_record.get("transform", "transform")),
+                    ]
+                )
+                npz_path = os.path.join(out_dir, f"{name}.npz")
+                np.savez_compressed(
+                    npz_path,
+                    actual_target_pixel_values=actual_cpu.numpy(),
+                    expected_shifted_target_pixel_values=expected_cpu.numpy(),
+                    reference_unshifted_target_pixel_values=reference_cpu.numpy() if reference_cpu is not None else np.array([]),
+                )
+        payload.update(
+            {
+                "ok": bool(same_shape and max_abs_diff is not None and max_abs_diff <= 1e-5),
+                "actual_shape": list(actual_cpu.shape),
+                "expected_shape": list(expected_cpu.shape),
+                "reference_shape": list(reference_cpu.shape) if reference_cpu is not None else None,
+                "expected_target_pixel_values_slice": expected_slice,
+                "reference_target_pixel_values_slice": reference_slice,
+                "max_abs_diff_actual_vs_expected_shifted": max_abs_diff,
+                "mean_abs_diff_actual_vs_expected_shifted": mean_abs_diff,
+                "npz_path": npz_path,
+            }
+        )
+        self._write_replay_dump(payload, detail="summary")
+
     def _record_processor_trace(
         self,
         *,
@@ -583,12 +810,14 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         prompt_mask = attention_mask[0].tolist()
         image_spans = self._find_image_token_spans(prompt_ids)
         target_span = image_spans[1] if len(image_spans) >= 2 else None
+        image_slices = self._processor_image_slices(processor_inputs)
         self._last_trace_state = {
             "dataset": str(dataset) if dataset is not None else None,
             "prompt_token_count": len(prompt_ids),
             "prompt_token_ids": prompt_ids,
             "image_token_spans": image_spans,
             "target_image_span": target_span,
+            "processor_image_slices": image_slices,
             "replayed_content": replayed_content,
         }
         token_payload = {
@@ -599,6 +828,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             "attention_mask": self._summarize_token_ids(prompt_mask, detail="full"),
             "image_token_spans": image_spans,
             "target_image_span": target_span,
+            "processor_image_slices": image_slices,
         }
         self._stage_debug("processor_inputs", token_payload, detail="full")
         self._write_replay_dump(
@@ -615,6 +845,15 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 },
             },
             detail="full",
+        )
+        transform_record = getattr(self, "_last_image_transform_record", None)
+        self._record_processor_image_transform_validation(
+            text=text,
+            images=images,
+            videos=videos,
+            processor_inputs=processor_inputs,
+            dataset=dataset,
+            transform_record=transform_record if isinstance(transform_record, dict) else None,
         )
 
     def _record_generation_loss_mask(self, generated_text: str, dataset: str | None) -> None:
@@ -966,6 +1205,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
                 "replayed_image_refs": replayed_image_refs,
                 "replayed_image_count": len(replayed_image_refs),
                 "vision_extract_image_count": len(images) if images is not None else 0,
+                "vllm_payload_image_sizes": (
+                    [list(image.size) for image in images] if images is not None else []
+                ),
+                "vllm_payload_image_rgb_sha256": (
+                    [image_rgb_sha256(image) for image in images] if images is not None else []
+                ),
                 "vision_extract_video_count": len(videos) if videos is not None else 0,
                 "vision_extract_image_summary": self._summarize_mm(images),
                 "vision_extract_video_summary": self._summarize_mm(videos),
@@ -1125,12 +1370,14 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             f"safe_fallback_truncate_chars={self.safe_fallback_truncate_chars}",
             flush=True,
         )
+        self._text_filler_audit = TextFillerAudit(self.__class__.__name__)
         self.image_transform_name = canonicalize_image_transform(os.environ.get("REPLAY_IMAGE_TRANSFORM", "baseline"))
         self.image_transform_cache_dir = os.environ.get("REPLAY_IMAGE_TRANSFORM_CACHE_DIR", "").strip()
         self.image_transform_target_position = max(
             1,
             int(os.environ.get("REPLAY_IMAGE_TRANSFORM_TARGET_POSITION", "2")),
         )
+        self._last_image_transform_record: dict[str, Any] | None = None
         print(
             f"[Qwen2VLChatReplay] image_transform={self.image_transform_name} "
             f"target_position={self.image_transform_target_position} "
@@ -1192,24 +1439,30 @@ class Qwen2VLChatReplay(Qwen2VLChat):
                 )
         return templated
 
-    def _apply_replay_to_content(self, content: list[dict[str, str]]) -> list[dict[str, str]]:
+    def _apply_replay_to_content(
+        self,
+        content: list[dict[str, str]],
+        replay_mode: str | None = None,
+    ) -> list[dict[str, str]]:
+        if replay_mode is None:
+            replay_mode = self.replay_cfg["mode"]
         replayed = apply_replay(
             content,
-            mode=self.replay_cfg["mode"],
+            mode=replay_mode,
             repeat_times=self.replay_cfg["repeat_times"],
             image_copy_mode=self.replay_cfg["image_copy_mode"],
         )
         self._stage_debug(
             "replay_before_after",
             {
-                "replay_mode": self.replay_cfg["mode"],
+                "replay_mode": replay_mode,
                 "before_preview": str(content)[:1200],
                 "after_preview": str(replayed)[:1200],
             },
         )
         maybe_debug_print_replay(
             enabled=self.replay_cfg["debug"],
-            mode=self.replay_cfg["mode"],
+            mode=replay_mode,
             before=content,
             after=replayed,
             tag=self.__class__.__name__,
@@ -1221,12 +1474,24 @@ class Qwen2VLChatReplay(Qwen2VLChat):
         content: list[dict[str, str]],
         dataset: str | None = None,
     ) -> list[dict[str, str]]:
+        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
+        if replay_mode == REPLAY_IMAGE_TEXT_FILLER_TEXT:
+            return self._apply_text_filler_replay(content, dataset=dataset)
+        return self._apply_template_replay_pipeline_mode(content, dataset=dataset, mode=replay_mode)
+
+    def _apply_template_replay_pipeline_mode(
+        self,
+        content: list[dict[str, str]],
+        dataset: str | None = None,
+        mode: str | None = None,
+    ) -> list[dict[str, str]]:
         # Default behavior: template first, then replay (legacy behavior).
         # Optional behavior: if replay is enabled and this flag is on,
         # replay first and template only the last text of replayed content.
+        if mode is None:
+            mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
         use_last_replay_text = getattr(self, "template_on_last_replay_text", False)
-        replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))
-        if use_last_replay_text and not is_noop_replay_mode(replay_mode):
+        if use_last_replay_text and not is_noop_replay_mode(mode):
             replay_source = content
             if self.prompt_template_cfg.get("name") == "directly_answer":
                 replay_source = strip_prompt_template_from_content_for_direct_answer(
@@ -1234,11 +1499,182 @@ class Qwen2VLChatReplay(Qwen2VLChat):
                     dataset=dataset,
                     text_key="text",
                 )
-            replayed = self._apply_replay_to_content(replay_source)
+            replayed = self._apply_replay_to_content(replay_source, replay_mode=mode)
             return self._apply_prompt_template_to_content(replayed, dataset=dataset)
 
         templated = self._apply_prompt_template_to_content(content, dataset=dataset)
-        return self._apply_replay_to_content(templated)
+        return self._apply_replay_to_content(templated, replay_mode=mode)
+
+    def _render_filler_payload_prompt(self, content: list[dict[str, str]]) -> str:
+        """Chat-template prompt string for ``content``, mirroring the exact
+        rendering ``_build_vllm_request`` feeds to ``llm.generate`` so the
+        filler's in-context token count is measured on the real payload
+        prompt (image parts render as constant ``<|image_pad|>`` scaffolds,
+        independent of the filler text)."""
+        messages = []
+        if self.system_prompt is not None:
+            messages.append({'role': 'system', 'content': self.system_prompt})
+        messages.append({'role': 'user', 'content': content})
+        return self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def _count_pure_space_tokens(self, ids):
+        """Engine-side count of tokens whose decoded text is entirely space
+        characters (U+0020 only); see the Gemma3 wrapper for rationale."""
+        return self._count_pure_literal_tokens(ids, SPACE_FILLER_LITERAL)
+
+    def _count_pure_literal_tokens(self, ids, literal):
+        """Engine-side count of tokens whose decoded text consists solely of
+        ``literal`` (generalizes the pure-space audit to the dots filler)."""
+        count = 0
+        for token_id in ids:
+            text = self.processor.tokenizer.decode([token_id])
+            if text and set(text) == {literal}:
+                count += 1
+        return count
+
+    def _qwen_visual_core_tokens(self, content: list[dict[str, str]]) -> tuple[int, list[dict[str, Any]]]:
+        """Core visual token count |V| for a prepared content list, using the
+        same vision extraction + processor call the vLLM request path applies.
+
+        The processor expands each single ``<|image_pad|>`` placeholder in the
+        rendered prompt to exactly the image's merged visual tokens (grid
+        ``t*h*w`` divided by ``merge_size**2``); counting the expanded
+        placeholders in the processor output is therefore the engine-side
+        in-context visual token count (the same source the blank/SLP trace
+        path reads via ``_find_image_token_spans``/``_processor_image_slices``).
+        """
+        try:
+            from qwen_vl_utils import process_vision_info
+        except Exception as err:
+            logging.critical("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'")
+            raise err
+
+        text = self._render_filler_payload_prompt(content)
+        images, videos = process_vision_info([{'role': 'user', 'content': content}])
+        inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors="pt")
+        image_processor = getattr(self.processor, "image_processor", None)
+        merge_size = int(getattr(image_processor, "merge_size", 2) or 2)
+        grid = inputs.get("image_grid_thw") if hasattr(inputs, "get") else None
+        details: list[dict[str, Any]] = []
+        grid_total = 0
+        if grid is not None:
+            rows = grid.detach().cpu().tolist() if hasattr(grid, "detach") else list(grid)
+            for row in rows:
+                if len(row) != 3:
+                    continue
+                t, h, w = [int(x) for x in row]
+                core = (t * h * w) // (merge_size * merge_size)
+                grid_total += core
+                details.append({"grid_thw": [t, h, w], "core": core})
+        image_pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        input_ids = inputs.get("input_ids") if hasattr(inputs, "get") else None
+        pad_count = 0
+        if input_ids is not None:
+            ids = input_ids[0]
+            ids = ids.detach().cpu().tolist() if hasattr(ids, "detach") else list(ids)
+            pad_count = sum(1 for token_id in ids if token_id == image_pad_id)
+        if pad_count > 0 and pad_count != grid_total:
+            raise RuntimeError(
+                f"Qwen2VL filler mode visual core mismatch: expanded <|image_pad|> "
+                f"count {pad_count} != grid-derived count {grid_total} ({details})"
+            )
+        if grid_total <= 0:
+            raise RuntimeError("Qwen2VL filler mode found no visual tokens in the processed payload")
+        return grid_total, details
+
+    def _apply_text_filler_replay(
+        self,
+        content: list[dict[str, str]],
+        dataset: str | None = None,
+    ) -> list[dict[str, str]]:
+        """⟨V,T,F,T⟩: the ⟨V,T,T⟩ pipeline with a token-matched filler block
+        inserted between the two text halves.
+
+        The Qwen2-VL chat template concatenates text parts of the user
+        content without separators (and does not trim them), so the filler is
+        embedded inside a single merged text item (first text half + F +
+        second text half), which renders byte-identically to the ⟨V,T,T⟩
+        baseline plus F. The carrier literal is selected by
+        ``REPLAY_TEXT_FILLER_TYPE`` (spaces/dots); an unknown value is a hard
+        error in the shared module.
+        """
+        base = self._apply_template_replay_pipeline_mode(content, dataset=dataset, mode="image_text_text")
+        text_positions = [
+            idx
+            for idx, item in enumerate(base)
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if not text_positions or len(text_positions) % 2 != 0:
+            raise RuntimeError(
+                f"Qwen2VL filler mode expected an even number of text items after "
+                f"image_text_text expansion, got {len(text_positions)}"
+            )
+        half = len(text_positions) // 2
+        first_text = "".join(str(base[idx].get("text", "")) for idx in text_positions[:half])
+        second_text = "".join(str(base[idx].get("text", "")) for idx in text_positions[half:])
+        image_items = [
+            item
+            for item in base
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        if not image_items:
+            raise RuntimeError("Qwen2VL filler mode requires at least one image item")
+        visual_core, image_grid_details = self._qwen_visual_core_tokens(base)
+        filler_type = read_text_filler_type()
+        filler_literal = filler_literal_for(filler_type)
+        baseline_prompt = self._render_filler_payload_prompt(base)
+        baseline_local_tokens = tokenize_length(self.processor.tokenizer, baseline_prompt)
+        baseline_ids = self.processor.tokenizer(baseline_prompt, add_special_tokens=False).input_ids
+        baseline_pure_space = self._count_pure_space_tokens(baseline_ids)
+        baseline_pure_literal = self._count_pure_literal_tokens(baseline_ids, filler_literal)
+        text_positions_set = set(text_positions)
+        first_text_position = text_positions[0]
+
+        def build_merged_content(filler_value):
+            merged_value = first_text + filler_value + second_text
+            out = []
+            for idx, item in enumerate(base):
+                if idx == first_text_position:
+                    out.append({"type": "text", "text": merged_value})
+                elif idx in text_positions_set:
+                    continue
+                else:
+                    out.append(item)
+            return out
+
+        def count_fn(filler_value):
+            prompt = self._render_filler_payload_prompt(build_merged_content(filler_value))
+            return count_filler_tokens(self.processor.tokenizer, prompt, baseline_prompt)
+
+        tag = f"{self.__class__.__name__} dataset={dataset}"
+        spec = build_text_filler(count_fn, visual_core, literal=filler_literal, tag=tag)
+        filler_value = filler_literal * int(spec["chars"])
+        filler_content = build_merged_content(filler_value)
+        meta = {
+            "dataset": str(dataset) if dataset is not None else None,
+            "mode": REPLAY_IMAGE_TEXT_FILLER_TEXT,
+            "filler_type": filler_type,
+            "filler_literal": filler_literal,
+            "image_count": len(image_items),
+            "image_grid_details": image_grid_details,
+            "visual_core_tokens": visual_core,
+            "filler_chars": int(spec["chars"]),
+            "filler_tokens_local": int(spec["tokens"]),
+            "baseline_local_tokens": baseline_local_tokens,
+            "baseline_pure_space_tokens": baseline_pure_space,
+            "baseline_pure_literal_tokens": baseline_pure_literal,
+            "chat_template": "qwen2_vl-processor-packaged",
+        }
+        for item in filler_content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                item["text_filler_meta"] = dict(meta)
+                break
+        self._text_filler_audit.log_construction({**meta, "phase_detail": "constructed"})
+        return filler_content
 
     def _apply_image_transform_pipeline(
         self,
@@ -1248,6 +1684,7 @@ class Qwen2VLChatReplay(Qwen2VLChat):
         dataset: str | None = None,
     ) -> list[dict[str, str]]:
         if self.image_transform_name == "baseline":
+            self._last_image_transform_record = None
             return content
         replay_meta = self._extract_replay_meta(inputs)
         transformed, transform_record = apply_image_transform_to_content(
@@ -1257,7 +1694,9 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             cache_dir=self.image_transform_cache_dir or os.path.join(os.getcwd(), ".replay_transform_cache"),
             dataset_name=str(dataset) if dataset is not None else "unknown_dataset",
             image_position=self.image_transform_target_position,
+            model_family="qwen2_5_vl",
         )
+        self._last_image_transform_record = transform_record
         self._stage_debug(
             "image_transform",
             {
@@ -1330,6 +1769,12 @@ class Qwen2VLChatReplay(Qwen2VLChat):
             return super().generate_inner_vllm(message, dataset=dataset)
         except Exception as first_err:
             if not self.safe_fallback_enabled:
+                raise
+            # Text-filler construction/audit errors carry the shared module's
+            # "[text-filler]" message prefix and must stay hard errors: the
+            # fallback below would silently relabel a broken ⟨V,T,F,T⟩
+            # condition as a plain ⟨V,T⟩ run and corrupt the experiment.
+            if "[text-filler]" in str(first_err):
                 raise
 
             replay_mode = canonicalize_replay_mode(self.replay_cfg.get("mode", "image_text"))

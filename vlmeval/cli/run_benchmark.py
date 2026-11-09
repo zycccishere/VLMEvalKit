@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import functools
+import importlib.util
 import csv
 import json
 import math
@@ -13,6 +16,8 @@ import time
 import subprocess
 import sys
 import threading
+import socket
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -24,6 +29,18 @@ try:
 except ImportError as exc:
     raise SystemExit("PyYAML is required to run vlmeval.cli.run_benchmark") from exc
 
+
+
+@functools.lru_cache(maxsize=1)
+def _replay_policy():
+    """The stdlib-only replay policy, loaded by file path: this runner is also
+    imported by path (prepare_bound_run, queue tests) without ``vlmeval`` on
+    sys.path, and importing the ``vlmeval.vlm`` package would pull wrappers."""
+    path = Path(__file__).resolve().parents[1] / "vlm" / "replay_policy.py"
+    spec = importlib.util.spec_from_file_location("bound_runner_replay_policy", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -283,6 +300,10 @@ class BenchmarkRunner:
     def __init__(self, repo_root: Path, args: argparse.Namespace) -> None:
         self.repo_root_path = repo_root
         self.args = args
+        self.atomic_checkpoints = getattr(args, "atomic_checkpoints", False)
+        self.gpu_ready_timeout = getattr(args, "gpu_ready_timeout", 0)
+        if self.gpu_ready_timeout < 0:
+            raise ValueError("gpu-ready-timeout must be nonnegative")
         matrix = load_yaml(args.matrix_config)
         models_cfg = load_yaml(args.model_config)
         default_repo_root = str(repo_root)
@@ -293,6 +314,7 @@ class BenchmarkRunner:
         self.node_gpu_ids = split_names(args.gpu_ids or str(matrix.get("node_gpu_ids", "0,1,2,3,4,5,6,7")))
         self.resume_infer = args.resume_infer if args.resume_infer is not None else truthy(matrix.get("resume_infer_default", False))
         self.evaluation_cfg = matrix.get("evaluation", {})
+        self.experiment_cfg = matrix.get("experiment", {})
         self.replay_cfg = matrix.get("replay", {})
         self.answer_format_cfg = matrix.get("answer_format", {})
         self.trace_cfg = matrix.get("trace", {})
@@ -322,6 +344,17 @@ class BenchmarkRunner:
         self.task_manifest_rows: list[dict[str, str]] = []
         self._load_profiles(models_cfg)
         self._load_matrix(matrix, models_cfg)
+        if self.experiment_cfg:
+            bindings = self.experiment_cfg.get("bindings", {})
+            if not self.experiment_cfg.get("run_id"):
+                raise ValueError("experiment.run_id is required")
+            if any(not bindings.get(t.tag, {}).get("cell_id") for t in self.tasks):
+                raise ValueError("Every selected task requires an experiment binding")
+            if self.experiment_cfg.get('execution_sha'):
+                sha = subprocess.check_output(['git', '-C', self.repo_root, 'rev-parse', 'HEAD'], text=True).strip()
+                dirty = subprocess.check_output(['git', '-C', self.repo_root, 'status', '--porcelain'], text=True).strip()
+                if sha != self.experiment_cfg['execution_sha'] or dirty:
+                    raise ValueError('Bound execution checkout changed after registration')
 
     def _resolve_results_root(self, raw: str) -> Path:
         path = Path(raw)
@@ -527,7 +560,7 @@ class BenchmarkRunner:
                 for failure in self.failures:
                     print(f"[NODE][FAILURE] {failure}", flush=True)
                 return 1
-            print(f"[NODE][DONE] node_rank={self.args.node_rank}", flush=True)
+            print(f"[NODE][{'INFERENCE_DONE' if self.evaluation_cfg.get('launch_mode') == 'bg' else 'DONE'}] node_rank={self.args.node_rank}", flush=True)
             return 0
 
         grouped: dict[str, list[Task]] = defaultdict(list)
@@ -569,7 +602,7 @@ class BenchmarkRunner:
             for failure in self.failures:
                 print(f"[NODE][FAILURE] {failure}", flush=True)
             return 1
-        print(f"[NODE][DONE] node_rank={self.args.node_rank}", flush=True)
+        print(f"[NODE][{'INFERENCE_DONE' if self.evaluation_cfg.get('launch_mode') == 'bg' else 'DONE'}] node_rank={self.args.node_rank}", flush=True)
         return 0
 
     def run_gpu_pool(self, assigned: list[Task]) -> None:
@@ -837,7 +870,13 @@ class BenchmarkRunner:
         env["REPLAY_MODE"] = task.mode
         env["REPLAY_IMAGE_TRANSFORM"] = task.transform
         env["REPLAY_IMAGE_TRANSFORM_CACHE_DIR"] = str(self.task_root(task) / "_transform_cache" / task.dataset)
-        env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = "2"
+        image_copy_count = _replay_policy().replay_mode_image_copy_count(task.mode)
+        if image_copy_count > 1:
+            env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = ",".join(
+                str(position) for position in range(2, 2 + image_copy_count)
+            )
+        else:
+            env["REPLAY_IMAGE_TRANSFORM_TARGET_POSITION"] = "2"
         env["REPLAY_PROMPT_TEMPLATE_NAME"] = policy.replay_prompt_template_name
         env["REPLAY_TIMES"] = str(self.replay_cfg.get("replay_times", 1))
         env["REPLAY_DEBUG"] = "0"
@@ -875,6 +914,13 @@ class BenchmarkRunner:
                 raise FileNotFoundError(f"blank image asset not found: {blank_asset}")
             env["REPLAY_BLANK_IMAGE_POSITIONS"] = "2"
             env["REPLAY_BLANK_IMAGE_PATH"] = str(blank_asset)
+        if task.mode == "image_text_filler_text":
+            env["REPLAY_TEXT_FILLER_AUDIT_FILE"] = str(
+                self.task_root(task) / "_filler_audit" / "audit.jsonl"
+            )
+            env["REPLAY_TEXT_FILLER_DEBUG_DIR"] = str(
+                self.task_root(task) / "_filler_audit" / "debug"
+            )
         max_num_seqs = self.max_num_seqs_for_task(model, task)
         env["MINICPM45_VLLM_TP_SIZE"] = str(model.tp_size)
         env["MINICPM45_VLLM_MAX_NUM_SEQS"] = str(max_num_seqs)
@@ -1174,12 +1220,45 @@ except Exception:
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         ensure_dir(path.parent)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".status-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def write_phase_status(self, task: Task, model: ModelSpec, expected: int,
+                           phase: str, status: str, **details: Any) -> None:
+        if not self.experiment_cfg:
+            return
+        payload = self._task_payload(task, model, expected)
+        if details.get("pid"):
+            try:
+                details['pid_start_ticks'] = Path(f"/proc/{details['pid']}/stat").read_text().rsplit(')', 1)[1].split()[19]
+            except FileNotFoundError:
+                pass  # the command may have already completed
+        payload.update(phase=phase, status=status, host=socket.gethostname(),
+                       supervisor_pid=os.getpid(), **details)
+        directory = self.prediction_dir(task) if phase == "inference" else self.eval_output_dir(task)
+        self._write_json(directory / "status.json", payload)
 
     def _task_payload(self, task: Task, model: ModelSpec, expected: int) -> dict[str, Any]:
         return {
             "schema_version": 1,
+            "checkpoint_io": "atomic-fsync-replace-v1" if self.atomic_checkpoints else "native",
             "matrix": self.matrix_name,
+            "run_id": self.experiment_cfg.get("run_id"),
+            "binding": self.experiment_cfg.get("bindings", {}).get(task.tag),
             "task": {
                 "tag": task.tag,
                 "index": task.index,
@@ -1262,18 +1341,25 @@ except Exception:
             return False
         return self.acc_complete(task, model)
 
-    def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path) -> int:
+    def run_subprocess(self, cmd: list[str], env: dict[str, str], log_path: Path,
+                       on_start: Any = None) -> int:
+        if self.atomic_checkpoints and len(cmd) > 1 and cmd[1] == "run.py":
+            cmd = [cmd[0], str(self.repo_root_path / "scripts/atomic_checkpoints.py"),
+                   str(Path(self.repo_root) / "run.py"), *cmd[2:]]
         ensure_dir(log_path.parent)
         with log_path.open("w", encoding="utf-8") as log_fh:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=self.repo_root,
                 env=env,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 text=True,
+                pass_fds=((self._eval_lock_fd,) if hasattr(self, "_eval_lock_fd") else ()),
             )
-        return proc.returncode
+            if on_start:
+                on_start(proc.pid)
+            return proc.wait()
 
     def _query_nvidia_smi(self, gpu_ids: list[str]) -> str:
         gpu_arg = ",".join(gpu_ids)
@@ -1367,10 +1453,46 @@ except Exception:
         if rc != 0:
             print(f"[FAIL][FORMAT] {task.tag}: rc={rc} log={log_path}", flush=True)
 
+    def wait_for_gpu_ready(self, gpu_ids: str) -> bool:
+        """Opt-in exclusive-card guard; placement remains owned by gpu_pool."""
+        if not self.gpu_ready_timeout:
+            return True
+        deadline = time.monotonic() + self.gpu_ready_timeout
+        while True:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "-i", gpu_ids, "--query-gpu=memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, check=True,
+                    timeout=max(.1, min(10, deadline - time.monotonic())),
+                )
+                used = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+                if len(used) != len(gpu_ids.split(",")):
+                    raise ValueError("GPU query returned an unexpected device count")
+                if all(value <= 1024 for value in used):
+                    print(f"[GPU][READY] gpus={gpu_ids} used_mib={used}", flush=True)
+                    return True
+                detail = f"used_mib={used} limit_mib=1024"
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                detail = f"query_error={type(exc).__name__}: {exc}"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(f"[GPU][TIMEOUT] gpus={gpu_ids} {detail}", flush=True)
+                return False
+            print(f"[GPU][WAIT] gpus={gpu_ids} {detail}", flush=True)
+            time.sleep(min(2, remaining))
+
     def run_infer(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
         log_path = self.log_root(task) / "infer" / f"{model.registry_name}_{task.dataset}_{self._timestamp()}.log"
         ensure_dir(self.model_output_root(task, model))
         ensure_dir(self.prediction_dir(task))
+        if self.gpu_ready_timeout:
+            self.write_phase_status(task, model, expected_count, "inference", "waiting_gpu",
+                                    gpu_ids=env["CUDA_VISIBLE_DEVICES"])
+            if not self.wait_for_gpu_ready(env["CUDA_VISIBLE_DEVICES"]):
+                self.write_phase_status(task, model, expected_count, "inference", "failed",
+                                        returncode=75, reason="gpu_readiness_timeout")
+                return 75
         batch_size = self.infer_batch_size_for_task(model, task)
         cmd = [
             self.env_profiles[model.env_profile].python,
@@ -1400,7 +1522,9 @@ except Exception:
             f"gpus={env['CUDA_VISIBLE_DEVICES']} batch={batch_size}",
             flush=True,
         )
-        rc = self.run_subprocess(cmd, env, log_path)
+        rc = self.run_subprocess(cmd, env, log_path, on_start=lambda pid:
+            self.write_phase_status(task, model, expected_count, "inference", "running",
+                                    pid=pid, log=str(log_path)))
         if rc == 0:
             pred_file = self.infer_file_path(task, model)
             if self.prediction_file_valid(pred_file, expected_count):
@@ -1408,6 +1532,9 @@ except Exception:
             print(f"[DONE][INFER] {task.tag} log={log_path}", flush=True)
         else:
             print(f"[FAIL][INFER] {task.tag} rc={rc} log={log_path}", flush=True)
+        complete = rc == 0 and self.infer_complete(task, model, expected_count)
+        self.write_phase_status(task, model, expected_count, "inference",
+                                "complete" if complete else "failed", returncode=rc, log=str(log_path))
         return rc
 
     def run_eval(self, task: Task, model: ModelSpec, env: dict[str, str], expected_count: int) -> int:
@@ -1417,6 +1544,19 @@ except Exception:
             print(f"[FAIL][EVAL] {task.tag}: missing fixed prediction file", flush=True)
             return 1
         ensure_dir(self.eval_output_dir(task))
+        env = dict(env)
+        # Each eval subprocess gets its own existing API concurrency gate.
+        # No shared experiment gate may silently turn a per-cell ceiling into
+        # a fleet-wide ceiling. No generation parameter is changed here.
+        if self.experiment_cfg:
+            nproc = int(self.evaluation_cfg.get("nproc", 512))
+            env.pop("LOCAL_LLM", None)
+            env.pop("VLMEVAL_OPENAI_TEMPERATURE", None)
+            env.update(CUDA_VISIBLE_DEVICES="",
+                       VLMEVAL_DYNAMIC_CONCURRENCY_FILE=str(self.eval_output_dir(task) / "concurrency.target"),
+                       VLMEVAL_DYNAMIC_CONCURRENCY_STATUS=str(self.eval_output_dir(task) / "concurrency.status.json"),
+                       VLMEVAL_DYNAMIC_CONCURRENCY_INITIAL=str(nproc),
+                       VLMEVAL_DYNAMIC_CONCURRENCY_CEILING=str(nproc))
         cmd = [
             self.env_profiles[model.env_profile].python,
             "run.py",
@@ -1440,14 +1580,88 @@ except Exception:
             str(self.evaluation_cfg.get("judge", "gpt-4o-mini")),
         ]
         print(f"[START][EVAL] {task.tag}", flush=True)
-        rc = self.run_subprocess(cmd, env, log_path)
+        rc = self.run_subprocess(cmd, env, log_path, on_start=lambda pid:
+            self.write_phase_status(task, model, expected_count, "evaluation", "running",
+                                    pid=pid, log=str(log_path), judge=self.evaluation_cfg.get("judge"),
+                                    nproc=int(self.evaluation_cfg.get("nproc", 8))))
         if rc == 0:
             self.write_eval_manifest(task, model, expected_count, pred_file, rc)
             print(f"[DONE][EVAL] {task.tag} log={log_path}", flush=True)
         else:
             self.write_eval_manifest(task, model, expected_count, pred_file, rc)
             print(f"[FAIL][EVAL] {task.tag} rc={rc} log={log_path}", flush=True)
-        return rc
+        complete = rc == 0 and self.eval_complete(task, model, expected_count)
+        self.write_phase_status(task, model, expected_count, "evaluation",
+                                "complete" if complete else "failed", returncode=rc, log=str(log_path))
+        return rc if rc else (0 if complete else 1)
+
+    def launch_background_eval(self, task: Task, model: ModelSpec, expected: int) -> None:
+        """Detach only the CPU/API evaluation; the existing GPU pool continues."""
+        directory = self.eval_output_dir(task)
+        ensure_dir(directory)
+        lock = (directory / ".worker.lock").open("a+")
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"[SKIP][EVAL] {task.tag}: background worker already owns this cell", flush=True)
+                return
+            if self.eval_complete(task, model, expected):
+                return
+            # Reuse the same runner, config resolution, eval command and final
+            # manifest checks. The inherited lock lasts until the worker exits.
+            cmd = [sys.executable, str(Path(__file__).resolve()),
+                   "--matrix-config", str(self.args.matrix_config.resolve()),
+                   "--model-config", str(self.args.model_config.resolve()),
+                   "--models", task.model_key, "--policies", task.policy_key,
+                   "--modes", task.mode, "--transforms", task.transform, "--datasets", task.dataset,
+                   "--eval-task-tag", task.tag, "--eval-lock-fd", str(lock.fileno())]
+            if self.task_manifest_path:
+                cmd += ["--task-manifest", str(self.task_manifest_path.resolve())]
+            if self.atomic_checkpoints:
+                cmd.append("--atomic-checkpoints")
+            supervisor_log = directory / "worker.log"
+            self.write_phase_status(task, model, expected, "evaluation", "queued", log=str(supervisor_log),
+                                    worker_lock=str(directory / ".worker.lock"))
+            with supervisor_log.open("a") as log:
+                proc = subprocess.Popen(cmd, cwd=self.repo_root, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True, pass_fds=(lock.fileno(),))
+            threading.Thread(target=proc.wait, daemon=True).start()
+            print(f"[BACKGROUND][EVAL] {task.tag} log={supervisor_log}", flush=True)
+        finally:
+            lock.close()
+
+    def run_background_eval(self, tag: str, lock_fd: int) -> int:
+        task = next(t for t in self.tasks if t.tag == tag)
+        model = self.models[task.model_key]
+        expected = -1
+        try:
+            os.fstat(lock_fd)  # launch_background_eval passed a live lock
+            self._eval_lock_fd = lock_fd
+            env = self.build_env(model, task, [])
+            expected = self.get_expected_count(model, env, task.dataset)
+            if not self.infer_complete(task, model, expected):
+                raise RuntimeError("background eval requires complete predictions")
+            if self.eval_complete(task, model, expected):
+                return 0
+            gate_path = self.eval_output_dir(task) / 'concurrency.status.json'
+            if gate_path.exists():
+                previous = self._read_json(gate_path)
+                # The inherited exclusive lock proves the previous scorer is
+                # gone. A killed HTTP worker cannot release its old slots.
+                previous['abandoned_on_resume'] = previous.get('in_flight', 0)
+                previous['in_flight'] = 0
+                self._write_json(gate_path, previous)
+            # Never re-enter inference or clean predictions in this worker.
+            self.run_answer_format(task, model, env)
+            return self.run_eval(task, model, env, expected)
+        except Exception as exc:
+            self.write_phase_status(task, model, expected, "evaluation", "failed",
+                                    error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            os.close(lock_fd)
 
     def run_single_task(self, model: ModelSpec, task: Task, gpu_ids: list[str]) -> None:
         env = self.build_env(model, task, gpu_ids)
@@ -1493,6 +1707,10 @@ except Exception:
         if self.eval_complete(task, model, expected_count):
             print(f"[SKIP][EVAL] {task.tag}: complete", flush=True)
             return
+        launch_mode = str(self.evaluation_cfg.get("launch_mode", "fg")).lower()
+        if launch_mode == "bg":
+            self.launch_background_eval(task, model, expected_count)
+            return
         if self.eval_artifacts(task, model):
             print(f"[CLEAN][EVAL] {task.tag}: remove stale eval artifacts", flush=True)
             self.cleanup_eval_artifacts(task, model)
@@ -1529,6 +1747,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodes", type=int, default=detect_num_nodes())
     parser.add_argument("--node-rank", type=int, default=detect_node_rank())
     parser.add_argument("--gpu-ids", type=str, default="")
+    parser.add_argument("--atomic-checkpoints", action="store_true",
+                        help="Atomically commit native prediction and judge checkpoint writes.")
+    parser.add_argument("--gpu-ready-timeout", type=int, default=0,
+                        help="Opt-in: wait up to N seconds before inference for assigned GPUs to use <=1024 MiB; 0 disables.")
     parser.add_argument("--models", type=str, default="")
     parser.add_argument("--policies", type=str, default="")
     parser.add_argument("--modes", type=str, default="")
@@ -1549,6 +1771,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-infer", action="store_true", dest="resume_infer")
     parser.add_argument("--no-resume-infer", action="store_false", dest="resume_infer")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--eval-task-tag", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--eval-lock-fd", type=int, default=-1, help=argparse.SUPPRESS)
     parser.set_defaults(resume_infer=None)
     return parser.parse_args()
 
@@ -1556,6 +1780,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     runner = BenchmarkRunner(default_repo_root(), args)
+    if args.eval_task_tag:
+        return runner.run_background_eval(args.eval_task_tag, args.eval_lock_fd)
     return runner.run()
 
 

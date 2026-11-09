@@ -67,6 +67,12 @@ class ImageMCQDataset(ImageBaseDataset):
         # 'SEEDBench_IMG': 'https://opencompass.openxlab.space/utils/VLMEval/SEEDBench_IMG.tsv',
         'SEEDBench_IMG': '/datasets/vlmeval/SEEDBench_IMG.tsv',
         'SEEDBench2': 'https://huggingface.co/datasets/VLMEval/SEEDBench2/resolve/main/SEEDBench2.tsv',
+        # SEEDBench2_Plus: upstream/main moved the file to
+        # utils/benchmarks/SEEDBench/SEEDBench2_Plus.tsv with MD5 e32d3216dc4f452b0fe497a52015d1fd;
+        # that copy re-letters 3 rows (1778/1841/1930) to options B/C/D leaving A empty, while this
+        # release-aligned copy (utils/VLMEval path + MD5 below, verified identical on the OSS bucket
+        # 2026-11-08) keeps the plain A/B/C layout used by the cluster paper runs. Keep the aligned
+        # copy for comparability; do not "refresh" the MD5 to upstream's without re-checking those rows.
         # 'SEEDBench2_Plus': 'https://opencompass.openxlab.space/utils/VLMEval/SEEDBench2_Plus.tsv',
         'SEEDBench2_Plus': '/datasets/vlmevalkit/SEEDBench2_Plus.tsv',
         # ScienceQA Series
@@ -226,8 +232,8 @@ class ImageMCQDataset(ImageBaseDataset):
             return load(score_file)
 
         model = judge_kwargs.get('model', 'exact_matching')
-        assert model in ['chatgpt-0125', 'exact_matching', 'gpt-4-0125', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'gpt-5', 'qwen3.6-35b-a3b']
-        name_str_map = {'chatgpt-0125': 'openai', 'gpt-4-0125': 'gpt4', 'gpt-4.1': 'gpt-4.1', 'gpt-4.1-mini': 'gpt-4.1-mini', 'gpt-4.1-nano': 'gpt-4.1-nano', 'gpt-4o-mini': 'gpt-4o-mini', 'gpt-4o': 'gpt-4o', 'gpt-4-turbo': 'gpt-4-turbo', 'gpt-5': 'gpt-5', 'qwen3.6-35b-a3b': 'qwen3.6-35b-a3b'}
+        assert model in ['chatgpt-0125', 'exact_matching', 'gpt-4-0125', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'gpt-5', 'gpt-6-luna-flex', 'qwen3.6-35b-a3b']
+        name_str_map = {'chatgpt-0125': 'openai', 'gpt-4-0125': 'gpt4', 'gpt-4.1': 'gpt-4.1', 'gpt-4.1-mini': 'gpt-4.1-mini', 'gpt-4.1-nano': 'gpt-4.1-nano', 'gpt-4o-mini': 'gpt-4o-mini', 'gpt-4o': 'gpt-4o', 'gpt-4-turbo': 'gpt-4-turbo', 'gpt-5': 'gpt-5', 'gpt-6-luna-flex': 'gpt-6-luna-flex', 'qwen3.6-35b-a3b': 'qwen3.6-35b-a3b'}
         name_str = name_str_map[model] if model in name_str_map else model
 
         if model == 'exact_matching':
